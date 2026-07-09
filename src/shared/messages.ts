@@ -16,7 +16,7 @@
  */
 import browser from "webextension-polyfill";
 import { createLogger } from "./log";
-import type { DeepPartial, Settings } from "./settings";
+import type { Settings, SettingsPatch } from "./settings";
 import type { PageTranslation, ProviderErrorKind } from "./types";
 
 const log = createLogger("messages");
@@ -52,8 +52,9 @@ export interface MessageMap {
   /** Fetch the current, migrated settings. */
   getSettings: { request: void; response: Settings };
 
-  /** Persist a partial settings update; resolves with the full new settings. */
-  setSettings: { request: DeepPartial<Settings>; response: Settings };
+  /** Persist a partial settings update; resolves with the full new settings.
+   *  `null` entries in the open-keyed records delete (see {@link SettingsPatch}). */
+  setSettings: { request: SettingsPatch; response: Settings };
 
   /** Broadcast (background/options → content/popup) that settings changed. */
   settingsChanged: { request: { settings: Settings }; response: void };

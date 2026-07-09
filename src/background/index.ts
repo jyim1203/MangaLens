@@ -13,24 +13,29 @@ import browser from "webextension-polyfill";
 import { createLogger } from "../shared/log";
 import { CMD_TOGGLE } from "../shared/constants";
 import { createMessageRouter } from "../shared/messages";
+import {
+  createSettingsHandlers,
+  toggleEnabled,
+} from "./settingsHandlers";
 
 const log = createLogger("background");
 
-// Typed message router (shared/messages.ts). Phase 1 wires only the messages
-// whose handlers already exist; translatePage/testApiKey land with the provider
-// and pipeline layers (Phases 2–3).
+// Typed message router (shared/messages.ts). Settings messages are live;
+// translatePage/testApiKey land with the provider and pipeline layers
+// (Phases 2–3).
 const router = createMessageRouter({
   ping: () => {
     log.debug("ping received");
     return { ok: true };
   },
+  ...createSettingsHandlers(),
 });
 browser.runtime.onMessage.addListener(router);
 
 browser.commands.onCommand.addListener((command) => {
   if (command === CMD_TOGGLE) {
-    // Real toggle behavior lands with settings in Phase 1.
-    log.info("toggle command received (not yet implemented)");
+    // Fail soft: a storage error must never leave an unhandled rejection.
+    void toggleEnabled().catch((err) => log.warn("toggle command failed", err));
   }
 });
 

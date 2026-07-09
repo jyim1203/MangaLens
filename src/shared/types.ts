@@ -32,20 +32,29 @@ export const PROVIDER_IDS: readonly ProviderId[] = [
 /**
  * What kind of text region the model detected (gap resolution #2).
  *
- * WHY reconstructed: the exact members were decided in an earlier design pass
- * that isn't in-repo. Reconstructed from the prompt spec (PROMPTS.md / §6),
- * which asks the model to detect "every speech bubble, caption, and text
- * region" and to flag onomatopoeia. `other` is the catch-all so the union can
- * grow without breaking the cache or overlay. Optional on
- * {@link TranslatedRegion} so providers that don't classify still validate.
+ * The five spec members mirror the canonical prompt schema enum in
+ * PROMPTS.md §2 exactly — `sign` is load-bearing (the watermark post-filter
+ * in PROMPTS.md §9 keys on it). `other` is NOT in the prompt schema: it is
+ * the code-side catch-all the response sanitizer maps unknown/unlisted kinds
+ * to, so a provider inventing a value can't poison the cache or overlay.
+ * Optional on {@link TranslatedRegion} so providers that don't classify
+ * still validate.
  */
-export type RegionKind = "bubble" | "caption" | "sfx" | "other";
+export type RegionKind =
+  | "bubble"
+  | "caption"
+  | "sfx"
+  | "sign"
+  | "thought"
+  | "other";
 
 /** All region kinds — runtime-usable for validation. */
 export const REGION_KINDS: readonly RegionKind[] = [
   "bubble",
   "caption",
   "sfx",
+  "sign",
+  "thought",
   "other",
 ] as const;
 
@@ -167,11 +176,14 @@ export interface ProviderSettings {
 }
 
 /** Taxonomy of provider failures (fully implemented in Phase 3). Surfaced here
- *  so message/error types can reference it now. */
+ *  so message/error types can reference it now. `refusal` is a provider
+ *  safety refusal (PROMPTS.md §6 ContentRefusalError): UI shows "provider
+ *  declined this image" and, unlike the others, it is never retried. */
 export type ProviderErrorKind =
   | "auth"
   | "rate-limit"
   | "malformed"
   | "network"
   | "aborted"
+  | "refusal"
   | "unknown";

@@ -46,6 +46,26 @@ describe("shared/settings — mergeSettings", () => {
     expect(mergeSettings(DEFAULT_SETTINGS, null)).toEqual(DEFAULT_SETTINGS);
     expect(mergeSettings(DEFAULT_SETTINGS, "nope")).toEqual(DEFAULT_SETTINGS);
   });
+
+  it("deletes open-record entries on null and heals null in fixed-shape objects (edge: null semantics)", () => {
+    const base: Settings = {
+      ...DEFAULT_SETTINGS,
+      perSiteOverrides: { "reader.io": true, "other.io": false },
+      apiKeys: { gemini: "key-g", openai: "key-o" },
+    };
+    const merged = mergeSettings(base, {
+      perSiteOverrides: { "reader.io": null },
+      apiKeys: { openai: null },
+      // Corrupt data: null inside the fixed-shape font object heals, not deletes.
+      font: { color: null },
+      // Top-level null is ignored entirely.
+      enabled: null,
+    });
+    expect(merged.perSiteOverrides).toEqual({ "other.io": false });
+    expect(merged.apiKeys).toEqual({ gemini: "key-g" });
+    expect(merged.font.color).toBe(base.font.color);
+    expect(merged.enabled).toBe(base.enabled);
+  });
 });
 
 describe("shared/settings — migrateSettings", () => {
@@ -149,6 +169,20 @@ describe("shared/settings — load/save round-trip", () => {
     const reloaded = await loadSettings();
     expect(reloaded.enabled).toBe(true);
     expect(reloaded.font.color).toBe("#0000ff");
+  });
+
+  it("saveSettings removes a per-site override via a null patch entry (edge: user-data deletion)", async () => {
+    await saveSettings({ perSiteOverrides: { "reader.io": true }, apiKeys: { gemini: "sk" } });
+    const cleared = await saveSettings({
+      perSiteOverrides: { "reader.io": null },
+      apiKeys: { gemini: null },
+    });
+    expect(cleared.perSiteOverrides).toEqual({});
+    expect(cleared.apiKeys).toEqual({});
+    // The deletion persisted — nulls are never stored.
+    const reloaded = await loadSettings();
+    expect(reloaded.perSiteOverrides).toEqual({});
+    expect(reloaded.apiKeys).toEqual({});
   });
 
   it("heals a corrupt stored blob on load (edge: bad data in storage)", async () => {

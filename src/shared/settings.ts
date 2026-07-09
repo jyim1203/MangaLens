@@ -29,6 +29,38 @@ export type DeepPartial<T> = {
 };
 
 /**
+ * The patch type accepted by {@link saveSettings} / the `setSettings` message.
+ *
+ * Identical to `DeepPartial<Settings>` except that entries in the OPEN-KEYED
+ * records ({@link Settings.perSiteOverrides}, {@link Settings.apiKeys},
+ * {@link Settings.models}) may be `null`, meaning **delete this entry**.
+ * WHY: the one-level merge can only add/overwrite keys, so without a delete
+ * sentinel there would be no way to remove a per-site override or wipe a
+ * stored API key — both are user-data-removal paths we must support (§7.6).
+ * `null` is never persisted; {@link mergeSettings} strips it.
+ */
+export type SettingsPatch = Omit<
+  DeepPartial<Settings>,
+  "perSiteOverrides" | "apiKeys" | "models"
+> & {
+  perSiteOverrides?: Record<string, boolean | null>;
+  apiKeys?: Partial<Record<ProviderId, string | null>>;
+  models?: Partial<Record<ProviderId, string | null>>;
+};
+
+/**
+ * The open-keyed record fields, where keys are user data (hostnames,
+ * providers) rather than schema: `null` deletes the entry. In fixed-shape
+ * nested objects (`font`) a `null` is corrupt data and heals to the base
+ * value instead.
+ */
+const OPEN_RECORD_KEYS: ReadonlySet<keyof Settings> = new Set([
+  "perSiteOverrides",
+  "apiKeys",
+  "models",
+]);
+
+/**
  * Bump when the {@link Settings} shape changes in a way that needs data
  * transformation (not just a new field with a default — those are handled by
  * merge). Each increment gets a step in {@link migrateSettings}.
@@ -192,12 +224,24 @@ export function mergeSettings(
   for (const key of Object.keys(defaults) as (keyof Settings)[]) {
     if (!(key in stored)) continue;
     const incoming = stored[key];
-    if (incoming === undefined) continue;
+    // Top-level null is never valid — treat like undefined (heals corrupt blobs).
+    if (incoming === undefined || incoming === null) continue;
 
     const base = defaults[key];
     if (isPlainObject(base) && isPlainObject(incoming)) {
       // One-level nested merge (font, apiKeys, models, perSiteOverrides).
-      (out[key] as Record<string, unknown>) = { ...base, ...incoming };
+      const merged: Record<string, unknown> = { ...base, ...incoming };
+      for (const k of Object.keys(merged)) {
+        if (merged[k] !== null) continue;
+        if (OPEN_RECORD_KEYS.has(key)) {
+          // `null` in an open-keyed record = delete the entry (SettingsPatch).
+          delete merged[k];
+        } else {
+          // `null` in a fixed-shape object (font) is corrupt — heal from base.
+          merged[k] = (base as Record<string, unknown>)[k];
+        }
+      }
+      (out[key] as Record<string, unknown>) = merged;
     } else {
       (out[key] as unknown) = incoming;
     }
@@ -319,10 +363,12 @@ export async function loadSettings(): Promise<Settings> {
 /**
  * Merge a partial update into the stored settings and persist. Returns the full
  * updated settings. Nested objects in `patch` (e.g. `{ font: {...} }`) are
- * merged onto existing values, not replaced wholesale.
+ * merged onto existing values, not replaced wholesale. A `null` entry in
+ * `perSiteOverrides` / `apiKeys` / `models` deletes that entry (see
+ * {@link SettingsPatch}).
  */
 export async function saveSettings(
-  patch: DeepPartial<Settings>,
+  patch: SettingsPatch,
 ): Promise<Settings> {
   const current = await loadSettings();
   const next = mergeSettings(current, patch as unknown);

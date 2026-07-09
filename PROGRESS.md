@@ -58,4 +58,35 @@ original: the exact `RegionKind` members (`bubble | caption | sfx | other`) and
 the precise `Settings` field set/shape. Both are easy to extend; flag on any
 mismatch. Deferred to later phases: `translatePage`/`testApiKey` message
 handlers (need the provider + pipeline layers), and wiring the enable-gate into
-the content script (Phase 5).
+the content script (Phase 5). *(The `RegionKind` mismatch was real — resolved
+in Phase 1.1 below.)*
+
+## Phase 1.1 summary (contract fixes)
+
+A review pass against the in-repo spec docs caught drift that the Phase 1
+"reconstructed" warning anticipated; all fixed. (1) `RegionKind` now matches
+the canonical prompt schema (PROMPTS.md §2) exactly — `bubble | caption | sfx
+| sign | thought` — plus code-side `other`, the catch-all the Phase 3
+sanitizer maps unknown provider values to (`sign` is load-bearing for the §9
+watermark filter). (2) `ProviderErrorKind` gained `refusal` (PROMPTS.md §6
+`ContentRefusalError`: "provider declined this image", never retried). (3) The
+settings message handlers Phase 1 accidentally left unwired are live: new
+`background/settingsHandlers.ts` implements `getSettings`/`setSettings`/
+`toggleEnabled` plus a `settingsChanged` broadcast to all tabs
+(`Promise.allSettled` — a dead tab never fails a save), and the Alt+Shift+M
+command now really toggles. Kept separate from index.ts because fake-browser
+doesn't stub `browser.commands`; the background is now the single settings
+write path (also serializes popup/options writes). (4) New deletion
+convention: `SettingsPatch` (now the `setSettings` payload type) allows `null`
+entries in the open-keyed records (`perSiteOverrides`/`apiKeys`/`models`)
+meaning "delete this entry" — previously the one-level merge could only
+add/overwrite, so per-site overrides and stored API keys were undeletable.
+`null` in fixed-shape objects (`font`) heals to the base value; top-level
+`null` is ignored; nulls are never persisted. (5) Content script is now fully
+inert — the Phase 0 liveness ping woke the background event page on every page
+visited; removed. Phase 5 note recorded in content/index.ts: gate via direct
+`storage.local` read + `storage.onChanged` (doesn't wake the event page), not
+messaging. Tests: 6 new (null-delete merge/persist; handler round-trips;
+toggle; broadcast fan-out with a rejecting tab — fake-browser's
+`tabs.sendMessage` is a throw-stub, mocked via spy), 32 total green; typecheck
++ eslint + build + `web-ext lint` (0/0) clean.
