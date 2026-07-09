@@ -17,18 +17,20 @@ import {
   createSettingsHandlers,
   toggleEnabled,
 } from "./settingsHandlers";
+import { createTranslateHandlers } from "./translateHandlers";
 
 const log = createLogger("background");
 
-// Typed message router (shared/messages.ts). Settings messages are live;
-// translatePage/testApiKey land with the provider and pipeline layers
-// (Phases 2–3).
+// Typed message router (shared/messages.ts). Settings + translatePage are live;
+// testApiKey lands with the options UI (Phase 6). Cache/queue wrap the translate
+// handler in Phase 4.
 const router = createMessageRouter({
   ping: () => {
     log.debug("ping received");
     return { ok: true };
   },
   ...createSettingsHandlers(),
+  ...createTranslateHandlers(),
 });
 browser.runtime.onMessage.addListener(router);
 

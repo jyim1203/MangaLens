@@ -13,6 +13,7 @@
  * reason to UI (and know an abort from a dead link). Per handoff rule 6, callers
  * fail soft: no overlay + a warning, never a broken host page.
  */
+import { isAbortError } from "../shared/guards";
 import { createLogger } from "../shared/log";
 
 const log = createLogger("imageFetcher");
@@ -85,12 +86,6 @@ export const MAX_IMAGE_BYTES = 40 * 1024 * 1024;
  * decoder in `imagePrep.ts` to accept or reject.
  */
 const NON_IMAGE_TYPE = /^(?:text\/|application\/(?:json|xml|xhtml\+xml|javascript))/i;
-
-/** True if `err` is (or wraps) an abort — either a DOMException or a named object. */
-function isAbortError(err: unknown): boolean {
-  if (err instanceof DOMException) return err.name === "AbortError";
-  return (err as { name?: unknown } | null)?.name === "AbortError";
-}
 
 /** First MIME token, lowercased and trimmed (`image/jpeg; charset=x` → `image/jpeg`). */
 function normalizeContentType(raw: string | null): string {

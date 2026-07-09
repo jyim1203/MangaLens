@@ -167,6 +167,13 @@ export interface ProviderSettings {
   targetLang: string;
   /** Pinned source language (F11); omit for auto-detect. */
   sourceLangHint?: string;
+  /**
+   * Manga reading direction, drives the prompt's `{{reading_order_rule}}`
+   * (PROMPTS.md §3/§7). Mirrors {@link import("./settings").Settings.readingDirection};
+   * added in Phase 3 (flagged handoff-rule-4 contract change) because the prompt
+   * layer needs it and `deriveProviderSettings` is the only bridge to it.
+   */
+  readingDirection: "rtl" | "ltr" | "auto";
   /** Keep Japanese honorifics (-san, -kun, …) in the translation. */
   preserveHonorifics: boolean;
   /** Translate SFX/onomatopoeia instead of skipping them (F19). */

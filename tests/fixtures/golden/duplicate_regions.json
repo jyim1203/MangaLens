@@ -1,0 +1,8 @@
+{
+  "source_lang": "ja",
+  "regions": [
+    { "bbox": [0.20, 0.20, 0.30, 0.20], "original": "だぶり", "translated": "Duplicate", "is_sfx": false, "confidence": 0.9 },
+    { "bbox": [0.205, 0.205, 0.30, 0.20], "original": "だぶり", "translated": "Duplicate", "is_sfx": false, "confidence": 0.7 },
+    { "bbox": [0.60, 0.60, 0.20, 0.10], "original": "べつの", "translated": "Different", "is_sfx": false }
+  ]
+}

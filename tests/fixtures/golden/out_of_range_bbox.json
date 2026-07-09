@@ -1,0 +1,7 @@
+{
+  "source_lang": "ja",
+  "regions": [
+    { "bbox": [1.05, -0.02, 0.20, 0.10], "original": "はみ出し", "translated": "Overflow", "is_sfx": false },
+    { "bbox": [0.30, 0.40, 1.20, 0.10], "original": "広すぎ", "translated": "Too wide", "is_sfx": false }
+  ]
+}

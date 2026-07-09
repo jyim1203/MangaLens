@@ -41,6 +41,19 @@ export interface TranslatePageRequest {
 }
 
 /**
+ * Response of the `translatePage` message: a discriminated result rather than
+ * a thrown error. WHY: `runtime.sendMessage` serializes a rejected Promise to
+ * a bare message string — a typed `ProviderError`'s `kind` would be lost in
+ * transit, and the PROMPTS.md §6 taxonomy must reach the content script to
+ * drive UI ("check your API key" vs backoff vs "provider declined"). Returning
+ * the failure as data survives the boundary and keeps the handler from ever
+ * rejecting (fail soft, handoff rule 6).
+ */
+export type TranslatePageResult =
+  | { ok: true; page: PageTranslation }
+  | { ok: false; errorKind: ProviderErrorKind; message: string };
+
+/**
  * The complete set of messages and their request/response shapes. Add a new
  * message by adding one entry here; every helper updates its types
  * automatically. Use `void` for a request or response that carries no data.
@@ -62,10 +75,11 @@ export interface MessageMap {
   /** Toggle the global enable flag; resolves with the full new settings (F1). */
   toggleEnabled: { request: void; response: Settings };
 
-  /** Translate one image; resolves with the page translation (§7.3). */
+  /** Translate one image; resolves with a success/failure result (§7.3).
+   *  Never rejects for translation failures — see {@link TranslatePageResult}. */
   translatePage: {
     request: TranslatePageRequest;
-    response: PageTranslation;
+    response: TranslatePageResult;
   };
 
   /** Validate an API key with a cheap ping (options "test key" button, §7.6). */

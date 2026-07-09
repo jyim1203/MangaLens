@@ -1,0 +1,3 @@
+{"source_lang":"ko","regions":[{"bbox":[0.2,0.3,0.25,0.1],"original":"안녕","translated":"Hi","is_sfx":false,"kind":"bubble"}]}
+
+I hope this helps! Let me know if you'd like any adjustments to the tone.

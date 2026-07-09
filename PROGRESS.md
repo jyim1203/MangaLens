@@ -169,3 +169,130 @@ regression, wide-strip width cap, tile-height clamp, non-strip tall page,
 degenerate guard; imageFetcher 1: content-length pre-check ordered before the
 body read), 78 total green; typecheck + eslint + build + `web-ext lint` (0/0)
 all clean.
+
+## Phase 3 summary (provider layer)
+
+Landed the whole `providers/` layer plus the end-to-end translate path that
+Phase 2 deferred. **One flagged contract change** (handoff rule 4): added
+`readingDirection` to `ProviderSettings` (mirrors `Settings.readingDirection`)
+and to `deriveProviderSettings`, because the prompt needs the reading-order slot
+and `derive` is the only bridge — no other `shared/types.ts` shape moved.
+`providers/prompt.ts` is the pure prompt layer (PROMPTS.md): the canonical JSON
+schema as a typed constant with three dialect converters derived from it —
+`toGeminiSchema` (strips `additionalProperties`), `toOpenAiStrictSchema` (adds
+`kind` to `required` + a `"none"` enum member, strips `minimum`/`maximum`/
+`minItems`/`maxItems` that strict mode rejects), `toAnthropicToolSchema`
+(canonical as-is) — plus the verbatim §3 `SYSTEM_PROMPT_TEMPLATE` with
+`{{slot}}` filling (`buildSystemPrompt`/`buildUserText`/`buildPromptContext`),
+`languageName` (curated map → `Intl.DisplayNames` → raw code; region tags like
+`zh-TW` kept in parens), and the honorifics/reading-order slot text. Change any
+of these strings ⇒ bump `PROMPT_VERSION`. `providers/ProviderBase.ts` holds (a)
+the typed `ProviderError` (`kind` from the §6 taxonomy: `auth`/`rate-limit`/
+`malformed`/`network`/`aborted`/`refusal`/`unknown`, carrying `status` +
+`retryAfterMs`) with `mapHttpError`/`parseRetryAfter`; (b) the **pure, exported
+response pipeline** (`extractJsonObject` → outermost-brace trim that also drops
+```json fences/commentary, `parseModelJson`, `validatePageShape`, `sanitizePage`
+= clamp bboxes to [0,1] + drop degenerate (`w*h<0.0001`)/whole-page (`>0.9`)/
+empty-original regions + dedupe IoU>0.85 identical-original + `>30%`
+missing-translation ⇒ throw `malformed`, `normalizeSourceLang` (jpn→ja, ja-JP→ja,
+und kept), `normalizeKind` (5 spec kinds + `other`; `none`/unknown → undefined/
+`other`), `parseBbox` (array or object form)); and (c) the abstract
+`ProviderBase implements Translator` engine — base64-encode the tile, HTTP with
+**rate-limit backoff** (2s/8s/30s ladder, honours `retry-after`), a **one-shot
+malformed→repair retry** (re-runs with a "return only JSON" nudge), a **400
+`downgrade` hook**, refusal short-circuit, abort guards, and tile→full-image
+bbox remap via `remapBboxFromTile` when `job.tileOffset` is set. All timing/HTTP
+seams (`fetchFn`/`sleep`/`backoffMs`) are constructor-injected so backoff is
+tested without real waits. Four adapters implement only request-shape +
+envelope-extraction: `gemini.ts` (default; `responseSchema` +
+`systemInstruction`, `x-goog-api-key` header, `finishReason`/`blockReason` →
+refusal), `openai.ts` (also the base for custom + OpenRouter; `json_schema`
+strict, `message.refusal`/`content_filter` → refusal, and the `json_schema`→
+`json_object` **downgrade ladder** on a 400 mentioning `response_format`, pasting
+the schema into the system prompt), `openrouter.ts` (OpenAI base URL + `HTTP-
+Referer`/`X-Title`), `anthropic.ts` (forced `emit_translation` tool-use →
+`tool_use.input` parsed directly, `anthropic-dangerous-direct-browser-access`
+header, `stop_reason:"refusal"`). `providers/factory.ts` `createProvider` maps a
+`ProviderId` to the class (custom → OpenAI wire format at the user's endpoint;
+throws if custom has no endpoint). `background/translateHandlers.ts` wires the
+`translatePage` message end-to-end (fetch → `prepareImage` → per-tile hash +
+`translatePage` → `mergeTilePages`) and is now live in the router; split like
+imagePrep into a **pure, tested `mergeTilePages`** (concat + `dedupeRegions`
+across tile overlap zones, first non-`und` source lang wins, token sums) and a
+**thin untested `translateImage`** driver (needs `OffscreenCanvas`, same env
+reason `prepareImage` is untested). **Design choices flagged:** (1) the §6.4
+repair uses the provider-agnostic "re-run at temperature-0 with a nudge" variant,
+not the "text-only cheap fix call" — structured-output providers rarely emit
+malformed JSON, so the simpler general path is preferred; the fix-call variant is
+a noted later refinement. (2) The §9 watermark post-filter (drop edge `sign`
+regions matching a domain regex) is deferred to the overlay layer (Phase 5),
+where image-edge proximity is unambiguous (a middle tile's edge isn't the page
+edge). (3) Multi-page batch (PROMPTS §4.2) stays deferred with F12 — the
+`Translator` interface is one-image-per-call, so batching is a queue concern
+(Phase 8); batch golden fixtures deferred with it. **Deferred to Phase 4:** the
+IndexedDB cache (cache-first + negative cache on failure) and the priority/
+concurrency queue — `translateHandlers` currently runs each request immediately
+and ignores `priority`; the merged page's `imageHash` is the original bytes'
+digest (composed with targetLang/model/`PROMPT_VERSION` later). `testApiKey` stays
+deferred to the options UI (Phase 6). The background bundle grew to ~25 kB as the
+provider + Phase-2 pipeline modules are now reachable from the live handler
+(previously tree-shaken). Tests: 67 new across 5 files (pipeline/golden 9 fixture
+files incl. fenced/trailing/out-of-range/whole-page/duplicate/empty; ProviderBase
+engine: happy path, tile remap, auth/abort guards, HTTP error mapping, refusal,
+rate-limit ladder + `retry-after` + give-up, malformed repair + propagation;
+per-provider request shape + extraction + refusal + downgrade; factory;
+prompt slots/dialects/lang-names; mergeTilePages), 145 total green; typecheck +
+eslint + build + `web-ext lint` (0 errors / 0 warnings; the lone
+`data_collection_permissions` notice stays Phase-8-deferred) all clean.
+
+## Phase 3.1 summary (review fixes)
+
+A review of Phase 3 against Architecture/PROMPTS plus current provider API
+behavior caught two would-be-broken-in-production bugs, several spec
+deviations, and cleanups; all fixed. (1) **Anthropic on current models was
+dead**: the adapter sent `temperature` unconditionally, but Claude 4.6+ models
+(Opus 4.7/4.8, Sonnet 5, Fable 5) removed sampling params and 400 on them —
+only older models like the default `claude-haiku-4-5` still accept them. Fix:
+a provider-specific `downgrade` pass (the hook was generalized from
+OpenAI-only) strips `temperature` on a 400 naming a sampling param and
+memoizes the model in a module-level set (learn-on-400 beats a hardcoded list
+that goes stale; one wasted 400 per model per event-page lifetime). (2)
+**Error kinds died at the message boundary**: `runtime.sendMessage` serializes
+a rejected `ProviderError` down to its message string, so the §6 taxonomy
+(auth/rate-limit/refusal/… → UI messaging) could never reach the Phase 5
+content script. **Flagged contract change** (messages.ts, zero consumers yet):
+`translatePage` now resolves with a `TranslatePageResult` union — `{ok:true,
+page}` | `{ok:false, errorKind, message}` — and the handler never rejects
+(fail-soft, rule 6); pure `errorToTranslateResult` maps ProviderError kinds
+1:1 and ImageFetchError reasons to `aborted`/`network`. (3) **tokensIn/Out
+were never populated** (F17 cost tracker starved; mergeTilePages summed
+always-undefined): `ProviderOutput` gained an optional `usage`, all three
+envelope extractors now pull provider token counts (OpenAI `usage.*_tokens`,
+Anthropic `usage.input/output_tokens`, Gemini `usageMetadata.*TokenCount`),
+and `finish` stamps them on the PageTranslation. (4) **Repair retry now runs
+at temperature 0** per PROMPTS §6.4 (was: user's temperature) — `BuildContext`
+carries a per-request `temperature`, `undefined` meaning "omit the field". (5)
+**529 (overloaded) joins the 429 backoff ladder** instead of failing instantly
+as `network` — it's the canonical retry-with-backoff status. (6) **retry-after
+is capped at 60s** (`MAX_RETRY_AFTER_MS`) so a hostile/buggy header can't
+stall a job for an hour. (7) **Webtoon tiles now translate in parallel**
+(`Promise.all`; §7.5 — a 10-tile strip was paying 10× serial latency; 429/529
+backoff self-limits until the Phase 4 queue adds the global concurrency cap).
+(8) **OpenAI downgrade mode is remembered per endpoint** (PROMPTS §5.2) in a
+module-level map — the §5.2 "persist in settings" part needs the options
+surface and is deferred to Phase 6; both memos expose `reset*` test seams. (9)
+`TranslatePageRequest.priority` now flows through to the jobs (was hardcoded
+0). (10) Reuse/dead code: new dependency-free `shared/guards.ts` owns
+`isPlainObject`/`isAbortError` (previously triplicated across settings.ts /
+imageFetcher.ts / ProviderBase.ts — importing from settings.ts would have
+dragged the polyfill into provider tests, hence the new module);
+`normalizeKind`'s redundant branches and `languageName`'s unreachable ternary
+arm collapsed; stale "fast path" comment fixed. Also verified against current
+API docs: `claude-haiku-4-5` is a valid model alias, `anthropic-version:
+2023-06-01` is current, and first-party Anthropic does NOT need
+thinking-disabled for forced tool_choice (that's Bedrock-only) — no changes
+needed there. Tests: 12 new (usage passthrough + per-provider extraction;
+temperature on primary/0-on-repair; 529 retry; retry-after cap; anthropic
+sampling-400 strip + memo; openai endpoint-mode memo; errorToTranslateResult
+kind mapping ×3), 157 total green; typecheck + eslint + build + `web-ext lint`
+(0/0) all clean.

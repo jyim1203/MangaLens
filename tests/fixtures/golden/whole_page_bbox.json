@@ -1,0 +1,7 @@
+{
+  "source_lang": "ja",
+  "regions": [
+    { "bbox": [0.02, 0.02, 0.97, 0.98], "original": "ページ全体", "translated": "The whole page", "is_sfx": false },
+    { "bbox": [0.10, 0.10, 0.20, 0.08], "original": "ふつうの吹き出し", "translated": "A normal bubble", "is_sfx": false }
+  ]
+}

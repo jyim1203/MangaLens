@@ -11,6 +11,7 @@
  * {@link saveSettings} are thin storage wrappers.
  */
 import browser from "webextension-polyfill";
+import { isPlainObject } from "./guards";
 import type { LogLevel } from "./log";
 import type { ProviderId, ProviderSettings } from "./types";
 import { PROVIDER_IDS } from "./types";
@@ -197,11 +198,6 @@ export const DEFAULT_SETTINGS: Settings = {
   readingDirection: "auto",
 };
 
-/** True for a non-null, non-array object. */
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 /**
  * Deep-merge a stored (possibly partial) settings blob onto the defaults.
  *
@@ -319,6 +315,7 @@ export function deriveProviderSettings(settings: Settings): ProviderSettings {
       settings.sourceLang && settings.sourceLang !== "auto"
         ? settings.sourceLang
         : undefined,
+    readingDirection: settings.readingDirection,
     preserveHonorifics: settings.preserveHonorifics,
     translateSfx: settings.translateSfx,
     temperature: settings.temperature,

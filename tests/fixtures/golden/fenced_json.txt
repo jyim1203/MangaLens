@@ -1,0 +1,5 @@
+Here is the translation you requested:
+
+```json
+{"source_lang":"ja","regions":[{"bbox":[0.1,0.1,0.2,0.15],"original":"こんにちは","translated":"Hello","is_sfx":false,"kind":"bubble"}]}
+```
