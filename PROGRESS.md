@@ -90,3 +90,82 @@ messaging. Tests: 6 new (null-delete merge/persist; handler round-trips;
 toggle; broadcast fan-out with a rejecting tab — fake-browser's
 `tabs.sendMessage` is a throw-stub, mocked via spy), 32 total green; typecheck
 + eslint + build + `web-ext lint` (0/0) clean.
+
+## Phase 2 summary (image acquisition pipeline)
+
+Landed the three background pipeline modules — all bytes work happens in the
+event page, never the content script (§7.3 CORS-taint bypass). No changes to
+`shared/types.ts` (handoff rule 4); tile geometry reuses the existing `BBox`.
+`background/hash.ts` is `sha256Hex(Blob | ArrayBuffer | ArrayBufferView)` over
+WebCrypto (`globalThis.crypto.subtle`, present in both the event page and the
+Node test runtime) → the 64-char hex `imageHash` that keys the cache; it hashes
+a typed-array view's own window (respects `byteOffset`/`byteLength`), and the
+*composite* key (hash + targetLang + model + `PROMPT_VERSION`) is deliberately
+left to Phase 4 `cache.ts`. `background/imageFetcher.ts` fetches image bytes by
+URL with `credentials: "include"` + `cache: "force-cache"` (mirror how the page
+loaded the image; reuse the HTTP-cached bytes), gated to http/https/data/blob
+schemes, capped at `MAX_IMAGE_BYTES` (40 MB), and surfaces a typed
+`ImageFetchError` with an `ImageFetchReason` taxonomy (`bad-url` /
+`unsupported-scheme` / `http-error` (carries `status`) / `empty` / `too-large` /
+`not-image` / `network` / `aborted`) so callers fail soft (rule 6); HTML/JSON
+bodies (auth walls, soft-404s) are rejected as `not-image`, and a missing
+content-type falls back to the sniffed `blob.type`. `background/imagePrep.ts` is
+split into a **pure, exhaustively-tested math layer** and a **thin browser
+canvas driver**: `computeDownscaledSize` (long-edge cap, never upscales, integer
+px, §7.5), `isLongStrip` (h/w > `LONG_STRIP_RATIO` = 3, §7.4), `computeTiles`
+(uniform tile-height windows — first flush at y=0, last **pinned to the image
+bottom** so there's no wasted sliver, adjacent overlap ≥ nominal `overlap ×
+tileHeightPx` so coverage has no gaps; emits a normalized `offset` BBox per
+tile), `remapBboxFromTile` (lift a provider's tile-local bbox back into
+full-image space, the inverse of tiling, §7.4), `iou`, and `dedupeRegions`
+(drop tile-overlap duplicates, keep higher confidence). Defaults live as
+exported constants (`DEFAULT_TILE_HEIGHT_PX` 1024, `DEFAULT_TILE_OVERLAP` 0.1,
+`LONG_STRIP_RATIO` 3, `TILE_DEDUPE_IOU` 0.5, `OUTPUT_MIME` `image/jpeg`). The
+browser-only `prepareImage(blob, opts)` is the small untested shell:
+`createImageBitmap` → `computeDownscaledSize` → `computeTiles` → per-tile
+`OffscreenCanvas` (draw the whole scaled bitmap shifted up by `yStartPx` so the
+canvas clips the band, avoiding source-rect rounding drift) → `convertToBlob`
+JPEG at `jpegQuality`, closing the bitmap in a `finally`; a normal page yields
+one full-image tile, a webtoon strip yields several overlapping ones. **Design
+choices flagged:** (1) dedupe uses the Architecture §7.4 rule (IoU > 0.5, keep
+higher confidence) rather than the PROMPTS §4.4 "farther from the cut edge"
+heuristic — simpler, operates on already-remapped tile-agnostic regions, noted
+in-source as a possible later refinement; (2) `prepareImage` is not unit-tested
+because `OffscreenCanvas`/`createImageBitmap` don't exist in the Node/jsdom test
+env — the untested surface is kept minimal and all its logic is in the tested
+pure helpers. Deferred: the `translatePage` handler that wires fetch→prep→hash
+→provider stays unbuilt (Phase 3 needs the provider layer), so nothing imports
+these three modules yet and they tree-shake out of the current build — expected;
+composite/negative cache keying lands in Phase 4. Tests: 39 new (hash 6:
+known-answer vectors + cross-representation stability + view-window; imageFetcher
+10: happy path + every reason branch + sniff fallback, global `fetch` stubbed;
+imagePrep 23: downscale/strip/tiling geometry, remap, IoU, dedupe), 71 total
+green; typecheck + eslint + build + `web-ext lint` (0 errors / 0 warnings; the
+lone `data_collection_permissions` notice stays Phase-8-deferred) all clean.
+
+## Phase 2.1 summary (review fixes)
+
+A review of Phase 2 against Architecture §7.4/§7.5 caught one critical bug and
+three hardening gaps; all fixed. (1) **Strip-crush bug**: `prepareImage` applied
+the long-edge cap to the whole image before tiling, so an 800×20000 webtoon
+(long edge = height) would have been shrunk to 48×1200 — §7.5's "max 1200 px on
+the long side" is *per tile* for strips. The fix extracts a new pure planner,
+`planPrep(naturalW, naturalH, opts) → PrepPlan` (strip flag, scale, scaled dims,
+tile layout): normal pages keep the long-edge cap, strips are **width-capped
+only** and tiled, with tile height clamped to `maxEdgePx` so every emitted tile
+honours the per-tile cap even when the user's cap is below the 1024 default.
+`prepareImage` is now an even thinner shell (decode → `planPrep` → render), and
+all scaling/tiling decisions are unit-testable — the regression case is pinned
+in a test. (2) JPEG has no alpha, so transparent PNG pixels encoded as black;
+`renderTile` now fills white before drawing. (3) `imageFetcher` rejects an
+oversized `content-length` header *before* buffering the body (the authoritative
+`blob.size` check stays as the backstop for lying/absent headers). (4)
+`jpegQuality` is clamped to [0, 1] — out-of-range is "unspecified" per the
+canvas spec and would silently fall back to the encoder default. Also noted
+in-source: `blob:` URLs stay fetch-allowed but page-created ones will fail
+cross-context as a plain `network` error (fail-soft; §7.3 screenshot capture is
+the eventual fallback). Tests: 7 new (planPrep 6: normal-page cap, strip
+regression, wide-strip width cap, tile-height clamp, non-strip tall page,
+degenerate guard; imageFetcher 1: content-length pre-check ordered before the
+body read), 78 total green; typecheck + eslint + build + `web-ext lint` (0/0)
+all clean.
