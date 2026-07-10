@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fakeBrowser } from "@webext-core/fake-browser";
 
 // translateHandlers.ts transitively imports settings.ts → webextension-polyfill,
@@ -7,12 +7,21 @@ import { fakeBrowser } from "@webext-core/fake-browser";
 vi.mock("webextension-polyfill", () => ({ default: fakeBrowser }));
 
 import {
+  createTranslateHandlers,
   errorToTranslateResult,
   mergeTilePages,
+  resetInflightForTest,
+  resetRequestControllersForTest,
+  resetSharedAbortsForTest,
+  resetTranslationQueueForTest,
 } from "../../src/background/translateHandlers";
 import { ImageFetchError } from "../../src/background/imageFetcher";
 import { ProviderError } from "../../src/background/providers/ProviderBase";
 import type { PageTranslation, TranslatedRegion } from "../../src/shared/types";
+import type browser from "webextension-polyfill";
+
+/** A minimal message sender stub for handler calls. */
+const SENDER = { url: "https://reader.example.com/ch/1" } as browser.Runtime.MessageSender;
 
 function region(
   bbox: TranslatedRegion["bbox"],
@@ -118,5 +127,80 @@ describe("translateHandlers — errorToTranslateResult", () => {
       errorKind: "unknown",
       message: "string throw",
     });
+  });
+
+  it("maps a raw AbortError to aborted (queue-level pre-run cancel path)", () => {
+    expect(
+      errorToTranslateResult(new DOMException("Aborted", "AbortError")),
+    ).toMatchObject({ ok: false, errorKind: "aborted" });
+  });
+});
+
+describe("translateHandlers — cancellation wiring (item 4)", () => {
+  beforeEach(() => {
+    fakeBrowser.reset();
+    resetRequestControllersForTest();
+    resetSharedAbortsForTest();
+    resetInflightForTest();
+    resetTranslationQueueForTest();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** Stub global fetch to hang until its signal aborts, resolving `onReached`. */
+  function hangingFetch(onReached: () => void): void {
+    vi.stubGlobal("fetch", (_url: string, init?: { signal?: AbortSignal }) => {
+      onReached();
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject(new DOMException("Aborted", "AbortError")),
+        );
+      });
+    });
+  }
+
+  it("cancelTranslation aborts the in-flight request → an aborted result", async () => {
+    const handlers = createTranslateHandlers();
+    let reached!: () => void;
+    const atFetch = new Promise<void>((r) => (reached = r));
+    hangingFetch(reached);
+
+    const pending = handlers.translatePage!(
+      { imageUrl: "https://x/y.jpg", priority: 0, requestId: "req-1" },
+      SENDER,
+    );
+    await atFetch; // now blocked inside the image fetch, controller registered
+
+    void handlers.cancelTranslation!({ requestId: "req-1" }, SENDER);
+
+    const result = await pending;
+    expect(result).toMatchObject({ ok: false, errorKind: "aborted" });
+  });
+
+  it("cancelTranslation for an unknown id is a silent no-op", () => {
+    const handlers = createTranslateHandlers();
+    expect(() =>
+      handlers.cancelTranslation!({ requestId: "does-not-exist" }, SENDER),
+    ).not.toThrow();
+  });
+
+  it("removes the request from the registry once it settles (later cancel no-ops)", async () => {
+    const handlers = createTranslateHandlers();
+    // Fetch rejects immediately → the request settles fast (as a network fail).
+    vi.stubGlobal("fetch", () =>
+      Promise.reject(new TypeError("NetworkError when attempting to fetch")),
+    );
+
+    const result = await handlers.translatePage!(
+      { imageUrl: "https://x/y.jpg", priority: 0, requestId: "req-2" },
+      SENDER,
+    );
+    expect(result.ok).toBe(false);
+
+    // Entry was removed in the handler's finally; cancelling now is a no-op.
+    expect(() =>
+      handlers.cancelTranslation!({ requestId: "req-2" }, SENDER),
+    ).not.toThrow();
   });
 });

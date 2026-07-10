@@ -440,3 +440,152 @@ running byte total inside its readwrite transaction — the read-only pre-check
 stays for the O(1) under-cap fast path — so a concurrent put/delete landing
 between the pre-check and the cursor walk can no longer be clobbered by the
 absolute total written back; re-verified green.)*
+
+## Phase 5 summary (content script: scan + overlay — first end-to-end)
+
+Landed the whole content-script pipeline (scan → viewport queue → background →
+provider → overlay) plus the real per-request cancellation the Phase 4 in-source
+note deferred — the first phase where the extension does anything user-visible.
+Every module keeps the repo's pure-core / thin-shell split: observers, Shadow-DOM
+manipulation, and layout reads live in untested shells, and every *decision*
+(gate classification, candidate scoring, priority tiers, geometry, text fitting,
+watermark/SFX filtering, abort refcounting) is a pure, browser-free, unit-tested
+function. **One flagged contract change** (handoff rule 4 — `shared/messages.ts`
+only, NO `shared/types.ts` change): `TranslatePageRequest` gained optional
+`requestId?: string` (content generates `crypto.randomUUID()`), and a new
+`cancelTranslation: { requestId } → void` message. **New dev dependency**
+`jsdom` (the one DOM-walker test opts in via `// @vitest-environment jsdom`; the
+suite default stays `node`).
+
+**Item 1 — enable gate (`content/gate.ts` + `content/index.ts` rewrite):** the
+gate is a pure reducer `computeGateAction(prev, settings, hostname) → activate |
+deactivate | restyle | re-request | no-op` (+ `activeAfter`), so idempotence
+(enable twice = once) and the restyle-vs-re-request classification are testable
+without a DOM. `re-request` fires when a *cache-key-affecting* setting changes
+(provider/model/customEndpoint/targetLang/sourceLang/readingDirection/honorifics,
+compared via `deriveProviderSettings`); `restyle` fires for font + `translateSfx`
+(render-time only); it dominates when both change. `index.ts` is a thin
+composition root: it reads settings with a raw `storage.local` get healed by the
+**pure** `migrateSettings` (NOT `loadSettings` — a content script on every page
+must never write storage, and a storage read doesn't wake the event page),
+gates on `getEffectiveEnabled`, and watches `storage.onChanged` (area local, key
+`SETTINGS_KEY`). It deliberately does NOT register a `settingsChanged` handler
+(storage.onChanged is strictly more reliable; both firing would double-handle —
+WHY-noted so Phase 6 doesn't "fix" it). Teardown is total (scanner → queue →
+overlay, in that order): observers disconnected, overlay hosts removed, every
+in-flight request cancelled.
+
+**Item 2 — `scanner.ts`:** pure `isCandidate` (rendered ≥ 180² px, natural ≥ 400
+px on one side, aspect unconstrained so webtoon strips pass) + `scoreCandidate`
+(rendered area × horizontal-centeredness so a big centered page beats a sidebar
+thumbnail) + `classifyImageUrl` (http/https/data accept, **blob skipped** — a
+blob URL can't be fetched cross-context, §7.3; Phase 7 covers it) + `parseCssUrl`.
+The thin shell walks `<img>` (`currentSrc` → `src`) and CSS `background-image`
+hosts, reconciles a registry each scan (dedupe unchanged, re-register on in-place
+`src` swap — firing onRemoved+onAdded so the stale overlay is dropped, prune
+gone elements), and drives re-scans off a debounced MutationObserver
+(childList+subtree, `src`/`srcset`/`style` attrs) + `popstate`. WHY no
+`history.pushState` monkey-patch: patching page globals from an isolated world is
+the host-page interference rule 6 forbids; the MutationObserver already catches
+the soft-nav DOM swap. Metrics read through an injectable seam so the walk is
+jsdom-testable (jsdom does no layout). **Scoping flagged:** `<canvas>` and
+`blob:` sources are skipped (Phase 7 drag-select/screenshot path); background
+hosts use rendered size as a natural-size proxy (no intrinsic size without
+loading — safe, only stricter).
+
+**Item 3 — `viewportQueue.ts`:** pure `planEnqueues` — (count, changed index +
+tier, already-requested set, prefetchAhead) → the exact `{index, priority}` list
+(the changed page at tier 0/1; on *visible*, N+1..N+prefetchAhead at priority 2;
+skip requested; never past the end). The shell runs two IntersectionObservers
+(rootMargin `0` → priority 0; `100%` → priority 1), sends
+`sendToBackground("translatePage", { imageUrl, priority, requestId })`, and wires
+the result to the overlay (`ok` → render, `aborted` → silent clear, else error
+badge). **No priority upgrade** for an already-sent request (the queue has no
+re-prioritize API and a duplicate would coalesce anyway — WHY-noted, revisit
+Phase 8). A generous 120 s timeout wraps the await (gap #8 — a dead event page
+would otherwise wedge the requested-set entry forever; on timeout it returns to
+"unrequested" so a later visibility retries). Doc order is maintained via
+`compareDocumentPosition` so prefetch neighbours are correct.
+
+**Item 4 — real cancellation:** `background/sharedAbort.ts` is a pure abort
+refcounter — the coalesced run owns one `AbortController`; each waiter registers
+its external signal; the underlying aborts only when *every* waiter has aborted
+(a no-signal waiter is permanently live; late registration after settle is a
+no-op). `translateImage` now creates/reuses one `SharedAbort` per cache key
+(leader creates + owns teardown, followers reuse it — leadership decided
+synchronously so there's no map desync), passing `shared.signal` to the run
+instead of the first caller's signal; `coalesce()` itself is untouched. The
+`translatePage` handler registers its `AbortController` under `requestId` in a
+module-level map (removed in `finally`); `cancelTranslation` aborts+removes it
+(unknown/settled id = silent no-op). Content sends `cancelTranslation` on
+teardown/disable (all outstanding) and on element-removed / `src`-swap — **not**
+on scroll-away (visible→near→visible thrash would cancel work we're about to
+want; prefetched results fill the cache anyway — WHY-noted). Hardening:
+`errorToTranslateResult` now maps any raw abort (`isAbortError`) to `aborted`, so
+a queue-level pre-run cancel stays silent instead of showing an `unknown` badge.
+
+**Item 5 — overlay (`overlay/OverlayManager.ts` + pure helpers):** one host per
+translated image appended to **`document.body`** (WHY not a sibling: inserting
+into the reader's tree mutates its layout — rule 6) with an **open** shadow root
+(debuggability; closed buys nothing). Styles injected as `<style>` into each
+shadow root only (never the page). Position: `absolute`, `getBoundingClientRect`
++ `scrollX/Y`, synced by ONE shared passive scroll/resize listener pair, a
+`ResizeObserver` per image, and the image's `load` event; `!img.isConnected`
+during sync tears the overlay down and asks the scanner to reconcile (cancels the
+request). The **one bbox→px conversion** (rule 5) is pure `regionToPx` (degenerate
+0-size rect → all-zero, no NaN). States: pending (shimmer skeleton), done
+(BubbleBoxes), error (⚠ badge with a title from the pure, total
+`errorKindToMessage`; `aborted` → renders nothing). **Watermark post-filter**
+(PROMPTS §9, deferred here from Phase 3) + **SFX filter** (F19) are pure
+`filterRegions`, applied at render time and **never mutating the cached page** (a
+`sign` within 2% of an edge whose original/translated text matches the page
+hostname or a URL/domain regex is dropped; middle signs, edge captions, and
+edge signs with non-URL text are kept).
+
+**Item 6 — `overlay/textFit.ts` + `overlay/BubbleBox.ts`:** pure `fitTextSize`
+(binary search for the largest integer px whose wrapped text fits, via an
+injected measurer) + `resolveFontSize` (fixed mode bypasses; empty text → 0;
+never-fits clamps to min and lets `overflow: hidden` crop). BubbleBox is the thin
+DOM shell: a positioned box with a separate fill layer (opacity without fading
+text, and no CSS-color parsing), centered auto-fitted text, 6% padding, optional
+`paint-order: stroke` + `-webkit-text-stroke` (with a text-shadow fallback),
+horizontal regardless of source direction. The DOM measurer reads an offscreen
+shadow-root element's scroll size.
+
+**Item 7 — test page:** `tests/fixtures/testpage.html` is self-contained — the
+images are hand-authored **public-domain SVG data-URI placeholders** (normal
+page, background-image page, extreme webtoon strip, ignored icon/avatar, and a
+2 s late-`src`-swap to exercise the MutationObserver), so scanning / ignore
+heuristics / positioning / tiling / mutation all work with zero binary fixtures.
+`tests/fixtures/images/README.md` documents dropping real public-domain manga
+JPGs there for a true provider round-trip. **Flagged:** no binary image fixtures
+were added (can't fetch/fabricate manga art here); the SVG placeholders cover the
+structural end-to-end, real OCR/translation needs the README's manual step.
+
+**Design choices flagged (recap):** body-append open-shadow hosts; no priority
+upgrade; no scroll-away cancel; blob/canvas scoping to Phase 7; background-image
+natural-size proxy; render-time watermark filter that never rewrites the cache;
+leader/follower shared-abort refcount; storage-read (non-waking) gate with no
+content-side `settingsChanged` handler. **Deferred:** drag-select / peek-original
+/ toasts (Phase 7); popup/options UI, in-flow permission request, cost/cache
+surfaces, `testApiKey` (Phase 6); prefetch tuning, priority re-prioritization,
+multi-page batching, scroll-away cancel (Phase 8). A mid-session `prefetchAhead`
+change is currently a no-op (takes effect on next activate) — accepted, noted.
+
+**Manual verification (not executed here — needs a real browser + API key):** the
+handoff's §"Manual verification" steps are ready to run against
+`tests/fixtures/testpage.html` served over http (`npx serve tests/fixtures`),
+with the optional host permission granted and a key set from the background
+console; enable via Alt+Shift+M and check overlays land on the two manga pages +
+strip (not the icons), track on resize, render instantly on reload (cache hit,
+no provider call), and vanish/return cleanly on toggle. This is the first phase
+whose pipeline is browser-runnable; the automated suite covers every pure
+decision, but the live provider round-trip is a manual step by nature.
+
+Tests: 69 new across 9 files (sharedAbort 6, gate 13, scanner 12, viewportQueue
+6, overlayGeometry 3, overlayFilter 12, overlayMessages 4, textFit 9,
+translateHandlers +4: abort mapping + cancel/unknown-id/registry-removal wiring),
+**284 total green**; typecheck + eslint + build + `web-ext lint` (0 errors / 0
+warnings; the lone `data_collection_permissions` notice stays Phase-8-deferred)
+all clean. Content bundle grew from inert to ~14 kB (scanner + queue + overlay +
+inlined `styles.css`).

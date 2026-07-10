@@ -1,0 +1,68 @@
+/*
+ * Overlay styles — injected into EACH overlay shadow root only (never the host
+ * document). Positioning/sizing of the boxes is set inline from measured pixel
+ * rects (BubbleBox / OverlayManager); this file carries the shared visuals:
+ * the host reset, the pending skeleton shimmer, and the error badge.
+ *
+ * Everything is pointer-events: none so the reader site keeps working (§7.2);
+ * the host page can never be styled by these rules (shadow isolation).
+ */
+
+:host {
+  all: initial;
+}
+
+.mangalens-container {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* Pending state (§7.5 perceived latency): a subtle animated shimmer. */
+.mangalens-skeleton {
+  position: absolute;
+  inset: 0;
+  border-radius: 6px;
+  pointer-events: none;
+  background: linear-gradient(
+    100deg,
+    rgba(120, 120, 120, 0.06) 30%,
+    rgba(120, 120, 120, 0.16) 50%,
+    rgba(120, 120, 120, 0.06) 70%
+  );
+  background-size: 200% 100%;
+  animation: mangalens-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes mangalens-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mangalens-skeleton {
+    animation: none;
+  }
+}
+
+/* Error state (§7.2): a small ⚠ badge; its title carries the user message. */
+.mangalens-badge {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font: 14px/1 system-ui, sans-serif;
+  color: #fff;
+  background: rgba(180, 40, 40, 0.92);
+  border-radius: 50%;
+  pointer-events: none;
+  user-select: none;
+}

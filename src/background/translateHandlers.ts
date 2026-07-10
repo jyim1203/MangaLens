@@ -45,6 +45,8 @@ import {
   shouldNegativeCache,
 } from "./cache";
 import { coalesce } from "./coalesce";
+import { createSharedAbort, type SharedAbort } from "./sharedAbort";
+import { isAbortError } from "../shared/guards";
 import { recordUsage, usageFromPage } from "./costTracker";
 import { ImageFetchError, fetchImageBytes } from "./imageFetcher";
 import { sha256Hex } from "./hash";
@@ -90,6 +92,33 @@ const inflightTranslations = new Map<string, Promise<PageTranslation>>();
 /** Reset the in-flight coalescing map — test seam only; no production caller. */
 export function resetInflightForTest(): void {
   inflightTranslations.clear();
+}
+
+/**
+ * Shared abort contexts keyed by cache key, parallel to
+ * {@link inflightTranslations}. Each coalesced run has ONE {@link SharedAbort}
+ * so per-request cancellation is refcounted: the underlying provider call is
+ * aborted only when every coalesced waiter has aborted (Phase 5 item 4).
+ */
+const sharedAborts = new Map<string, SharedAbort>();
+
+/** Reset the shared-abort map — test seam only; no production caller. */
+export function resetSharedAbortsForTest(): void {
+  sharedAborts.clear();
+}
+
+/**
+ * In-flight `translatePage` requests keyed by their content-generated
+ * `requestId`, so a later `cancelTranslation` can abort the exact request the
+ * content side gave up on (teardown, element removal, `src` swap). Module-level
+ * because the event page has no other place to hold it (gap #8: not persisted —
+ * an event-page death drops these, which is fine, the request died with it).
+ */
+const requestControllers = new Map<string, AbortController>();
+
+/** Reset the request-controller registry — test seam only; no production caller. */
+export function resetRequestControllersForTest(): void {
+  requestControllers.clear();
 }
 
 /**
@@ -262,23 +291,53 @@ export async function translateImage(
     throw new ProviderError(lookup.errorKind, lookup.message);
   }
 
-  // Coalesce concurrent misses for the same key onto one provider run (item 7).
-  // WHY safe to share `signal`: the handler's AbortController is never aborted
-  // today, so every coalesced caller wants the same result. When Phase 5 adds
-  // real per-request cancellation, this needs a refcount (abort only when the
-  // LAST waiter leaves) — leave that to Phase 5; don't build it here.
-  return coalesce(inflightTranslations, cacheKey, () =>
+  // Coalesce concurrent misses for the same key onto one provider run (item 7)
+  // and refcount the callers' abort signals (Phase 5 item 4): the run owns one
+  // SharedAbort; each caller registers its own `signal`; the underlying provider
+  // call is aborted only when EVERY caller has aborted, so a follower tab is
+  // never cancelled by a leader that scrolled away or toggled off.
+  //
+  // Leadership is decided synchronously (no await between here and `coalesce`):
+  // the first caller for a key creates the SharedAbort and owns its teardown;
+  // followers reuse it (it is set before the inflight entry that gates them).
+  const leader = !inflightTranslations.has(cacheKey);
+  const shared = leader
+    ? createSharedAbort()
+    : (sharedAborts.get(cacheKey) ?? createSharedAbort());
+  if (leader) sharedAborts.set(cacheKey, shared);
+  const stopWaiting = shared.addWaiter(signal);
+
+  const run = coalesce(inflightTranslations, cacheKey, () =>
     runTranslateMiss(
       cacheKey,
       pageHash,
       fetched.blob,
       settings,
       providerSettings,
-      signal,
+      shared.signal,
       priority,
       origin,
     ),
   );
+
+  if (leader) {
+    // The leader owns the SharedAbort lifecycle. `coalesce` clears the inflight
+    // entry in its own `.finally` first (it is upstream in the chain), so by the
+    // time this runs the entry is gone; only delete our own instance in case a
+    // fresh run for the same key already replaced it.
+    void run.finally(() => {
+      shared.settle();
+      if (sharedAborts.get(cacheKey) === shared) sharedAborts.delete(cacheKey);
+    });
+  }
+
+  try {
+    return await run;
+  } finally {
+    // Detach this caller's abort listener (does not count as leaving — a settled
+    // run must not trip the refcount).
+    stopWaiting();
+  }
 }
 
 /**
@@ -354,6 +413,13 @@ export function errorToTranslateResult(err: unknown): TranslatePageResult {
       message: `Image fetch failed (${err.reason}): ${err.message}`,
     };
   }
+  // A raw abort (queue-level pre-run cancel, or a DOMException an inner await
+  // rethrew) must map to `aborted`, not `unknown`, so the overlay stays silent
+  // (handoff item 5: aborted → render nothing). ProviderError('aborted') and
+  // ImageFetchError('aborted') are already handled above; this catches the rest.
+  if (isAbortError(err)) {
+    return { ok: false, errorKind: "aborted", message: "Translation aborted" };
+  }
   return {
     ok: false,
     errorKind: "unknown",
@@ -365,15 +431,17 @@ export function errorToTranslateResult(err: unknown): TranslatePageResult {
 export function createTranslateHandlers(): MessageHandlers {
   return {
     translatePage: async (req, sender) => {
+      // A fresh controller gives the provider an AbortSignal; the queue merges
+      // it with its own so a queue-wide abort still cancels this job. Registered
+      // under the request's id so `cancelTranslation` can abort it (item 4).
+      const controller = new AbortController();
+      if (req.requestId) requestControllers.set(req.requestId, controller);
       try {
         const settings = await loadSettings();
         const providerSettings = deriveProviderSettings(settings);
         // A request-level target language (e.g. drag-select) overrides settings.
         if (req.targetLang) providerSettings.targetLang = req.targetLang;
 
-        // A fresh controller gives the provider an AbortSignal; the queue merges
-        // it with its own so a queue-wide abort still cancels this job.
-        const controller = new AbortController();
         const page = await translateImage(
           req.imageUrl,
           settings,
@@ -386,6 +454,19 @@ export function createTranslateHandlers(): MessageHandlers {
       } catch (err) {
         log.warn(`translatePage failed for ${req.imageUrl}`, err);
         return errorToTranslateResult(err);
+      } finally {
+        if (req.requestId) requestControllers.delete(req.requestId);
+      }
+    },
+
+    cancelTranslation: (req) => {
+      // Abort the registered controller; unknown/already-settled ids are a silent
+      // no-op (the normal race — the request may have finished before the cancel
+      // arrived, or the event page was torn down and lost the registry).
+      const controller = requestControllers.get(req.requestId);
+      if (controller) {
+        controller.abort(new DOMException("Translation cancelled", "AbortError"));
+        requestControllers.delete(req.requestId);
       }
     },
   };

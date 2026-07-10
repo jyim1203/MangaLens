@@ -1,0 +1,343 @@
+/**
+ * Visibility → priority → translate requests (Architecture §7.5).
+ *
+ * This wires the priority plumbing that has existed end-to-end since Phase 1
+ * (`TranslatePageRequest.priority` → background `PriorityQueue`) but never had a
+ * real sender. Split per the pure-core / thin-shell rule:
+ *  - PURE, unit-tested: {@link planEnqueues} — given the candidate count, the
+ *    index whose visibility tier just changed, the already-requested set, and
+ *    `prefetchAhead`, it returns the exact `{ index, priority }` list to send.
+ *  - THIN shell: {@link createViewportQueue} — two IntersectionObservers, the
+ *    requested/outstanding bookkeeping, the fire-and-forget send with a timeout,
+ *    and the per-request cancellation on teardown (item 4).
+ *
+ * Priorities (§7.5): 0 = visible now, 1 = near viewport, 2 = prefetch ahead.
+ */
+import { createLogger } from "../shared/log";
+import { sendToBackground } from "../shared/messages";
+import type { PageTranslation, ProviderErrorKind } from "../shared/types";
+import type { Candidate } from "./scanner";
+
+const log = createLogger("viewport-queue");
+
+/** rootMargin for the "near viewport" observer — one viewport in every direction. */
+const NEAR_ROOT_MARGIN = "100%";
+
+/**
+ * Generous timeout around the `translatePage` await (§7.5, gap #8). WHY: the
+ * background event page is NOT persistent — if it dies mid-request the promise
+ * may never settle, which would wedge this image's requested-set entry forever.
+ * On timeout we return the entry to "unrequested" so a later visibility event
+ * retries.
+ */
+const REQUEST_TIMEOUT_MS = 120_000;
+
+/** The visibility tier a candidate just entered. 0 = visible, 1 = near. */
+export type Tier = 0 | 1;
+
+/** One enqueue instruction: translate candidate `index` at `priority`. */
+export interface Enqueue {
+  index: number;
+  priority: number;
+}
+
+/** Inputs to {@link planEnqueues}. All indices are into the doc-ordered list. */
+export interface PlanInput {
+  /** Total number of registered candidates. */
+  count: number;
+  /** The candidate index whose tier just changed. */
+  changedIndex: number;
+  /** Which tier it entered (0 visible / 1 near). */
+  changedTier: Tier;
+  /** Candidate indices already requested (never re-sent — no priority upgrade). */
+  requested: ReadonlySet<number>;
+  /** How many following pages to prefetch when a page becomes visible (§7.5). */
+  prefetchAhead: number;
+}
+
+/**
+ * Decide what to enqueue when one candidate's visibility tier changes (§7.5).
+ *
+ * The candidate itself is enqueued at its tier priority. Additionally, when a
+ * candidate becomes *visible* (tier 0), the next `prefetchAhead` candidates in
+ * document order are enqueued at priority 2 ("when page N becomes visible,
+ * enqueue N+1..N+3"). Already-requested indices are skipped (no re-send / no
+ * priority upgrade — the background queue has no re-prioritize API and a
+ * duplicate send would coalesce anyway), and prefetch never runs past the end of
+ * the list.
+ *
+ * @returns the enqueues to send, the changed candidate first. Pure.
+ */
+export function planEnqueues(input: PlanInput): Enqueue[] {
+  const { count, changedIndex, changedTier, requested, prefetchAhead } = input;
+  const plan: Enqueue[] = [];
+
+  const push = (index: number, priority: number): void => {
+    if (index < 0 || index >= count) return;
+    if (requested.has(index)) return;
+    if (plan.some((e) => e.index === index)) return;
+    plan.push({ index, priority });
+  };
+
+  push(changedIndex, changedTier);
+  if (changedTier === 0) {
+    for (let k = 1; k <= prefetchAhead; k++) push(changedIndex + k, 2);
+  }
+  return plan;
+}
+
+/** What the queue needs from the overlay layer — kept minimal to avoid coupling. */
+export interface OverlaySink {
+  /** Show the pending (skeleton/spinner) state for a candidate (§7.5). */
+  setPending(candidate: Candidate): void;
+  /** Render a finished translation. */
+  render(candidate: Candidate, page: PageTranslation): void;
+  /** Show the error badge for a candidate. */
+  setError(candidate: Candidate, errorKind: ProviderErrorKind): void;
+  /** Remove any overlay/pending state for a candidate. */
+  clear(candidate: Candidate): void;
+}
+
+/** Injectable seams for {@link createViewportQueue} (defaults use real APIs). */
+export interface ViewportQueueOptions {
+  overlay: OverlaySink;
+  /** How many pages ahead to prefetch (from settings). */
+  prefetchAhead: number;
+  /** Optional per-request target-language override (drag-select etc.). */
+  targetLang?: string;
+  /** Generate a request id; defaulted to `crypto.randomUUID()`. */
+  makeRequestId?: () => string;
+  /** IntersectionObserver factory seam (tests inject a fake). */
+  createObserver?: (
+    cb: IntersectionObserverCallback,
+    options?: IntersectionObserverInit,
+  ) => IntersectionObserver;
+}
+
+/** A live viewport queue. */
+export interface ViewportQueue {
+  /** Register a candidate for visibility tracking (from the scanner). */
+  register(candidate: Candidate): void;
+  /** Unregister a candidate: unobserve, cancel any in-flight request, clear overlay. */
+  unregister(candidate: Candidate): void;
+  /** Tear everything down: cancel all in-flight requests and disconnect observers. */
+  stop(): void;
+}
+
+/** Per-candidate bookkeeping. */
+interface Tracked {
+  candidate: Candidate;
+  requested: boolean;
+  /** requestId of the in-flight translate, if any (for cancellation, item 4). */
+  requestId?: string;
+}
+
+/**
+ * Build the viewport queue (§7.5). Observes registered candidates with two
+ * IntersectionObservers (exact viewport → priority 0; one-viewport margin →
+ * priority 1), plans enqueues with {@link planEnqueues}, and sends
+ * `translatePage` for each, wiring the result into the overlay sink. In-flight
+ * requests are cancellable by id so teardown/removal stops paying the provider
+ * (item 4).
+ *
+ * @param opts overlay sink, prefetch depth, and optional test seams.
+ */
+export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
+  const overlay = opts.overlay;
+  const makeRequestId = opts.makeRequestId ?? (() => crypto.randomUUID());
+  const makeObserver =
+    opts.createObserver ??
+    ((cb, options) => new IntersectionObserver(cb, options));
+
+  /** Candidates in document order (as registered by the scanner). */
+  const order: Candidate[] = [];
+  /** element → tracking record, so an IntersectionObserver entry maps back. */
+  const tracked = new Map<Element, Tracked>();
+
+  const indexOf = (candidate: Candidate): number =>
+    order.findIndex((c) => c.id === candidate.id);
+
+  /** Build the requested-index set the pure planner needs. */
+  const requestedIndices = (): Set<number> => {
+    const set = new Set<number>();
+    order.forEach((c, i) => {
+      if (tracked.get(c.el)?.requested) set.add(i);
+    });
+    return set;
+  };
+
+  const onTierChange = (candidate: Candidate, tier: Tier): void => {
+    const changedIndex = indexOf(candidate);
+    if (changedIndex < 0) return;
+    const plan = planEnqueues({
+      count: order.length,
+      changedIndex,
+      changedTier: tier,
+      requested: requestedIndices(),
+      prefetchAhead: opts.prefetchAhead,
+    });
+    for (const { index, priority } of plan) {
+      const c = order[index];
+      if (c) void sendTranslate(c, priority);
+    }
+  };
+
+  const visibleObserver = makeObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const rec = tracked.get(entry.target);
+        if (rec) safe(() => onTierChange(rec.candidate, 0));
+      }
+    },
+    { rootMargin: "0px" },
+  );
+
+  const nearObserver = makeObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const rec = tracked.get(entry.target);
+        if (rec) safe(() => onTierChange(rec.candidate, 1));
+      }
+    },
+    { rootMargin: NEAR_ROOT_MARGIN },
+  );
+
+  async function sendTranslate(
+    candidate: Candidate,
+    priority: number,
+  ): Promise<void> {
+    const rec = tracked.get(candidate.el);
+    // WHY re-check identity: a rescan may have unregistered/replaced this element
+    // between the plan and this async send.
+    if (!rec || rec.candidate.id !== candidate.id || rec.requested) return;
+
+    rec.requested = true;
+    const requestId = makeRequestId();
+    rec.requestId = requestId;
+    safe(() => overlay.setPending(candidate));
+
+    try {
+      const result = await withTimeout(
+        sendToBackground("translatePage", {
+          imageUrl: candidate.url,
+          priority,
+          requestId,
+          targetLang: opts.targetLang,
+        }),
+        REQUEST_TIMEOUT_MS,
+      );
+      // The candidate may have been torn down while we awaited.
+      const live = tracked.get(candidate.el);
+      if (!live || live.candidate.id !== candidate.id) return;
+      live.requestId = undefined;
+
+      if (result.ok) {
+        safe(() => overlay.render(candidate, result.page));
+      } else if (result.errorKind === "aborted") {
+        // Silent: the user scrolled away or toggled off — nothing is wrong.
+        safe(() => overlay.clear(candidate));
+      } else {
+        safe(() => overlay.setError(candidate, result.errorKind));
+      }
+    } catch (err) {
+      // Timeout or channel close (event page died mid-request, gap #8): return
+      // the entry to "unrequested" so a later visibility event retries.
+      log.warn(`translate request failed for ${candidate.url}`, err);
+      const live = tracked.get(candidate.el);
+      if (live && live.candidate.id === candidate.id) {
+        live.requested = false;
+        live.requestId = undefined;
+        safe(() => overlay.clear(candidate));
+      }
+    }
+  }
+
+  /** Cancel a candidate's in-flight request, if any (item 4). Fire-and-forget. */
+  const cancel = (rec: Tracked): void => {
+    if (!rec.requestId) return;
+    const requestId = rec.requestId;
+    rec.requestId = undefined;
+    void sendToBackground("cancelTranslation", { requestId }).catch((err) =>
+      log.warn("cancelTranslation failed", err),
+    );
+  };
+
+  return {
+    register(candidate: Candidate): void {
+      if (tracked.has(candidate.el)) return; // de-duped by the scanner already
+      tracked.set(candidate.el, { candidate, requested: false });
+      // Keep `order` in document order so prefetch (N+1..N+3) is meaningful.
+      insertInDocOrder(order, candidate);
+      safe(() => visibleObserver.observe(candidate.el));
+      safe(() => nearObserver.observe(candidate.el));
+    },
+
+    unregister(candidate: Candidate): void {
+      const rec = tracked.get(candidate.el);
+      if (!rec || rec.candidate.id !== candidate.id) return;
+      tracked.delete(candidate.el);
+      const i = order.findIndex((c) => c.id === candidate.id);
+      if (i >= 0) order.splice(i, 1);
+      safe(() => visibleObserver.unobserve(candidate.el));
+      safe(() => nearObserver.unobserve(candidate.el));
+      cancel(rec); // stop paying the provider for work nobody will see (item 4)
+      safe(() => overlay.clear(candidate));
+    },
+
+    stop(): void {
+      for (const rec of tracked.values()) cancel(rec);
+      tracked.clear();
+      order.length = 0;
+      safe(() => visibleObserver.disconnect());
+      safe(() => nearObserver.disconnect());
+    },
+  };
+}
+
+/**
+ * Insert `candidate` into `order` keeping document order via
+ * `compareDocumentPosition`. WHY: a lazily-loaded image can appear before
+ * already-registered ones; prefetch reads this order, so append-only would
+ * prefetch the wrong neighbours.
+ */
+function insertInDocOrder(order: Candidate[], candidate: Candidate): void {
+  for (let i = 0; i < order.length; i++) {
+    const rel = candidate.el.compareDocumentPosition(order[i]!.el);
+    if (rel & Node.DOCUMENT_POSITION_FOLLOWING) {
+      order.splice(i, 0, candidate);
+      return;
+    }
+  }
+  order.push(candidate);
+}
+
+/** Reject with a timeout error if `p` hasn't settled within `ms` (gap #8). */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`translate request timed out after ${ms} ms`)),
+      ms,
+    );
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** Swallow + log any throw so an observer callback can never break the page (rule 6). */
+function safe(fn: () => void): void {
+  try {
+    fn();
+  } catch (err) {
+    log.warn("viewport-queue step failed", err);
+  }
+}

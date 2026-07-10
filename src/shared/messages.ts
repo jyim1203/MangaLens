@@ -38,6 +38,12 @@ export interface TranslatePageRequest {
   targetLang?: string;
   /** 0 = visible, 1 = near viewport, 2 = prefetch/all (§7.5). */
   priority: number;
+  /**
+   * Content-generated id (`crypto.randomUUID()`) so the content side can later
+   * cancel this specific request via {@link MessageMap.cancelTranslation}
+   * (Phase 5 real cancellation). Optional — omit for fire-and-forget callers.
+   */
+  requestId?: string;
 }
 
 /**
@@ -81,6 +87,14 @@ export interface MessageMap {
     request: TranslatePageRequest;
     response: TranslatePageResult;
   };
+
+  /**
+   * Cancel an in-flight {@link translatePage} by its `requestId` (Phase 5).
+   * WHY: without this, disabling MangaLens or closing a tab mid-chapter leaves
+   * the event page paying the provider for pages nobody will see. Cancelling an
+   * unknown/already-settled id is a silent no-op (the normal teardown race).
+   */
+  cancelTranslation: { request: { requestId: string }; response: void };
 
   /** Validate an API key with a cheap ping (options "test key" button, §7.6). */
   testApiKey: {

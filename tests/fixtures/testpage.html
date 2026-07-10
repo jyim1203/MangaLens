@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MangaLens — manual test page (Phase 5)</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: system-ui, sans-serif;
+        background: #f4f4f4;
+        color: #222;
+      }
+      header,
+      footer {
+        padding: 16px 24px;
+        background: #fff;
+        border-bottom: 1px solid #ddd;
+      }
+      footer {
+        border-top: 1px solid #ddd;
+        border-bottom: none;
+      }
+      main {
+        max-width: 860px;
+        margin: 0 auto;
+        padding: 24px 16px 800px; /* bottom pad so scroll/prefetch is exercised */
+      }
+      figure {
+        margin: 0 0 48px;
+        text-align: center;
+      }
+      figcaption {
+        margin-top: 8px;
+        font-size: 13px;
+        color: #666;
+      }
+      .sidebar {
+        position: fixed;
+        top: 80px;
+        right: 8px;
+        width: 90px;
+      }
+      .icons {
+        display: flex;
+        gap: 12px;
+        justify-content: center;
+        align-items: center;
+      }
+      img {
+        max-width: 100%;
+        height: auto;
+        background: #fff;
+      }
+      .bg-page {
+        width: 700px;
+        height: 990px;
+        max-width: 100%;
+        margin: 0 auto;
+        background-repeat: no-repeat;
+        background-size: cover;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>MangaLens manual test page</h1>
+      <p>
+        Phase 5 end-to-end check. Enable MangaLens (Alt+Shift+M) after granting
+        the optional host permission and setting an API key — see
+        <code>docs/PHASE-5-HANDOFF.md</code> → "Manual verification". Serve this
+        over http (e.g. <code>npx serve tests/fixtures</code>); <code>file:</code>
+        image URLs are not background-fetchable.
+      </p>
+      <p style="font-size: 13px; color: #666">
+        NOTE: the images below are self-contained, hand-drawn
+        <strong>public-domain SVG placeholders</strong> (authored here, no
+        external assets) so the page works with zero binary fixtures — they
+        exercise scanning, the ignore heuristics, overlay positioning, tiling,
+        and the MutationObserver. For a REAL provider round-trip (actual OCR +
+        translation) drop 2–3 public-domain manga/webtoon JPGs into
+        <code>tests/fixtures/images/</code> and point the &lt;img&gt; srcs at
+        them — see <code>images/README.md</code>.
+      </p>
+    </header>
+
+    <!-- (c) sidebar thumbnail: small rendered area → scanner must IGNORE -->
+    <img
+      class="sidebar"
+      id="sidebar-thumb"
+      alt="sidebar thumbnail (should be ignored)"
+    />
+
+    <main>
+      <!-- (a) normal manga page: large rendered + natural size → ACCEPTED -->
+      <figure>
+        <img id="page-a" alt="manga page A" />
+        <figcaption>(a) normal manga page — expect overlays</figcaption>
+      </figure>
+
+      <!-- CSS background-image manga page → ACCEPTED (v1 background source) -->
+      <figure>
+        <div class="bg-page" id="page-bg" role="img" aria-label="bg manga page"></div>
+        <figcaption>(a2) background-image manga page — expect overlays</figcaption>
+      </figure>
+
+      <!-- (b) extreme-aspect webtoon strip → ACCEPTED + TILED (regions across full height) -->
+      <figure>
+        <img id="strip" alt="webtoon strip" style="width: 700px" />
+        <figcaption>
+          (b) webtoon long strip — expect overlays across the FULL height (tile
+          remap)
+        </figcaption>
+      </figure>
+
+      <!-- (c) small icons / avatar: natural size &lt; 400 → scanner must IGNORE -->
+      <figure class="icons">
+        <img id="icon-1" alt="icon" />
+        <img id="avatar" alt="avatar" />
+        <figcaption>(c) icon + avatar — must NOT get overlays</figcaption>
+      </figure>
+
+      <!-- (d) late-swapped image: src set after 2s → exercises the MutationObserver -->
+      <figure>
+        <img id="late" alt="late-swapped page" style="width: 700px" />
+        <figcaption>
+          (d) late-swapped image — src is set after 2s; scanner's
+          MutationObserver should pick it up
+        </figcaption>
+      </figure>
+    </main>
+
+    <footer>
+      <p style="font-size: 13px; color: #666">
+        Placeholder art © none — released to the public domain (CC0) by the
+        MangaLens authors. Replace with real public-domain fixtures for a full
+        translation test.
+      </p>
+    </footer>
+
+    <script>
+      // Build small, self-contained SVG "pages" as data URIs. Natural size comes
+      // from the svg width/height attributes, so the scanner's 400px natural
+      // check keys off these numbers: pages/strip pass, icon/avatar are rejected.
+      function svgDataUri(w, h, label, hue) {
+        const svg =
+          `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">` +
+          `<rect width="100%" height="100%" fill="hsl(${hue},18%,92%)" stroke="#bbb"/>` +
+          // a couple of "bubbles" with placeholder text near top and bottom
+          `<ellipse cx="${w * 0.3}" cy="${h * 0.12}" rx="${w * 0.22}" ry="${h * 0.05}" fill="#fff" stroke="#333"/>` +
+          `<text x="${w * 0.3}" y="${h * 0.125}" font-size="${Math.round(w * 0.03)}" text-anchor="middle" fill="#111">セリフ ${label}</text>` +
+          `<ellipse cx="${w * 0.68}" cy="${h * 0.88}" rx="${w * 0.24}" ry="${h * 0.05}" fill="#fff" stroke="#333"/>` +
+          `<text x="${w * 0.68}" y="${h * 0.885}" font-size="${Math.round(w * 0.03)}" text-anchor="middle" fill="#111">おしまい ${label}</text>` +
+          `</svg>`;
+        return "data:image/svg+xml;utf8," + encodeURIComponent(svg);
+      }
+
+      document.getElementById("page-a").src = svgDataUri(800, 1130, "A", 210);
+      document.getElementById("strip").src = svgDataUri(800, 4200, "strip", 140);
+      document.getElementById("page-bg").style.backgroundImage =
+        `url("${svgDataUri(800, 1130, "BG", 30)}")`;
+
+      // Icons/avatar: natural size < 400 on both sides → must be ignored.
+      document.getElementById("sidebar-thumb").src = svgDataUri(90, 130, "s", 0);
+      document.getElementById("icon-1").src = svgDataUri(64, 64, "i", 300);
+      document.getElementById("avatar").src = svgDataUri(120, 120, "av", 340);
+
+      // (d) Late swap after 2s to exercise the MutationObserver re-scan.
+      setTimeout(() => {
+        document.getElementById("late").src = svgDataUri(800, 1130, "late", 90);
+      }, 2000);
+    </script>
+  </body>
+</html>
