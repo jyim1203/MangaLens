@@ -30,3 +30,13 @@ export const CACHE_VERSION = 2;
 
 /** Keyboard command id from manifest.json — keep in sync with src/manifest.ts. */
 export const CMD_TOGGLE = "toggle-mangalens";
+
+/**
+ * The attribute the {@link import("../content/overlay/OverlayManager").OverlayManager}
+ * stamps on every overlay HOST element. Lives here (dependency-free) so the
+ * scanner can recognise our own hosts and skip the `style` mutations the overlay
+ * writes on every scroll/resize sync — otherwise scrolling would drive an endless
+ * self-triggered re-scan (Phase 5.1 item 4). Host children live in a shadow root,
+ * so only the host itself is ever visible to the page-level MutationObserver.
+ */
+export const OVERLAY_HOST_ATTR = "data-mangalens-overlay";

@@ -589,3 +589,86 @@ translateHandlers +4: abort mapping + cancel/unknown-id/registry-removal wiring)
 warnings; the lone `data_collection_permissions` notice stays Phase-8-deferred)
 all clean. Content bundle grew from inert to ~14 kB (scanner + queue + overlay +
 inlined `styles.css`).
+
+## Phase 5.1 summary (review fixes)
+
+A review of the Phase 5 content-script pipeline against Architecture §7.1/§7.2/
+§7.5 and real-page behavior caught two correctness bugs, four robustness/UX gaps,
+and two cleanups; all fixed, keeping the pure-core / thin-shell split (every new
+*decision* is a tested pure helper; observers/DOM/layout reads stay shell-thin).
+**P1 (correctness):** (1) **Overlay bubbles went stale on resize** — `positionEntry`
+only moved the host; the BubbleBoxes inside stayed at paint-time pixel offsets, so
+a window resize/zoom/re-flow misaligned every overlay. Each `OverlayEntry` now
+tracks its last-painted displayed size and a `done` overlay re-paints (re-running
+textFit per region — required so `auto` re-fits and `fixed` doesn't visually
+scale, WHY a re-paint not a CSS transform-scale) when the size changed beyond an
+epsilon; the decision is the pure `displayedSizeChanged` (geometry.ts). While in
+there, all position syncs (shared scroll/resize listeners + every per-image
+`ResizeObserver` + `load`) now **coalesce through one `requestAnimationFrame`** —
+one rect read + style write per entry per frame instead of per event, which also
+throttles the ResizeObserver-loop repaint churn during a continuous drag-resize.
+(2) **Host mispositioned when `<body>` is a containing block** — `left/top = rect +
+scroll` assumed the initial containing block, which breaks under `position:
+relative`/transform/filter on body or even the UA-default 8 px body margin.
+`positionEntry` now measures the residual error (`host.getBoundingClientRect()` vs
+the image rect) and subtracts it — robust to every cause at once and idempotent;
+with the rAF batching the extra rect read is once per frame. **P2 (robustness/
+UX):** (3) **Unhandled rejection in the coalesce leader's cleanup** — the leader
+tore down its `SharedAbort` with `void run.finally(cleanup)`, and `.finally()`
+returns a NEW promise that re-rejects; every failed coalesced run fired an
+`unhandledrejection` in the event page (console noise + AMO-review flag) even
+though `await run` handled the real rejection. Now `run.finally(cleanup).catch(()
+=> {})` swallows only the derived promise; cleanup still runs on both paths. (4)
+**Scanner re-scan feedback loop + starvation** — the MutationObserver watched
+`style` document-wide and the OverlayManager writes overlay-host `style` on every
+scroll sync, so scrolling scheduled an endless self-triggered re-scan; the pure
+`isOwnOverlayHost` (matches the new `OVERLAY_HOST_ATTR` marker) drops bursts that
+are entirely our own hosts. The trailing-edge debounce could also starve forever
+on a perpetually-animating inline style, so a **max-wait ceiling** (pure
+`computeRescanDelay`: quiet → 250 ms trailing, continuous → forced within ~1 s)
+now guarantees late-added images are found. And `defaultCollectElements` reads the
+rect and skips sub-`MIN_RENDERED_PX` elements **before** calling `getComputedStyle`
+(the expensive pass on a 10k-element DOM). (5) **API-key change must re-request** —
+`translationSignature` excluded `apiKey`, correct for cached successes but wrong
+for failures: after an `auth` error, entering a correct key was a gate no-op
+(nothing recovered until reload). `apiKey` is now in the signature, so a key change
+while active classifies as `re-request` — errored pages retry while cached
+successes re-render instantly (the key is NOT part of the cache key). This unblocks
+the Phase 6 first-run path (auth badges → paste key → recover). (6) **Retry path
+never retried a statically-visible image** — on the 120 s timeout (or send-failure)
+the entry reset to unrequested, but IntersectionObserver fires only on
+*transitions*, so an image sitting still in the viewport was wedged until scrolled
+away and back. After the reset it now `unobserve()`+`observe()`s both observers
+(observe always delivers an initial entry with the current intersection state),
+re-planning/re-sending if still visible; the same treatment covers an `aborted`
+result arriving while still registered. The request timeout is now injectable
+(`requestTimeoutMs`) so this is testable without a 2-minute fake-timer wait.
+**P3 (cleanups):** (7) removed the **dead score sort** in `scan()` (the viewport
+queue re-inserts every candidate into document order via `insertInDocOrder`, so
+registration order had zero effect); `scoreCandidate` stays exported + tested with
+a JSDoc note that it's reserved for the §7.1 main-image ranking (Phase 7). (8)
+**Bootstrap race** (`content/index.ts`): a `storage.onChanged` firing while the
+initial `readSettings()` was awaiting could be applied then clobbered by the
+staler initial read; the newest raw value is now buffered and re-applied after the
+initial apply (newest-wins). **Double stroke** (`BubbleBox.ts`): the text-shadow
+halo was applied *alongside* `-webkit-text-stroke`, so Firefox (which supports the
+prefixed property) rendered stroke + halo, thickening the outline; the shadow is
+now gated on `!CSS.supports("-webkit-text-stroke", …)` (memoized). **Flagged/
+accepted (item 9, noted in-source, not built):** the ms-wide cache-store race
+(re-pays at most one provider call — noted at the `cacheStorePage` site);
+offscreen prefetch skeletons; the 120 s timeout vs. Phase-6 "translate all" (revisit
+with Phase 8 queue tuning); the standing Phase 5 deferrals (no scroll-away cancel,
+no priority upgrade, no blob/canvas sources, no mid-session `prefetchAhead`).
+**No `shared/types.ts` or `shared/messages.ts` change** (rule 4); the only
+`shared/*` change is the new `OVERLAY_HOST_ATTR` constant (a DOM marker string,
+not a data contract). **Manual re-verify (needs a real browser):** resize/zoom the
+window — overlays track and re-fit; add `position: relative` + margin to `<body>`
+— overlays stay aligned. Tests: 16 new/changed (overlayGeometry +5:
+`displayedSizeChanged` beyond/within-epsilon/undefined-prev/zero-size/custom-eps;
+scanner +5: `computeRescanDelay` trailing/ceiling/clamp + `isOwnOverlayHost`
+host/non-host; gate +3: apiKey re-request while active / no-op while inactive /
+non-active-provider-key ignored; viewportQueue +2: timeout re-observes + re-sends,
+aborted-while-registered resets; translateHandlers +1: failed coalesced run leaves
+no unhandled rejection and still cleans up the shared-abort map), **300 total
+green**; typecheck + eslint + build + `web-ext lint` (0 errors / 0 warnings; the
+lone `data_collection_permissions` notice stays Phase-8-deferred) all clean.

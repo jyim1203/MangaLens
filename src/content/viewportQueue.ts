@@ -112,6 +112,9 @@ export interface ViewportQueueOptions {
     cb: IntersectionObserverCallback,
     options?: IntersectionObserverInit,
   ) => IntersectionObserver;
+  /** Per-request timeout (ms); defaulted to {@link REQUEST_TIMEOUT_MS}. Injectable
+   *  so the retry path (item 6) is testable without a 2-minute fake-timer wait. */
+  requestTimeoutMs?: number;
 }
 
 /** A live viewport queue. */
@@ -145,6 +148,7 @@ interface Tracked {
 export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
   const overlay = opts.overlay;
   const makeRequestId = opts.makeRequestId ?? (() => crypto.randomUUID());
+  const requestTimeoutMs = opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
   const makeObserver =
     opts.createObserver ??
     ((cb, options) => new IntersectionObserver(cb, options));
@@ -204,6 +208,23 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
     { rootMargin: NEAR_ROOT_MARGIN },
   );
 
+  /**
+   * Force a fresh intersection callback for `el` by unobserving then re-observing
+   * both observers (item 6). WHY: IntersectionObserver fires only on *transitions*,
+   * so an image sitting still in the viewport when its request times out (or aborts
+   * while still registered) produces no new event and would be wedged — no overlay,
+   * no retry — until the user scrolls it out and back. `observe()` always delivers
+   * an initial entry with the current intersection state, which re-plans and
+   * re-sends when the image is (near-)visible. Only meaningful after `requested`
+   * has been reset to false, or the re-fired callback is a no-op.
+   */
+  const reobserve = (el: Element): void => {
+    safe(() => visibleObserver.unobserve(el));
+    safe(() => nearObserver.unobserve(el));
+    safe(() => visibleObserver.observe(el));
+    safe(() => nearObserver.observe(el));
+  };
+
   async function sendTranslate(
     candidate: Candidate,
     priority: number,
@@ -226,7 +247,7 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
           requestId,
           targetLang: opts.targetLang,
         }),
-        REQUEST_TIMEOUT_MS,
+        requestTimeoutMs,
       );
       // The candidate may have been torn down while we awaited.
       const live = tracked.get(candidate.el);
@@ -236,8 +257,14 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
       if (result.ok) {
         safe(() => overlay.render(candidate, result.page));
       } else if (result.errorKind === "aborted") {
-        // Silent: the user scrolled away or toggled off — nothing is wrong.
+        // Silent: the user scrolled away or toggled off — nothing is wrong. But a
+        // terminal-without-render result must stay retryable on next visibility
+        // (item 6): reset + re-observe so a still-visible image isn't wedged. Today
+        // aborts arrive from unregister/teardown (already removed from `tracked`,
+        // so this is near-unreachable), but it's one line to keep the invariant.
+        live.requested = false;
         safe(() => overlay.clear(candidate));
+        reobserve(live.candidate.el);
       } else {
         safe(() => overlay.setError(candidate, result.errorKind));
       }
@@ -250,6 +277,10 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
         live.requested = false;
         live.requestId = undefined;
         safe(() => overlay.clear(candidate));
+        // WHY re-observe: an image still in the viewport at timeout emits no new
+        // intersection event (IO fires on transitions only), so without this it
+        // would never retry until scrolled away and back (item 6).
+        reobserve(live.candidate.el);
       }
     }
   }

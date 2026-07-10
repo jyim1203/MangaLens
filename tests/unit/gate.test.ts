@@ -96,6 +96,38 @@ describe("gate — computeGateAction (enable-gate reducer)", () => {
     ).toBe("re-request");
   });
 
+  it("classifies an apiKey change while active as re-request (item 5)", () => {
+    const prev = s({ enabled: true, apiKeys: { gemini: "old-key" } });
+    const next = s({ enabled: true, apiKeys: { gemini: "new-key" } });
+    expect(
+      computeGateAction({ active: true, settings: prev }, next, HOST),
+    ).toBe("re-request");
+  });
+
+  it("leaves an apiKey change while inactive a no-op (item 5)", () => {
+    const prev = s({ enabled: false, apiKeys: { gemini: "old-key" } });
+    const next = s({ enabled: false, apiKeys: { gemini: "new-key" } });
+    expect(
+      computeGateAction({ active: false, settings: prev }, next, HOST),
+    ).toBe("no-op");
+  });
+
+  it("ignores a non-active provider's key change (only the active key matters, item 5)", () => {
+    const prev = s({
+      enabled: true,
+      provider: "gemini",
+      apiKeys: { gemini: "k", openai: "a" },
+    });
+    const next = s({
+      enabled: true,
+      provider: "gemini",
+      apiKeys: { gemini: "k", openai: "b" },
+    });
+    expect(
+      computeGateAction({ active: true, settings: prev }, next, HOST),
+    ).toBe("no-op");
+  });
+
   it("re-request wins when both a translation field AND the font change", () => {
     const prev = s({ enabled: true, targetLang: "en" });
     const next = s({

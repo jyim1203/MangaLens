@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { regionToPx } from "../../src/content/overlay/geometry";
+import {
+  displayedSizeChanged,
+  regionToPx,
+} from "../../src/content/overlay/geometry";
 
 describe("overlay — regionToPx (the one bbox→pixel conversion, rule 5)", () => {
   it("scales a normalized bbox to displayed pixels", () => {
@@ -33,5 +36,40 @@ describe("overlay — regionToPx (the one bbox→pixel conversion, rule 5)", () 
       width: 0,
       height: 0,
     });
+  });
+});
+
+describe("overlay — displayedSizeChanged (repaint-on-resize predicate, item 1)", () => {
+  it("is true when either dimension changes beyond the epsilon", () => {
+    expect(displayedSizeChanged({ w: 800, h: 1200 }, { w: 900, h: 1200 })).toBe(true);
+    expect(displayedSizeChanged({ w: 800, h: 1200 }, { w: 800, h: 1100 })).toBe(true);
+  });
+
+  it("is false for a sub-epsilon jitter (scroll rounding / RO noise)", () => {
+    expect(displayedSizeChanged({ w: 800, h: 1200 }, { w: 800.3, h: 1199.7 })).toBe(
+      false,
+    );
+    // Exactly at the epsilon boundary is NOT "beyond" it.
+    expect(displayedSizeChanged({ w: 800, h: 1200 }, { w: 800.5, h: 1200 })).toBe(
+      false,
+    );
+  });
+
+  it("treats a never-painted (undefined) previous size as changed", () => {
+    expect(displayedSizeChanged(undefined, { w: 800, h: 1200 })).toBe(true);
+  });
+
+  it("handles degenerate zero sizes without NaN issues", () => {
+    expect(displayedSizeChanged({ w: 0, h: 0 }, { w: 0, h: 0 })).toBe(false);
+    expect(displayedSizeChanged({ w: 0, h: 0 }, { w: 800, h: 1200 })).toBe(true);
+  });
+
+  it("respects a custom epsilon", () => {
+    expect(displayedSizeChanged({ w: 800, h: 1200 }, { w: 803, h: 1200 }, 5)).toBe(
+      false,
+    );
+    expect(displayedSizeChanged({ w: 800, h: 1200 }, { w: 806, h: 1200 }, 5)).toBe(
+      true,
+    );
   });
 });

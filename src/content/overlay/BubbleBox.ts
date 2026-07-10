@@ -18,6 +18,24 @@ import { resolveFontSize, type Measure } from "./textFit";
 /** Inner padding as a fraction of the box (§7.7). */
 export const PADDING_RATIO = 0.06;
 
+/** Memoized `-webkit-text-stroke` support probe (constant per engine). */
+let strokeSupportedMemo: boolean | undefined;
+
+/**
+ * Does the engine support the prefixed `-webkit-text-stroke` property? Gates the
+ * text-shadow halo fallback so it isn't drawn *alongside* a real stroke (item 8).
+ * Memoized; degrades to `false` (use the shadow) if `CSS.supports` is unavailable.
+ */
+function strokeSupported(): boolean {
+  if (strokeSupportedMemo === undefined) {
+    strokeSupportedMemo =
+      typeof CSS !== "undefined" &&
+      typeof CSS.supports === "function" &&
+      CSS.supports("-webkit-text-stroke", "1px red");
+  }
+  return strokeSupportedMemo;
+}
+
 /**
  * Build a hidden measuring element's `Measure` factory bound to the shadow root's
  * styling context, so measurements match what will actually render. The element
@@ -112,8 +130,13 @@ export function renderBubbleBox(
     const strokeW = Math.max(1, Math.round(px * 0.08));
     label.style.setProperty("-webkit-text-stroke", `${strokeW}px ${font.strokeColor}`);
     label.style.setProperty("paint-order", "stroke fill");
-    // Fallback for engines without text-stroke: a tight shadow halo.
-    label.style.textShadow = `0 0 ${strokeW}px ${font.strokeColor}`;
+    // WHY gate the shadow fallback: Firefox (our only target) supports the
+    // prefixed -webkit-text-stroke, so applying the shadow halo *alongside* it
+    // double-renders the outline (stroke + halo) and visibly thickens it. Only
+    // fall back to the shadow where text-stroke is unsupported (item 8).
+    if (!strokeSupported()) {
+      label.style.textShadow = `0 0 ${strokeW}px ${font.strokeColor}`;
+    }
   }
 
   box.appendChild(label);

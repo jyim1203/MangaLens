@@ -40,11 +40,20 @@ export interface GateState {
 }
 
 /**
- * Fields that change the *translation content* (and thus the cache key): a change
- * to any of them means existing overlays are stale and must be re-requested.
+ * Fields whose change means existing overlays are stale and must be re-requested.
  * Derived via {@link deriveProviderSettings} so this stays in lockstep with the
- * provider slice. Excludes `apiKey` (a key change doesn't invalidate a produced
- * translation) and `temperature` (a continuous knob, excluded from the cache key).
+ * provider slice.
+ *
+ * WHY `apiKey` is INCLUDED even though it is NOT part of the cache key: the key
+ * is deliberately key-agnostic so a produced translation survives a key change
+ * (cache-cheap for successes — a previously-translated page re-renders instantly
+ * from cache). But after an `auth` error every candidate sits at `requested:true`
+ * with a ⚠ badge, and re-requesting is the ONLY recovery path — entering a
+ * correct key must reclassify as `re-request` (full teardown/re-activate) so
+ * errored pages actually retry while cached successes re-render for free. Without
+ * this, the first-run flow (Phase 6: see auth badges → paste key → nothing
+ * happens) is broken. `temperature` stays excluded (a continuous knob, also
+ * excluded from the cache key).
  */
 function translationSignature(s: Settings): string {
   const p = deriveProviderSettings(s);
@@ -56,6 +65,7 @@ function translationSignature(s: Settings): string {
     p.sourceLangHint ?? "",
     p.readingDirection,
     p.preserveHonorifics,
+    p.apiKey,
   ]);
 }
 

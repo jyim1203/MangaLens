@@ -2,13 +2,16 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyImageUrl,
+  computeRescanDelay,
   createScanner,
   isCandidate,
+  isOwnOverlayHost,
   parseCssUrl,
   scoreCandidate,
   type Candidate,
   type CandidateMetrics,
 } from "../../src/content/scanner";
+import { OVERLAY_HOST_ATTR } from "../../src/shared/constants";
 
 /** A qualifying manga-page metric set; override per test. */
 function metrics(overrides: Partial<CandidateMetrics> = {}): CandidateMetrics {
@@ -94,6 +97,44 @@ describe("scanner — parseCssUrl", () => {
   it("returns null when there is no url()", () => {
     expect(parseCssUrl("none")).toBeNull();
     expect(parseCssUrl("linear-gradient(#fff,#000)")).toBeNull();
+  });
+});
+
+describe("scanner — computeRescanDelay (debounce + max-wait, item 4)", () => {
+  const DEBOUNCE = 250;
+  const MAX = 1000;
+
+  it("returns the trailing debounce delay when there is headroom before max-wait", () => {
+    // First mutation of a burst: now === firstScheduledAt.
+    expect(computeRescanDelay(1000, 1000, DEBOUNCE, MAX)).toBe(DEBOUNCE);
+    // A later mutation still well inside the ceiling: trailing debounce wins.
+    expect(computeRescanDelay(1300, 1000, DEBOUNCE, MAX)).toBe(DEBOUNCE);
+  });
+
+  it("forces a run at the max-wait ceiling under continuous mutations", () => {
+    // now=1900, ceiling=2000: only 100 ms left, less than the 250 ms debounce.
+    expect(computeRescanDelay(1900, 1000, DEBOUNCE, MAX)).toBe(100);
+    // At the ceiling exactly, run now.
+    expect(computeRescanDelay(2000, 1000, DEBOUNCE, MAX)).toBe(0);
+  });
+
+  it("never returns a negative delay past the ceiling", () => {
+    expect(computeRescanDelay(2500, 1000, DEBOUNCE, MAX)).toBe(0);
+  });
+});
+
+describe("scanner — isOwnOverlayHost (self-trigger filter, item 4)", () => {
+  it("recognises our own overlay host by its marker attribute", () => {
+    const host = document.createElement("div");
+    host.setAttribute(OVERLAY_HOST_ATTR, "mangalens-cand-1");
+    expect(isOwnOverlayHost(host)).toBe(true);
+  });
+
+  it("does not match ordinary page elements, text nodes, or null", () => {
+    expect(isOwnOverlayHost(document.createElement("img"))).toBe(false);
+    expect(isOwnOverlayHost(document.createTextNode("hi"))).toBe(false);
+    expect(isOwnOverlayHost(null)).toBe(false);
+    expect(isOwnOverlayHost(undefined)).toBe(false);
   });
 });
 

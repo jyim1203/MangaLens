@@ -14,10 +14,11 @@
  */
 import styles from "../styles.css?inline";
 import { createLogger } from "../../shared/log";
+import { OVERLAY_HOST_ATTR } from "../../shared/constants";
 import type { Settings } from "../../shared/settings";
 import type { PageTranslation } from "../../shared/types";
 import type { Candidate } from "../scanner";
-import { regionToPx } from "./geometry";
+import { displayedSizeChanged, regionToPx, type Size } from "./geometry";
 import { filterRegions } from "./regionFilter";
 import { errorKindToMessage } from "./errorMessages";
 import { createShadowMeasurer, renderBubbleBox } from "./BubbleBox";
@@ -48,6 +49,10 @@ interface OverlayEntry {
   state: OverlayState;
   /** Last rendered page, kept so a font/settings change can re-render in place. */
   page?: PageTranslation;
+  /** Displayed image size at the last {@link OverlayManager.paint}, so a resize
+   *  (window/zoom/re-flow) can re-run layout only when it actually changed
+   *  (item 1). Undefined until the entry has been painted at least once. */
+  lastPaintedSize?: Size;
 }
 
 /**
@@ -62,7 +67,16 @@ export class OverlayManager {
   private readonly entries = new Map<string, OverlayEntry>();
   private started = false;
 
-  private readonly onScrollOrResize = (): void => this.syncPositions();
+  /** rAF coalescing state for position syncs (item 1). */
+  private syncScheduled = false;
+  private rafHandle: number | undefined;
+
+  // WHY coalesce through one rAF: the capture-phase scroll listener and every
+  // per-image ResizeObserver would otherwise do a getBoundingClientRect + style
+  // write *per event*. We instead mark dirty and sync once per frame — one rect
+  // read + style write per entry per frame, which also throttles the repaint
+  // churn a continuous drag-resize's ResizeObserver loop would produce.
+  private readonly onScrollOrResize = (): void => this.scheduleSync();
 
   constructor(opts: OverlayManagerOptions) {
     this.settings = opts.settings;
@@ -141,7 +155,7 @@ export class OverlayManager {
     }
   }
 
-  /** Reposition every overlay against its image's current rect (scroll/resize). */
+  /** Reposition (and re-paint if resized) every overlay now, synchronously. */
   syncPositions(): void {
     for (const [id, entry] of [...this.entries]) {
       if (!entry.candidate.el.isConnected) {
@@ -154,12 +168,51 @@ export class OverlayManager {
         }
         continue;
       }
-      this.positionEntry(entry);
+      this.syncEntry(entry);
+    }
+  }
+
+  /** Mark positions dirty and flush once on the next animation frame (item 1). */
+  private scheduleSync(): void {
+    if (this.syncScheduled) return;
+    this.syncScheduled = true;
+    if (typeof requestAnimationFrame === "function") {
+      this.rafHandle = requestAnimationFrame(() => {
+        this.rafHandle = undefined;
+        this.syncScheduled = false;
+        this.syncPositions();
+      });
+    } else {
+      // No rAF (non-browser/test env): fall back to a synchronous sync.
+      this.syncScheduled = false;
+      this.syncPositions();
+    }
+  }
+
+  /**
+   * Position one entry's host and, if it's a `done` overlay whose displayed size
+   * changed since its last paint, re-paint it (item 1). WHY re-paint, not a CSS
+   * transform-scale of the container: `auto`-size text must re-fit to the new box
+   * and `fixed`-size text must NOT visually scale — only re-running textFit per
+   * region gets both right. The size-changed test is the pure
+   * {@link displayedSizeChanged}.
+   */
+  private syncEntry(entry: OverlayEntry): void {
+    this.positionEntry(entry);
+    if (entry.state !== "done" || !entry.page) return;
+    const rect = entry.candidate.el.getBoundingClientRect();
+    if (displayedSizeChanged(entry.lastPaintedSize, { w: rect.width, h: rect.height })) {
+      this.paint(entry);
     }
   }
 
   /** Tear down every overlay and drop the shared listeners. */
   stop(): void {
+    if (this.rafHandle !== undefined && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(this.rafHandle);
+    }
+    this.rafHandle = undefined;
+    this.syncScheduled = false;
     for (const id of [...this.entries.keys()]) this.teardownEntry(id);
     if (this.started) {
       window.removeEventListener("scroll", this.onScrollOrResize, {
@@ -178,7 +231,8 @@ export class OverlayManager {
     if (existing) return existing;
     try {
       const host = document.createElement("div");
-      host.setAttribute("data-mangalens-overlay", candidate.id);
+      // Marker the scanner uses to skip our own hosts' style mutations (item 4).
+      host.setAttribute(OVERLAY_HOST_ATTR, candidate.id);
       Object.assign(host.style, {
         position: "absolute",
         margin: "0",
@@ -222,15 +276,14 @@ export class OverlayManager {
       };
 
       // Re-sync on the image's own resize + late decode (load changes the rect).
+      // Both route through the rAF-batched sync so a `done` overlay re-paints
+      // (not just re-positions) when the displayed size changed (item 1).
       if (typeof ResizeObserver !== "undefined") {
-        entry.resizeObserver = new ResizeObserver(() => this.positionEntry(entry));
+        entry.resizeObserver = new ResizeObserver(() => this.scheduleSync());
         entry.resizeObserver.observe(candidate.el);
       }
       if (candidate.el instanceof HTMLImageElement) {
-        entry.onImgLoad = () => {
-          this.positionEntry(entry);
-          if (entry.state === "done") this.paint(entry);
-        };
+        entry.onImgLoad = () => this.scheduleSync();
         candidate.el.addEventListener("load", entry.onImgLoad);
       }
 
@@ -258,6 +311,9 @@ export class OverlayManager {
     const rect = entry.candidate.el.getBoundingClientRect();
     const displayedW = rect.width;
     const displayedH = rect.height;
+    // Record the size we're painting against so a later resize re-paints only
+    // when it actually changed (item 1, via displayedSizeChanged in syncEntry).
+    entry.lastPaintedSize = { w: displayedW, h: displayedH };
     const makeMeasure = createShadowMeasurer(entry.measureEl, this.settings.font);
 
     for (const region of regions) {
@@ -275,12 +331,34 @@ export class OverlayManager {
   private positionEntry(entry: OverlayEntry): void {
     try {
       const rect = entry.candidate.el.getBoundingClientRect();
+      // WHY rect + scroll: this assumes the host's containing block is the initial
+      // one, anchored at the document origin. That holds while the host is a plain
+      // body child, but breaks whenever `<body>`/`<html>` establishes a containing
+      // block (e.g. `position: relative` on body, even the UA-default 8 px body
+      // margin, or a transform/filter on body). Content-level transforms are fine —
+      // the image's rect already reflects them and our host is outside that subtree.
+      let left = rect.left + window.scrollX;
+      let top = rect.top + window.scrollY;
       Object.assign(entry.host.style, {
-        left: `${rect.left + window.scrollX}px`,
-        top: `${rect.top + window.scrollY}px`,
+        left: `${left}px`,
+        top: `${top}px`,
         width: `${rect.width}px`,
         height: `${rect.height}px`,
       } satisfies Partial<CSSStyleDeclaration>);
+
+      // Item 2: measure the residual error and correct it — robust to every
+      // containing-block cause at once, and idempotent (a correct position yields
+      // a zero delta, so re-running does nothing). With the rAF batching above the
+      // extra rect read is once per frame, not per scroll event.
+      const hostRect = entry.host.getBoundingClientRect();
+      const dx = hostRect.left - rect.left;
+      const dy = hostRect.top - rect.top;
+      if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+        left -= dx;
+        top -= dy;
+        entry.host.style.left = `${left}px`;
+        entry.host.style.top = `${top}px`;
+      }
     } catch (err) {
       log.warn("failed to position overlay", err);
     }

@@ -107,6 +107,11 @@ export function resetSharedAbortsForTest(): void {
   sharedAborts.clear();
 }
 
+/** Current shared-abort map size — test seam only (asserts cleanup ran, item 3). */
+export function sharedAbortsSizeForTest(): number {
+  return sharedAborts.size;
+}
+
 /**
  * In-flight `translatePage` requests keyed by their content-generated
  * `requestId`, so a later `cancelTranslation` can abort the exact request the
@@ -325,10 +330,20 @@ export async function translateImage(
     // entry in its own `.finally` first (it is upstream in the chain), so by the
     // time this runs the entry is gone; only delete our own instance in case a
     // fresh run for the same key already replaced it.
-    void run.finally(() => {
-      shared.settle();
-      if (sharedAborts.get(cacheKey) === shared) sharedAborts.delete(cacheKey);
-    });
+    //
+    // WHY `.catch(() => {})` after `.finally`: `.finally()` returns a NEW promise
+    // that RE-REJECTS whenever `run` rejects. Left un-caught (the old `void`),
+    // every failed coalesced run (auth/refusal/network) would surface an
+    // `unhandledrejection` in the event page — console noise on every failure
+    // path, and an AMO-review flag — even though the real rejection is handled by
+    // the `await run` below. Swallow only this derived promise; cleanup still runs
+    // on both resolve and reject (item 3).
+    run
+      .finally(() => {
+        shared.settle();
+        if (sharedAborts.get(cacheKey) === shared) sharedAborts.delete(cacheKey);
+      })
+      .catch(() => {});
   }
 
   try {
@@ -374,6 +389,10 @@ async function runTranslateMiss(
     throw err;
   }
 
+  // NOTE (accepted, Phase 5.1 item 9): fire-and-forget, and the coalesce entry
+  // clears on settle, so a request arriving in the ms-wide window between this
+  // run settling and the IndexedDB commit landing re-pays one provider call.
+  // Acceptable — the window is tiny and the worst case is a single duplicate.
   void cacheStorePage(cacheKey, result.page, cacheCapBytes(settings), origin);
   // providerCalls (tile count) → accurate `images` accounting for strips (item 2).
   void recordUsage(usageFromPage(result.page, result.providerCalls));

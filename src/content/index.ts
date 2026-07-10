@@ -127,16 +127,37 @@ function onSettingsChanged(rawNewValue: unknown): void {
   }
 }
 
+/** True once the initial `readSettings` → `applySettings` has completed. */
+let initialApplied = false;
+/** The latest raw settings blob seen via storage.onChanged before the initial
+ *  apply finished, held so it can be re-applied afterwards (item 8). */
+let bufferedChange: { value: unknown } | undefined;
+
 async function bootstrap(): Promise<void> {
   browser.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
     const change = changes[SETTINGS_KEY];
     if (!change) return;
+    // WHY buffer until the initial apply lands: a change firing while
+    // `readSettings()` is still awaiting would be applied first and then clobbered
+    // by the STALER initial snapshot (an async read that started earlier). Record
+    // the latest raw value instead and re-apply it once the initial apply is done,
+    // so newest-wins holds. A single `bufferedChange` beats a queue — only the last
+    // value matters (applySettings is a full snapshot, not a delta).
+    if (!initialApplied) {
+      bufferedChange = { value: change.newValue };
+      return;
+    }
     onSettingsChanged(change.newValue);
   });
 
   const settings = await readSettings();
   applySettings(settings);
+  // Everything from here is synchronous (no await), so no listener can interleave:
+  // drain any change buffered during the read, then go live.
+  if (bufferedChange) onSettingsChanged(bufferedChange.value);
+  bufferedChange = undefined;
+  initialApplied = true;
 }
 
 // Wrap the whole bootstrap: a failure here must never surface on the host page.

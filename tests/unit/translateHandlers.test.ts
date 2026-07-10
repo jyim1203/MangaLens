@@ -14,6 +14,7 @@ import {
   resetRequestControllersForTest,
   resetSharedAbortsForTest,
   resetTranslationQueueForTest,
+  sharedAbortsSizeForTest,
 } from "../../src/background/translateHandlers";
 import { ImageFetchError } from "../../src/background/imageFetcher";
 import { ProviderError } from "../../src/background/providers/ProviderBase";
@@ -202,5 +203,55 @@ describe("translateHandlers — cancellation wiring (item 4)", () => {
     expect(() =>
       handlers.cancelTranslation!({ requestId: "req-2" }, SENDER),
     ).not.toThrow();
+  });
+});
+
+describe("translateHandlers — coalesce leader cleanup on a failed run (item 3)", () => {
+  beforeEach(() => {
+    fakeBrowser.reset();
+    resetRequestControllersForTest();
+    resetSharedAbortsForTest();
+    resetInflightForTest();
+    resetTranslationQueueForTest();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("swallows the finally-derived rejection (no unhandledrejection) and still cleans up", async () => {
+    const handlers = createTranslateHandlers();
+    // Fetch returns a valid image so we reach the COALESCED run; prepareImage then
+    // throws (no OffscreenCanvas/createImageBitmap in node), so the run rejects —
+    // exercising the leader's `run.finally(cleanup).catch(...)` chain (item 3).
+    vi.stubGlobal("fetch", () =>
+      Promise.resolve(
+        new Response(new Blob([new Uint8Array([1, 2, 3])], { type: "image/jpeg" }), {
+          status: 200,
+          headers: { "content-type": "image/jpeg" },
+        }),
+      ),
+    );
+
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on("unhandledRejection", onRejection);
+    try {
+      const result = await handlers.translatePage!(
+        { imageUrl: "https://x/y.jpg", priority: 0, requestId: "req-3" },
+        SENDER,
+      );
+      expect(result.ok).toBe(false); // the failed run surfaces as a failure result
+
+      // Let any un-handled microtask rejection from the finally chain surface.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(rejections).toEqual([]); // the derived rejection was swallowed
+
+      // Cleanup still ran on the reject path: the shared-abort entry is gone.
+      expect(sharedAbortsSizeForTest()).toBe(0);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
   });
 });

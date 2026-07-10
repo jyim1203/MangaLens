@@ -17,6 +17,7 @@
  * image nears the viewport.
  */
 import { createLogger } from "../shared/log";
+import { OVERLAY_HOST_ATTR } from "../shared/constants";
 
 const log = createLogger("scanner");
 
@@ -25,8 +26,16 @@ export const MIN_RENDERED_PX = 180;
 /** Minimum natural size (px) on at least ONE side. */
 export const MIN_NATURAL_PX = 400;
 
-/** Debounce for MutationObserver-triggered re-scans (ms). */
+/** Trailing-edge debounce for MutationObserver-triggered re-scans (ms). */
 const RESCAN_DEBOUNCE_MS = 250;
+/**
+ * Max wait before a re-scan is forced even under continuous mutations (ms). WHY:
+ * a page with a perpetually-animating inline `style` (sliders, progress bars)
+ * mutates faster than the debounce forever, so a pure trailing-edge debounce
+ * would never fire and late-added images would never be found (item 4). This caps
+ * the starvation: a scan runs at most ~1 s into a continuous mutation burst.
+ */
+const RESCAN_MAX_WAIT_MS = 1000;
 
 /**
  * DOM-free metrics describing one image element, everything the pure predicate
@@ -71,6 +80,11 @@ export function isCandidate(m: CandidateMetrics): boolean {
  * Rank a candidate so the most likely main-content page sorts first (§7.1).
  * Larger rendered area and closer-to-horizontally-centered both raise the score,
  * so a big centered page beats a small sidebar/footer thumbnail. Pure.
+ *
+ * RESERVED / not yet consumed: the scanner no longer sorts by score (the viewport
+ * queue re-orders everything into document order, so it had no effect — item 7).
+ * This stays exported + tested for the §7.1 main-image ranking a later consumer
+ * will use (drag-select default target / main-image heuristics, Phase 7).
  *
  * @param m metrics for the element.
  * @returns a non-negative score; higher is more manga-page-like.
@@ -122,6 +136,46 @@ export function classifyImageUrl(url: string | null | undefined): UrlPolicy {
 export function parseCssUrl(backgroundImage: string): string | null {
   const m = /url\(\s*(['"]?)([^'")]+)\1\s*\)/i.exec(backgroundImage);
   return m && m[2] ? m[2] : null;
+}
+
+/**
+ * Is `node` one of our own overlay HOST elements (marked with
+ * {@link OVERLAY_HOST_ATTR})? Used to drop MutationObserver records that the
+ * OverlayManager itself produces when it rewrites host `style` on every
+ * scroll/resize sync — without this, scrolling would schedule an endless
+ * self-triggered re-scan (item 4). Host *children* live in a shadow root and
+ * never reach the page-level observer, so testing the record target suffices.
+ * Pure.
+ *
+ * @param node a MutationRecord target (or any node), possibly null.
+ */
+export function isOwnOverlayHost(node: Node | null | undefined): boolean {
+  return node instanceof Element && node.hasAttribute(OVERLAY_HOST_ATTR);
+}
+
+/**
+ * Trailing-edge debounce with a max-wait ceiling (item 4). Given the current
+ * time, when the *first* mutation of the current burst was seen, and the two
+ * bounds, return how many ms from now the re-scan should run: normally
+ * `debounceMs` after the latest mutation (quiet-settles), but never later than
+ * `maxWaitMs` after the burst began, so a continuously-mutating page still gets
+ * scanned. Clamped to ≥ 0. Pure.
+ *
+ * @param now current timestamp (ms).
+ * @param firstScheduledAt timestamp of the first mutation since the last run.
+ * @param debounceMs trailing-edge quiet window.
+ * @param maxWaitMs hard ceiling from `firstScheduledAt`.
+ * @returns delay in ms from `now` until the scan should run.
+ */
+export function computeRescanDelay(
+  now: number,
+  firstScheduledAt: number,
+  debounceMs: number,
+  maxWaitMs: number,
+): number {
+  const trailingAt = now + debounceMs;
+  const ceilingAt = firstScheduledAt + maxWaitMs;
+  return Math.max(0, Math.min(trailingAt, ceilingAt) - now);
 }
 
 /**
@@ -219,6 +273,12 @@ function defaultCollectElements(): Element[] {
   // check in resolveUrl keeps this cheap enough for a debounced rescan.
   for (const el of document.querySelectorAll<HTMLElement>("*")) {
     if (el instanceof HTMLImageElement) continue;
+    // WHY rect before getComputedStyle: getComputedStyle is the expensive call on
+    // a 10k-element DOM, while layout is already clean at this point, so a cheap
+    // rect read lets us skip the sub-threshold majority (which isCandidate would
+    // reject anyway) before ever touching computed style (item 4).
+    const rect = el.getBoundingClientRect();
+    if (rect.width < MIN_RENDERED_PX || rect.height < MIN_RENDERED_PX) continue;
     const bg = el.style.backgroundImage || getComputedStyle(el).backgroundImage;
     if (bg && bg !== "none" && bg.includes("url(")) els.push(el);
   }
@@ -252,24 +312,27 @@ export function createScanner(opts: ScannerOptions): Scanner {
 
   let mutationObserver: MutationObserver | undefined;
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  /** When the first mutation of the current un-run burst was seen (max-wait). */
+  let firstScheduledAt: number | undefined;
   let onPopstate: (() => void) | undefined;
 
   const nextId = (): string => `mangalens-cand-${++idCounter}`;
 
   const scan = (): void => {
     const seen = new Set<Element>();
-    // Order elements by score so the viewport queue registers the main page(s)
-    // first — prefetch and priority both read document/registration order.
-    const found: Array<{ el: Element; url: string; score: number }> = [];
+    // WHY not sorted by score: the viewport queue re-inserts every candidate into
+    // document order (`insertInDocOrder`), so registration order has no observable
+    // effect on prefetch or priority — a sort here would be dead code. scoreCandidate
+    // is reserved for the §7.1 main-image ranking a later consumer will use (Phase 7).
+    const found: Array<{ el: Element; url: string }> = [];
 
     for (const el of collectElements()) {
       const metrics = readMetrics(el);
       if (!metrics || !isCandidate(metrics)) continue;
       const url = resolveUrl(el);
       if (classifyImageUrl(url) !== "accept" || !url) continue;
-      found.push({ el, url, score: scoreCandidate(metrics) });
+      found.push({ el, url });
     }
-    found.sort((a, b) => b.score - a.score);
 
     for (const { el, url } of found) {
       seen.add(el);
@@ -295,11 +358,20 @@ export function createScanner(opts: ScannerOptions): Scanner {
   };
 
   const scheduleScan = (): void => {
+    const now = Date.now();
+    if (firstScheduledAt === undefined) firstScheduledAt = now;
+    const delay = computeRescanDelay(
+      now,
+      firstScheduledAt,
+      RESCAN_DEBOUNCE_MS,
+      RESCAN_MAX_WAIT_MS,
+    );
     if (debounceTimer !== undefined) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       debounceTimer = undefined;
+      firstScheduledAt = undefined;
       safe(scan);
-    }, RESCAN_DEBOUNCE_MS);
+    }, delay);
   };
 
   return {
@@ -308,7 +380,14 @@ export function createScanner(opts: ScannerOptions): Scanner {
       started = true;
       safe(scan);
 
-      mutationObserver = new MutationObserver(() => scheduleScan());
+      mutationObserver = new MutationObserver((records) => {
+        // Drop records produced by our own overlay hosts (the OverlayManager
+        // rewrites host `style` on every scroll/resize sync); if a burst is
+        // ENTIRELY our own hosts, it must not schedule a re-scan (item 4). A
+        // real page mutation in the same burst still gets through.
+        if (records.every((r) => isOwnOverlayHost(r.target))) return;
+        scheduleScan();
+      });
       mutationObserver.observe(document.documentElement, {
         childList: true,
         subtree: true,
@@ -330,6 +409,7 @@ export function createScanner(opts: ScannerOptions): Scanner {
         clearTimeout(debounceTimer);
         debounceTimer = undefined;
       }
+      firstScheduledAt = undefined;
       mutationObserver?.disconnect();
       mutationObserver = undefined;
       if (onPopstate) {
