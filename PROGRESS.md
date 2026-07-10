@@ -296,3 +296,147 @@ temperature on primary/0-on-repair; 529 retry; retry-after cap; anthropic
 sampling-400 strip + memo; openai endpoint-mode memo; errorToTranslateResult
 kind mapping ×3), 157 total green; typecheck + eslint + build + `web-ext lint`
 (0/0) all clean.
+
+## Phase 4 summary (cache + queue + cost tracker)
+
+Landed the three background infrastructure modules and wired them into the
+translate path. **No `shared/types.ts` change** (handoff rule 4) — cache/queue/
+cost types are module-local, since nothing across a context boundary needs them
+yet (the popup/options read them in Phase 6). One new dependency (`idb@8`,
+Architecture §4's named IndexedDB wrapper) and one additive constant
+(`shared/constants.ts` `CACHE_VERSION`). Each module follows the repo's
+pure-core-plus-thin-shell split. `background/cache.ts` (F13, §7.3): the tested
+pure core is `buildCacheKey` (composite `imageHash|targetLang|model|p<PROMPT_
+VERSION>` so the same bytes under a different language/model/prompt never
+collide), `estimatePageBytes` (UTF-8 byte length of the serialized page +
+fixed record overhead — the size cap is a soft budget), `classifyCacheLookup`
+(`miss|hit|negative|expired`), `shouldNegativeCache` (**only** `malformed`/
+`refusal` are cached — PROMPTS §6.5; transient `auth`/`rate-limit`/`network`/
+`aborted` stay retryable), and `planEviction` (drop expired negatives first,
+then evict least-recently-accessed until under the byte cap). The **thin,
+untested `idb` shell** (`cacheLookup`/`cacheStorePage`/`cacheStoreNegative`/
+`evictToCap`/`clearCacheForSite`/`clearAllCache`) opens a `CACHE_VERSION`-named
+DB (a value-shape change retires the whole store at once, distinct from
+`PROMPT_VERSION` which is folded into each key), indexes `origin` for O(site)
+per-site clear (F15) and `lastAccess` for eviction scans, and wraps **every**
+operation so an IndexedDB fault degrades to "no caching", never a failed
+translation (rule 6); negative entries carry a 10-min TTL (`NEGATIVE_TTL_MS`).
+Untested for the same env reason as `prepareImage` — IndexedDB doesn't exist in
+the Node test runtime. `background/queue.ts` is fully browser-free and tested:
+`PriorityQueue` runs lowest-priority-number first (0 = visible, §7.5), FIFO
+within a priority (insertion-seq tiebreak), caps in-flight jobs at a runtime-
+adjustable `concurrency`, and propagates abort two ways — a queue-wide signal
+rejects all queued + in-flight jobs, a per-job signal rejects just that job, and
+every task is invoked with a *merged* signal so running work (e.g. `fetch`) can
+cancel itself. Opt-in retry-with-backoff exists (`maxRetries`, injectable
+`sleep`/`backoffMs` seams) but **defaults to 0 in the translate path** — the
+provider layer already owns the 429/529 backoff ladder, and retrying here would
+double it (WHY noted in-source). `background/costTracker.ts` (F17): pure
+`estimateRequestCost` (from a **ballpark** `PRICING` table, VERIFY-AT-BUILD-TIME
+per §3), pure immutable `addUsage` accumulator, `usageFromPage`,
+`emptyCostStats`; persistence over `storage.local` (never `sync`, §7.6) via
+`getCostStats`/`recordUsage`/`resetCostStats`, fail-soft and healing corrupt
+stored values to zero. **Wiring** (`translateHandlers.ts`, now cache-first +
+queued): `translateImage` fetches (HTTP-cache-reused) → hashes the original
+bytes → `buildCacheKey` → `cacheLookup`; a **hit returns instantly** (§7.5
+"<50 ms", never enters the queue), a **live negative re-throws the cached
+`ProviderError`** so the UI messaging path is identical, and a miss enqueues the
+extracted `translatePrepared` (prep → per-tile provider calls → `mergeTilePages`)
+through the single module-level `PriorityQueue` at the request's priority. On
+success the page is cached (`cacheStorePage`, which then evicts to the cap) and
+its tokens recorded (`recordUsage`); a `malformed`/`refusal` failure is
+negatively cached. The image `origin` (for per-site clear) is derived from the
+message `sender.url`. **Design choices flagged:** (1) the concurrency cap bounds
+*images* in flight; tiles within one strip still fan out in parallel (§7.5,
+bounded by tile count) rather than sharing the global cap — a later refinement if
+strip fan-out proves too aggressive. (2) Per-site clear stores a single `origin`
+per content-hash entry (an image reused across sites keeps its first origin) —
+acceptable because caching is content-hash-keyed and images are effectively
+site-specific; noted in-source. **Deferred:** `translateImage`/`translatePrepared`
+stay untested (browser-only: OffscreenCanvas + IndexedDB) with all their
+decisions delegated to tested pure helpers; `clearCacheForSite`/`clearAllCache`/
+`getCostStats`/`resetCostStats` are exported and ready but only wired into the
+options UI in Phase 6 (cache management + cost display); `testApiKey` stays
+Phase 6; prefetch tuning and multi-page batching (F12) stay Phase 8. Manual
+verify: load in Firefox, translate a page twice — the second render is instant
+(cache hit, no provider call in the network panel); the popup cost figure only
+moves on the first. Tests: 43 new (cache 18: key composition/isolation, UTF-8
+size estimate, lookup classifier, negative-cache policy, LRU+TTL eviction;
+queue 13: concurrency cap, priority+FIFO ordering, per-job/queue-wide/running
+abort, add-after-abort, retry ladder + give-up + no-retry-on-abort, bookkeeping;
+costTracker 12: pricing/accumulate/immutability/usageFromPage + storage round-
+trip/reset/corrupt-heal), 200 total green; typecheck + eslint + build +
+`web-ext lint` (0 errors / 0 warnings; the lone `data_collection_permissions`
+notice stays Phase-8-deferred) all clean.
+
+## Phase 4.1 summary (review fixes)
+
+A review of Phase 4 against Architecture §7.3–§7.6 caught four correctness bugs,
+four robustness gaps, and three cleanups; all fixed. **P1 (correctness):** (1)
+**Cost lost-update race** — `recordUsage` did an unserialized read-modify-write,
+so at the default concurrency 6 two near-simultaneous finishes both read the same
+totals and one page's tokens vanished; all cost writes now serialize through a
+module-level promise chain (`enqueueWrite`; `recordUsage` + `resetCostStats` each
+append and await their own link, and a failed link can't poison the chain — the
+per-link try/catch keeps it fail-soft). (2) **Tiled pages under-reported images**
+— `translatePrepared` now returns `{ page, providerCalls }` (the tile count = the
+number of provider image requests) and the driver passes it to
+`usageFromPage(merged, providerCalls)`, so a webtoon strip's `images` count is
+finally accurate; `ProviderCostStats` JSDoc clarified (`calls` = pages/events,
+`images` = provider requests, the figure that tracks cost for strips). (3)
+**Cache key built from the raw (often empty) model string** — the provider
+actually runs `settings.model || defaultModel`, so factory-default settings keyed
+under `""` while the request used e.g. `gemini-2.0-flash` (stale hits after a
+default bump; needless re-translation when a user picks the model that *is* the
+default). Introduced one source of truth — `DEFAULT_MODELS` in `ProviderBase.ts`,
+consumed by all four adapters *and* a new pure `resolveEffectiveModel`
+(`factory.ts`) — and the cache key now uses the resolved model. (4)
+**Prompt-shaping settings missing from the key** — `buildCacheKey` now composes
+`{provider}|{imageHash}|{targetLang}|{model}|h{0|1}|d{rtl|ltr|auto}|s{hint|-}|p{ver}`,
+folding in the provider id (also kills same-model cross-provider collisions) and
+the honorifics / reading-direction / source-lang-hint slots that change the
+prompt (PROMPTS §3/§4/§7); free-text segments are `encodeURIComponent`-ed so a
+model id containing `|` can't collide; `temperature` is deliberately excluded
+(continuous knob, WHY-noted). **Flagged (rule 4):** this goes beyond the
+Architecture F13 key spec, but it's the same staleness bug `PROMPT_VERSION`
+exists to prevent; still background-module-local, no `shared/types.ts` change.
+**P2 (robustness):** (5) `getDb` now clears the memo on a *rejected* open, so one
+transient IndexedDB fault no longer disables caching for the whole event-page
+lifetime. (6) **Eviction no longer deserializes the whole store on every write**
+— a new tiny `meta` object store holds a running `totalBytes`, maintained
+transactionally on every put/delete/clear (pure `totalAfterPut`), so `evictToCap`
+is O(1) when under cap and only walks the `lastAccess` index with a cursor
+(oldest-first, pure `planLruEviction`) when over; the old `planEviction`/getAll
+pass is retired, and the "expired first" sweep is dropped (expired negatives are
+tiny and collected by the LRU walk + item 9, with `classifyCacheLookup`'s TTL
+check remaining the correctness guard). This is a store-layout change, so
+`CACHE_VERSION` is bumped **1 → 2**. (7) **In-flight coalescing** — a new pure
+`coalesce(map, key, fn)` helper plus a module-level map keyed by cache key means
+concurrent `translatePage`s for the same image (scanner + prefetch overlap,
+duplicate scrolls, two tabs) share one provider run (F13); the abort-refcount
+caveat for Phase 5's real cancellation is left as an in-source note, not built.
+(8) On first open a fire-and-forget sweep deletes stale `mangalens-cache-v*`
+databases (via `indexedDB.databases()`, FF126+; we require 128) so a
+`CACHE_VERSION` bump doesn't strand the old (up-to-cap-sized) DB forever.
+**P3 (cleanups):** (9) an `expired` `cacheLookup` fire-and-forgets a delete of the
+dead negative entry (decrementing the total in the same tx); (10) `estimatePageBytes`
+now uses `TextEncoder` instead of hand-rolled surrogate arithmetic; (11)
+`cacheCapBytes` clamps to a 1 MB floor so a corrupt `cacheCapMb ≤ 0` can't make
+every store evict the whole cache. **Left alone per the handoff:** queue retry
+stays 0 in the translate path; fetch+hash stay outside the queue; the
+negative-cache policy and `PRICING` ballpark are unchanged; the handler's unwired
+`AbortController` and per-entry single `origin` remain Phase-5/accepted. **No
+`shared/types.ts` change** (rule 4); the only `shared/*` change is
+`CACHE_VERSION`'s value. Tests: 15 new/changed (coalesce 4: share/cleanup-on-
+reject/independent-keys/sync-throw; resolveEffectiveModel 4: explicit/default/
+custom-empty/key-equivalence; buildCacheKey rewritten to the 8-part format +
+honorifics/hint encoding + per-field change detection + delimiter-proofing;
+`totalAfterPut` 3 + `planLruEviction` 4 replacing `planEviction`; costTracker 3:
+multi-tile `images` accumulation + concurrent-recordUsage serialization +
+chain-not-poisoned), 215 total green; typecheck + eslint + build + `web-ext lint`
+(0 errors / 0 warnings; the lone `data_collection_permissions` notice stays
+Phase-8-deferred) all clean. *(Post-review tweak: `evictToCap` now re-reads the
+running byte total inside its readwrite transaction — the read-only pre-check
+stays for the O(1) under-cap fast path — so a concurrent put/delete landing
+between the pre-check and the cursor walk can no longer be clobbered by the
+absolute total written back; re-verified green.)*

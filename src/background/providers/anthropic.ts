@@ -12,6 +12,7 @@
  * extension that calls the API directly (§7.6). Keys stay local.
  */
 import {
+  DEFAULT_MODELS,
   ProviderBase,
   tokenCount,
   type BuildContext,
@@ -49,7 +50,7 @@ export function resetSamplingMemo(): void {
 
 /** Anthropic provider. */
 export class AnthropicProvider extends ProviderBase {
-  protected readonly defaultModel = "claude-haiku-4-5";
+  protected readonly defaultModel = DEFAULT_MODELS.anthropic;
 
   protected override buildRequest(ctx: BuildContext): ProviderRequest {
     const temperature = MODELS_REJECTING_SAMPLING.has(ctx.model)

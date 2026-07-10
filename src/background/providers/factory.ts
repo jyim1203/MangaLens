@@ -5,7 +5,11 @@
  * {@link Translator} interface.
  */
 import type { ProviderSettings, Translator } from "../../shared/types";
-import { ProviderError, type ProviderBaseOptions } from "./ProviderBase";
+import {
+  DEFAULT_MODELS,
+  ProviderError,
+  type ProviderBaseOptions,
+} from "./ProviderBase";
 import { AnthropicProvider } from "./anthropic";
 import { GeminiProvider } from "./gemini";
 import {
@@ -51,4 +55,24 @@ export function createProvider(
         `Unknown provider: ${String(settings.provider)}`,
       );
   }
+}
+
+/**
+ * The model that {@link createProvider}'s translator will actually run for these
+ * settings: the user's explicit choice, or the provider's default when none is
+ * set. This MUST mirror `ProviderBase`'s own `settings.model || this.defaultModel`
+ * resolution (both read {@link DEFAULT_MODELS}), so the cache key
+ * ({@link import("../cache").buildCacheKey}) is keyed by the same model string
+ * the request used and the stored {@link import("../../shared/types").PageTranslation}
+ * is stamped with (Phase 4.1 item 3).
+ *
+ * WHY custom can resolve to `""`: an OpenAI-compatible endpoint has no canonical
+ * default model; when the user hasn't named one the empty segment is still a
+ * stable, self-consistent key (the same endpoint always keys the same way).
+ *
+ * @param settings the provider slice.
+ * @returns the resolved model id (possibly `""` for an unconfigured custom endpoint).
+ */
+export function resolveEffectiveModel(settings: ProviderSettings): string {
+  return settings.model || DEFAULT_MODELS[settings.provider];
 }

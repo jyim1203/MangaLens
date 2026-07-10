@@ -8,6 +8,7 @@
  * part. `maxOutputTokens` is generous (8192) for dense action pages.
  */
 import {
+  DEFAULT_MODELS,
   ProviderBase,
   tokenCount,
   type BuildContext,
@@ -34,7 +35,7 @@ const REFUSAL_REASONS: ReadonlySet<string> = new Set([
 
 /** Gemini provider. */
 export class GeminiProvider extends ProviderBase {
-  protected readonly defaultModel = "gemini-2.0-flash";
+  protected readonly defaultModel = DEFAULT_MODELS.gemini;
 
   protected override buildRequest(ctx: BuildContext): ProviderRequest {
     const body = {

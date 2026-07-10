@@ -9,6 +9,7 @@
  * schema pasted into the system prompt (the {@link downgrade} hook, §5.2).
  */
 import {
+  DEFAULT_MODELS,
   ProviderBase,
   tokenCount,
   type BuildContext,
@@ -163,7 +164,7 @@ export function createOpenAiProvider(
 ): OpenAiProvider {
   return new OpenAiProvider(
     "openai",
-    { baseUrl: OPENAI_BASE_URL, defaultModel: "gpt-4o-mini" },
+    { baseUrl: OPENAI_BASE_URL, defaultModel: DEFAULT_MODELS.openai },
     options,
   );
 }
@@ -179,7 +180,7 @@ export function createCustomProvider(
 ): OpenAiProvider {
   return new OpenAiProvider(
     "custom",
-    { baseUrl, defaultModel: "" },
+    { baseUrl, defaultModel: DEFAULT_MODELS.custom },
     options,
   );
 }

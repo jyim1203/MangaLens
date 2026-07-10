@@ -13,8 +13,14 @@ import {
   OPENROUTER_BASE_URL,
   createOpenRouterProvider,
 } from "../../src/background/providers/openrouter";
-import { createProvider } from "../../src/background/providers/factory";
-import { ProviderError } from "../../src/background/providers/ProviderBase";
+import {
+  createProvider,
+  resolveEffectiveModel,
+} from "../../src/background/providers/factory";
+import {
+  DEFAULT_MODELS,
+  ProviderError,
+} from "../../src/background/providers/ProviderBase";
 import type {
   ProviderSettings,
   TranslateJob,
@@ -338,5 +344,36 @@ describe("createProvider factory", () => {
       const provider = createProvider(makeSettings({ provider: id }));
       expect(typeof provider.translatePage).toBe("function");
     }
+  });
+});
+
+describe("resolveEffectiveModel", () => {
+  it("returns the explicit model when the user picked one", () => {
+    expect(resolveEffectiveModel(makeSettings({ provider: "gemini", model: "gemini-1.5-pro" }))).toBe(
+      "gemini-1.5-pro",
+    );
+  });
+
+  it("falls back to the per-provider default when model is empty", () => {
+    for (const id of ["gemini", "anthropic", "openai", "openrouter"] as const) {
+      expect(resolveEffectiveModel(makeSettings({ provider: id, model: "" }))).toBe(
+        DEFAULT_MODELS[id],
+      );
+    }
+  });
+
+  it("keeps '' for a custom endpoint with no model set", () => {
+    expect(resolveEffectiveModel(makeSettings({ provider: "custom", model: "" }))).toBe("");
+  });
+
+  it("resolves default-settings gemini to the same model as an explicit pick (item 3)", () => {
+    // The cache key would therefore match — no needless re-translation when the
+    // user explicitly selects the model that is already the default.
+    const fromDefault = resolveEffectiveModel(makeSettings({ provider: "gemini", model: "" }));
+    const fromExplicit = resolveEffectiveModel(
+      makeSettings({ provider: "gemini", model: "gemini-2.0-flash" }),
+    );
+    expect(fromDefault).toBe(fromExplicit);
+    expect(fromDefault).toBe(DEFAULT_MODELS.gemini);
   });
 });

@@ -6,7 +6,7 @@
  * inherits the `json_schema` → `json_object` downgrade ladder unchanged.
  */
 import { OpenAiProvider } from "./openai";
-import type { ProviderBaseOptions } from "./ProviderBase";
+import { DEFAULT_MODELS, type ProviderBaseOptions } from "./ProviderBase";
 
 /** Canonical OpenRouter API base. */
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
@@ -28,7 +28,7 @@ export function createOpenRouterProvider(
     "openrouter",
     {
       baseUrl: OPENROUTER_BASE_URL,
-      defaultModel: "google/gemini-2.0-flash-001",
+      defaultModel: DEFAULT_MODELS.openrouter,
       extraHeaders: OPENROUTER_HEADERS,
     },
     options,
