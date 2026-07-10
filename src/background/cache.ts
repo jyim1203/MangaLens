@@ -541,6 +541,35 @@ export async function clearCacheForSite(hostname: string): Promise<number> {
   }
 }
 
+/** Totals for the options page cache panel (Phase 6). */
+export interface CacheStats {
+  /** Number of cached entries (positive + negative). */
+  entries: number;
+  /** Estimated bytes used (the running {@link TOTAL_BYTES_KEY} total). */
+  bytes: number;
+}
+
+/**
+ * Read the cache totals for display (options page). Fail-soft to zeros — a
+ * cache fault must never break the settings page. Safe to call from the
+ * options context directly: extension pages share the background's origin, so
+ * it's the same IndexedDB, and reads don't contend with the write paths.
+ */
+export async function getCacheStats(): Promise<CacheStats> {
+  try {
+    const db = await getDb();
+    const tx = db.transaction([CACHE_STORE, META_STORE], "readonly");
+    const entries = await tx.objectStore(CACHE_STORE).count();
+    const bytes =
+      (await tx.objectStore(META_STORE).get(TOTAL_BYTES_KEY)) ?? 0;
+    await tx.done;
+    return { entries, bytes };
+  } catch (err) {
+    log.warn("getCacheStats failed", err);
+    return { entries: 0, bytes: 0 };
+  }
+}
+
 /** Wipe the entire translation cache (options page "clear cache"). Fail-soft. */
 export async function clearAllCache(): Promise<void> {
   try {

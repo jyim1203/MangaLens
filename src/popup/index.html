@@ -4,24 +4,234 @@
     <meta charset="utf-8" />
     <title>MangaLens</title>
     <style>
+      :root {
+        --bg: #ffffff;
+        --fg: #1b1b1f;
+        --muted: #66666e;
+        --border: #d9d9e0;
+        --accent: #4f46e5;
+        --accent-fg: #ffffff;
+        --banner-bg: #fff7e0;
+        --banner-border: #e8c96a;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #1f1f24;
+          --fg: #ececf1;
+          --muted: #9d9da8;
+          --border: #3a3a44;
+          --accent: #7c74f2;
+          --accent-fg: #17171c;
+          --banner-bg: #3a3320;
+          --banner-border: #6b5c2a;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      /* WHY: the UA stylesheet implements [hidden] as display:none, but ANY
+         author display rule (e.g. .banner { display:flex }) overrides it —
+         without this reset the setup banners could never be hidden. */
+      [hidden] {
+        display: none !important;
+      }
       body {
-        min-width: 260px;
+        width: 300px;
         margin: 0;
         padding: 12px;
-        font: 13px/1.4 system-ui, sans-serif;
+        font: 13px/1.45 system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 4px;
       }
       h1 {
-        font-size: 14px;
-        margin: 0 0 8px;
+        font-size: 15px;
+        margin: 0;
       }
-      #status {
-        color: #666;
+      .status {
+        margin: 0 0 10px;
+        color: var(--muted);
+      }
+      .banner {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        background: var(--banner-bg);
+        border: 1px solid var(--banner-border);
+        border-radius: 6px;
+        padding: 6px 8px;
+        margin-bottom: 8px;
+      }
+      .banner > span:first-child {
+        flex: 1;
+      }
+      button.dismiss {
+        border: none;
+        background: none;
+        color: var(--muted);
+        font-size: 15px;
+        line-height: 1;
+        padding: 0 2px;
+      }
+      .rows {
+        display: grid;
+        gap: 6px;
+        margin-bottom: 10px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 88px 1fr;
+        align-items: center;
+        gap: 8px;
+      }
+      .row > span {
+        color: var(--muted);
+      }
+      select,
+      input[type="text"] {
+        width: 100%;
+        padding: 4px 6px;
+        font: inherit;
+        color: var(--fg);
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 5px;
+      }
+      button {
+        font: inherit;
+        cursor: pointer;
+      }
+      button.primary {
+        width: 100%;
+        padding: 7px 10px;
+        border: none;
+        border-radius: 6px;
+        background: var(--accent);
+        color: var(--accent-fg);
+        font-weight: 600;
+      }
+      button.primary:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      button.link {
+        border: none;
+        background: none;
+        color: var(--accent);
+        padding: 0;
+        text-decoration: underline;
+        white-space: nowrap;
+      }
+      .hint {
+        min-height: 1.2em;
+        margin: 6px 0 0;
+        color: var(--muted);
+      }
+      footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 10px;
+        padding-top: 8px;
+        border-top: 1px solid var(--border);
+        color: var(--muted);
+      }
+      /* Global on/off switch */
+      .switch {
+        position: relative;
+        display: inline-block;
+        width: 36px;
+        height: 20px;
+      }
+      .switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+      }
+      .switch .slider {
+        position: absolute;
+        inset: 0;
+        background: var(--border);
+        border-radius: 10px;
+        transition: background 0.15s;
+      }
+      .switch .slider::before {
+        content: "";
+        position: absolute;
+        width: 16px;
+        height: 16px;
+        left: 2px;
+        top: 2px;
+        background: var(--bg);
+        border-radius: 50%;
+        transition: transform 0.15s;
+      }
+      .switch input:checked + .slider {
+        background: var(--accent);
+      }
+      .switch input:checked + .slider::before {
+        transform: translateX(16px);
       }
     </style>
   </head>
   <body>
-    <h1>MangaLens</h1>
-    <p id="status">Checking background…</p>
+    <header>
+      <h1>MangaLens</h1>
+      <label class="switch" title="Toggle MangaLens (Alt+Shift+M)">
+        <input type="checkbox" id="enabled" />
+        <span class="slider"></span>
+      </label>
+    </header>
+
+    <p id="status" class="status">Loading…</p>
+
+    <div id="banner-key" class="banner" hidden>
+      <span>No API key for this provider.</span>
+      <button id="add-key" class="link">Add key</button>
+      <button id="dismiss-key" class="dismiss" title="Dismiss" aria-label="Dismiss">✕</button>
+    </div>
+    <div id="banner-perm" class="banner" hidden>
+      <span>Image access not granted.</span>
+      <button id="grant-perm" class="link">Grant</button>
+      <button id="dismiss-perm" class="dismiss" title="Dismiss" aria-label="Dismiss">✕</button>
+    </div>
+
+    <section class="rows">
+      <label class="row">
+        <span>This site</span>
+        <select id="site-choice">
+          <option value="default">Follow global</option>
+          <option value="on">Always on</option>
+          <option value="off">Always off</option>
+        </select>
+      </label>
+      <label class="row">
+        <span>Translate to</span>
+        <select id="target-lang"></select>
+      </label>
+      <label class="row">
+        <span>Provider</span>
+        <select id="provider"></select>
+      </label>
+      <label class="row">
+        <span>Model</span>
+        <input type="text" id="model" spellcheck="false" />
+      </label>
+    </section>
+
+    <button id="translate-all" class="primary">Translate all pages</button>
+    <p id="action-status" class="hint"></p>
+
+    <footer>
+      <span id="cost">≈ $0.00</span>
+      <button id="open-options" class="link">Settings</button>
+    </footer>
+
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

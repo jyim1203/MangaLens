@@ -18,12 +18,14 @@ import {
   toggleEnabled,
 } from "./settingsHandlers";
 import { createTranslateHandlers } from "./translateHandlers";
+import { createKeyTestHandlers } from "./providers/keyTest";
+import { resetCostStats } from "./costTracker";
 
 const log = createLogger("background");
 
-// Typed message router (shared/messages.ts). Settings + translatePage are live;
-// testApiKey lands with the options UI (Phase 6). Cache/queue wrap the translate
-// handler in Phase 4.
+// Typed message router (shared/messages.ts). Settings, translatePage, and (as
+// of Phase 6) testApiKey + resetCostStats are live. translateAll is handled by
+// the CONTENT script (popup → tab), not here.
 const router = createMessageRouter({
   ping: () => {
     log.debug("ping received");
@@ -31,6 +33,13 @@ const router = createMessageRouter({
   },
   ...createSettingsHandlers(),
   ...createTranslateHandlers(),
+  ...createKeyTestHandlers(),
+  // WHY here and not a direct import in the options page: cost writes are
+  // serialized through costTracker's per-context chain — a second context
+  // writing would race it (see the resetCostStats MessageMap note).
+  resetCostStats: async () => {
+    await resetCostStats();
+  },
 });
 browser.runtime.onMessage.addListener(router);
 

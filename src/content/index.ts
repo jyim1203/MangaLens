@@ -21,9 +21,11 @@
  */
 import browser from "webextension-polyfill";
 import { createLogger } from "../shared/log";
+import { createMessageRouter } from "../shared/messages";
 import {
   SETTINGS_KEY,
   migrateSettings,
+  peekSettings,
   type Settings,
 } from "../shared/settings";
 import { activeAfter, computeGateAction, type GateState } from "./gate";
@@ -108,15 +110,9 @@ function applySettings(settings: Settings): void {
   };
 }
 
-/**
- * Read settings WITHOUT waking the event page: a raw `storage.local` read healed
- * by the PURE {@link migrateSettings} (never `loadSettings`, which persists on
- * first run — a content script on every page must never write storage).
- */
-async function readSettings(): Promise<Settings> {
-  const raw = (await browser.storage.local.get(SETTINGS_KEY))[SETTINGS_KEY];
-  return migrateSettings(raw).settings;
-}
+// Settings are read WITHOUT waking the event page via the shared
+// `peekSettings` (raw storage read + pure migrate — never `loadSettings`,
+// which persists on first run; a content script must never write storage).
 
 /** Recompute the gate from a raw stored blob (from storage.onChanged). */
 function onSettingsChanged(rawNewValue: unknown): void {
@@ -134,6 +130,20 @@ let initialApplied = false;
 let bufferedChange: { value: unknown } | undefined;
 
 async function bootstrap(): Promise<void> {
+  // Popup → this tab: F8 "translate all" (Phase 6). Registered even while
+  // inert — a passive onMessage listener touches nothing on the host page and
+  // sends nothing (unlike the Phase 0 liveness ping this file used to have).
+  // While inactive there is no queue, so the popup just gets { count: 0 }.
+  // This is NOT the forbidden settingsChanged listener (see module WHY-note):
+  // settings changes still arrive exclusively via storage.onChanged below.
+  browser.runtime.onMessage.addListener(
+    createMessageRouter({
+      translateAll: (req) => ({
+        count: viewportQueue?.requestAll(req?.dryRun ?? false) ?? 0,
+      }),
+    }),
+  );
+
   browser.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
     const change = changes[SETTINGS_KEY];
@@ -151,7 +161,7 @@ async function bootstrap(): Promise<void> {
     onSettingsChanged(change.newValue);
   });
 
-  const settings = await readSettings();
+  const settings = await peekSettings();
   applySettings(settings);
   // Everything from here is synchronous (no await), so no listener can interleave:
   // drain any change buffered during the read, then go live.

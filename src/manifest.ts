@@ -39,7 +39,12 @@ const manifest: Record<string, unknown> = {
       run_at: "document_idle",
     },
   ],
-  permissions: ["storage"],
+  // WHY activeTab (Phase 6): the popup's per-site toggle and "translate all"
+  // need the ACTIVE tab's URL/hostname, which is hidden without a tabs-ish
+  // permission. activeTab is granted on user interaction with the extension
+  // (opening the popup counts) and carries NO install-time warning, unlike the
+  // scary "tabs" permission.
+  permissions: ["storage", "activeTab"],
   optional_host_permissions: ["<all_urls>"],
   commands: {
     "toggle-mangalens": {

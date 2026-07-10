@@ -358,6 +358,20 @@ export async function loadSettings(): Promise<Settings> {
 }
 
 /**
+ * Read the current settings WITHOUT ever writing storage — for contexts that
+ * must not be a settings write path (the popup and options pages render from
+ * this and send all writes through the background's `setSettings`, keeping the
+ * Phase 1.1 single-write-path invariant; the content script has its own copy
+ * of this pattern). Unlike {@link loadSettings} this never persists the healed
+ * blob or seeds the first-run locale — the background does that on its first
+ * real load.
+ */
+export async function peekSettings(): Promise<Settings> {
+  const raw = (await browser.storage.local.get(SETTINGS_KEY))[SETTINGS_KEY];
+  return migrateSettings(raw).settings;
+}
+
+/**
  * Merge a partial update into the stored settings and persist. Returns the full
  * updated settings. Nested objects in `patch` (e.g. `{ font: {...} }`) are
  * merged onto existing values, not replaced wholesale. A `null` entry in

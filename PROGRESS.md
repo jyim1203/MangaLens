@@ -672,3 +672,179 @@ aborted-while-registered resets; translateHandlers +1: failed coalesced run leav
 no unhandled rejection and still cleans up the shared-abort map), **300 total
 green**; typecheck + eslint + build + `web-ext lint` (0 errors / 0 warnings; the
 lone `data_collection_permissions` notice stays Phase-8-deferred) all clean.
+
+## Phase 6 summary (UI: popup + options)
+
+Landed the real popup and options pages — F1/F2/F5/F8/F9/F15/F17 all get their
+user-facing surface — plus the background/content plumbing the UI needed
+(`testApiKey`, cost reset, translate-all, cache stats). **Stack decision:**
+vanilla TS + static HTML skeletons, no Preact/lit-html (Architecture §4 offers
+either) — the repo is framework-free everywhere else and the surface is small;
+instead the house pure-core / thin-shell split carries the weight: every
+*decision* lives in browser-free, unit-tested `popupLogic.ts` /
+`optionsLogic.ts`, and each `main.ts` only reads state, renders it, and
+forwards events.
+
+**Flagged contract changes (handoff rule 4 — `shared/messages.ts` + manifest,
+NO `shared/types.ts` change):** (1) `testApiKey`'s request gained
+`customEndpoint?` (a custom provider has no fixed URL to ping) and its
+`provider` field is now spelled `ProviderId` directly. (2) New `resetCostStats`
+message — WHY not a direct `resetCostStats()` import in options: cost WRITES
+serialize through costTracker's per-context promise chain, and a second
+writing context would reintroduce the Phase 4.1 lost-update race; reads stay
+direct. (3) New `translateAll` message (popup → content tab) with a `dryRun`
+mode so the popup can count before committing (Risks table: confirm >30
+pages). (4) `manifest.permissions` gained **`activeTab`** — the popup's
+per-site toggle and translate-all need the active tab's URL/hostname, which is
+hidden without it; activeTab is granted by opening the popup and carries no
+install-time warning (unlike `tabs`). **Shared-module moves (re-exported, no
+caller churn):** `DEFAULT_MODELS` → `shared/constants.ts` (UI placeholders
+need it; importing ProviderBase would drag the whole prompt layer into the
+popup bundle), the curated language map → new `shared/languages.ts`
+(prompt.ts re-exports `languageName`; new `languageOptions(current?)` appends
+an uncurated stored value so the dropdown never lies), plus new
+`shared/format.ts` (`formatUsd`/`formatBytes`/`formatTokens`) and
+`PROVIDER_LABELS` in constants. `shared/settings.ts` gained `peekSettings()` —
+the read-that-never-writes (raw get + pure migrate) the popup/options/content
+all use so only the background ever persists settings (content/index.ts's
+private copy was replaced with it).
+
+**Key test (§7.6, `providers/keyTest.ts`):** cheaper than the architecture's
+"1-token ping" — a token-free *authenticated GET* per provider (gemini/openai/
+custom: `/models`; anthropic: `/v1/models` with the `anthropic-dangerous-
+direct-browser-access` header; openrouter: `/key`, because its `/models` list
+is public and would bless any garbage key). Pure `buildKeyTestRequest` +
+`classifyKeyTestResponse` (Gemini reports a bad key as **400** `API_KEY_INVALID`,
+not 401 — mapped to `auth`; 429/529 report "key authenticated but throttled/
+out of quota" rather than pretending the key is bad; 5xx → `network`), thin
+`runKeyTest` that NEVER rejects (a rejection would be serialized to a bare
+string at the message boundary — same reasoning as `TranslatePageResult`) and
+aborts via `AbortSignal.timeout` (15 s). Wired into the background router with
+the one-line `resetCostStats` handler; `cache.ts` gained a read-only
+`getCacheStats()` (entry count + the running `totalBytes`).
+
+**Translate-all (F8):** `viewportQueue.requestAll(dryRun)` fills in every
+registered-but-unrequested candidate at the new `TRANSLATE_ALL_PRIORITY` (2 —
+already-visible pages keep their better tier; `sendTranslate` flips
+`requested` synchronously, so double-clicks can't double-send), and
+content/index.ts registers a `translateAll` router at bootstrap. WHY that
+doesn't break inert-by-default: a passive `onMessage` listener touches nothing
+on the host page and sends nothing (unlike the removed Phase 0 liveness ping);
+while inert there's no queue and the popup just gets `{count: 0}`. It is NOT
+the forbidden content-side `settingsChanged` listener — settings still arrive
+exclusively via `storage.onChanged`.
+
+**Popup:** global toggle (via `toggleEnabled`), per-site tri-state
+(default/on/off; "default" null-deletes the override), target language,
+provider + model quick-pick (model placeholder = the provider default; empty
+input null-deletes so the default reapplies), translate-all with an **inline**
+two-click confirm above 30 pages (WHY not `window.confirm`: modals from a
+browser-action popup are unreliable in Firefox — focus loss closes the popup),
+a cost line, and two setup banners: missing API key (→ options) and the §7.3
+**in-flow `<all_urls>` grant** — `permissions.request` must run in a
+user-gesture handler in an extension page, so the popup is where the
+architecture's "requested on first use" actually lives. Reads never wake the
+event page (`peekSettings` + direct `getCostStats`); all writes go through
+`setSettings`/`toggleEnabled` messages; `storage.onChanged` live-refreshes
+both settings and the cost line while open.
+
+**Options:** per-provider rows generated from `PROVIDER_IDS` — masked key
+inputs that **rest empty with the mask as placeholder** (WHY: the stored key is
+never round-tripped into the DOM in full, so it can't be shoulder-surfed or
+leak via autofill/session-restore; Clear does the null-delete), per-row Test
+buttons (a typed-but-unsaved key wins over the stored one, so users can test
+before saving), per-provider model inputs, and the custom row carrying its
+endpoint field; translation prefs (honorifics **select** keep/localize mapped
+onto the stored boolean, reading direction, SFX toggle, source pin,
+temperature); font controls with a live preview that mimics BubbleBox's
+separate fill layer (opacity never fades the text); per-site rules table with
+per-row **Clear cache** (direct `clearCacheForSite` — extension pages share
+the background's origin so it's the same IndexedDB, and cache ops are
+transactional) and Remove; numeric fields bound generically via `data-num`
+attributes to a `NUMERIC_FIELDS` bounds table (WHY explicit clamps: a typo'd
+`jpegQuality: 70` or `concurrency: 600` must not wreck uploads/perf;
+`numericFieldPatch` is an exhaustive switch because four fields live under
+`font` and a computed key wouldn't typecheck), with the min ≤ max auto-fit
+guard (`sanitizeFontBounds` — the edited bound drags the other); the F17 usage
+table + reset (via the message); cache panel + clear-all; and a permissions
+panel with grant/revoke. Garbage numeric input reverts to the stored value;
+re-renders skip the focused control so `storage.onChanged` can't clobber
+mid-typing.
+
+**Design choices flagged:** (1) UI pages read storage/IndexedDB directly
+(never write) — reads don't wake the event page and don't race the write
+chains; every write crosses the message bus. (2) PROMPTS §5.2's "persist the
+endpoint downgrade mode in settings" is **re-deferred to Phase 8**: the
+in-memory memo already saves all but one 400 per event-page lifetime, and
+persistence would couple the provider layer to storage (or need a
+learn-callback seam) for marginal value — noted in openai.ts. (3) `activeTab`
+over `tabs` (no permission warning). (4) The `pagesPerRequest` field ships
+with a "takes effect when batching ships (Phase 8)" hint rather than being
+hidden. **Deferred:** drag-select, peek-original, error toasts, UI i18n
+(Phase 7); batching, prefetch tuning, endpoint-mode persistence (Phase 8).
+
+**Manual verification (needs a real browser):** load the build, open the
+popup on `tests/fixtures/testpage.html` — flip the toggle, set a site rule,
+watch the status line; grant image access from the banner; paste a key in
+options and Test it (wrong key → auth message; right key → "✓ Key works");
+translate-all queues the fixture pages and the popup cost line moves;
+usage/cache panels fill in and their reset/clear buttons zero them; resize
+the options window with a rule list present — nothing clobbers a focused
+input.
+
+*(The always-visible setup banners this list would have caught were found in
+the Phase 6.1 review below — the popup banner logic was correct but the CSS
+made `hidden` inert.)*
+
+Tests: 54 new (keyTest 17: per-provider request shape, custom endpoint
+normalization/missing, classifier incl. the Gemini 400 quirk + 429 wording +
+snippet, shell happy/empty-key/bad-endpoint/network/body-read, handler wiring;
+popupLogic 9: site tri-state round-trip incl. null-delete, hostnameFromUrl
+web/non-web, statusLine, needsApiKey active-provider-only, cost summary,
+confirm threshold; optionsLogic 17: numeric parse/clamp/round/garbage,
+value↔patch round-trip for every field, font-bounds guard, key mask/patches,
+hostname normalization, site rules, honorifics mapping, costRows; format 9:
+usd/bytes/tokens incl. healing + languageOptions curated/appended;
+viewportQueue +2: requestAll dry-run counts without sending, real run sends
+the remainder at priority 2 and is idempotent), **354 total green**; typecheck
++ eslint + build + `web-ext lint` (0 errors / 0 warnings; the lone
+`data_collection_permissions` notice stays Phase-8-deferred) all clean. Popup
+bundle ~5 kB + shared chunks; options ~13 kB; background grew ~1 kB (keyTest).
+
+## Phase 6.1 summary (review fixes)
+
+A user-reported review of the Phase 6 UI caught one rendering bug with two
+victims, plus one UX addition; the pure logic layer needed no changes. **The
+bug — `hidden` was inert wherever author CSS set `display`:** the HTML `hidden`
+attribute is implemented by the UA stylesheet as `display: none`, and ANY
+author `display` rule on the same element overrides a UA rule regardless of
+specificity. (1) The popup's `.banner { display: flex }` made BOTH setup
+banners permanently visible — "No API key for this provider." showed even with
+a valid, tested key stored for the active provider (the reported symptom), and
+"Image access not granted." showed even after the grant — `els.bannerKey.hidden
+= !needsApiKey(settings)` was computing the right value into a dead property.
+(2) The options page's `.field { display: grid }` did the same to the
+fixed-size / auto-fit font rows: both were always visible instead of swapping
+with the size-mode select. Fix: a `[hidden] { display: none !important; }`
+reset in both pages' stylesheets (WHY-noted in each), which is the standard
+defense and future-proofs any later `display`-styled element. The other
+`hidden` consumers (grant/revoke/clear buttons, the empty-state `.hint`
+paragraphs) carried no author `display` rule and were already working —
+verified by grep, not assumption. **UX addition (user request):** both popup
+banners now carry a ✕ dismiss button; dismissal is popup-instance-scoped (a
+module-level `dismissed` flag checked by `render`/`renderPermissionBanner`,
+never persisted — the banners are state-driven and should return on the next
+open while their condition holds). **Verified clean in the same pass:** the
+options key save path (change-commit → `apiKeyPatch` → single-write-path
+`setSettings`; Clear's null-delete), the typed-but-unsaved-key-wins test flow,
+`keyTest` request shapes + classifier, `needsApiKey`/`deriveProviderSettings`,
+the `translateAll` popup↔content round trip and `requestAll` idempotence, and
+the fresh `loadSettings()` per translate request (no stale-settings path to
+the ProviderBase "No API key configured" throw). Tests: none new — the fix is
+CSS plus two lines in the untested thin shell, with nothing decidable to
+extract; **354 total green**; typecheck + eslint + build + `web-ext lint`
+(0 errors / 0 warnings; the lone `data_collection_permissions` notice stays
+Phase-8-deferred) all clean. **Manual re-verify (needs a real browser):** with
+a valid key stored, the popup shows no key banner; remove the key → banner
+returns and ✕ dismisses it for that popup instance; in options, switching Font
+sizing between auto/fixed swaps the two rows.

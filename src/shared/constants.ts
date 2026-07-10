@@ -1,10 +1,32 @@
 /**
  * Global constants shared across background, content, popup, and options.
- * Keep this file dependency-free (imported everywhere, including tests).
+ * Keep this file dependency-free (imported everywhere, including tests) —
+ * type-only imports from ./types are fine, they're erased at compile time.
  */
+import type { ProviderId } from "./types";
 
 /** Extension display name, used in logs and UI. */
 export const EXTENSION_NAME = "MangaLens";
+
+/**
+ * The model each provider runs when the user hasn't picked one
+ * (`settings.model` empty). SINGLE SOURCE OF TRUTH: every adapter's
+ * `defaultModel`, the cache-key model resolver (`resolveEffectiveModel`), and
+ * the popup/options model-input placeholders all read from here, so the stored
+ * `PageTranslation.model`, the value actually sent to the provider, the cache
+ * key, and what the UI shows can never disagree (Phase 4.1 item 3 / Phase 6).
+ * `custom` has no default — an OpenAI-compatible endpoint may name its model
+ * however it likes. Moved here from providers/ProviderBase.ts in Phase 6
+ * (ProviderBase re-exports it) because the UI pages need it and importing the
+ * provider engine into the popup bundle would drag the whole prompt layer in.
+ */
+export const DEFAULT_MODELS: Record<ProviderId, string> = {
+  gemini: "gemini-2.0-flash",
+  anthropic: "claude-haiku-4-5",
+  openai: "gpt-4o-mini",
+  openrouter: "google/gemini-2.0-flash-001",
+  custom: "",
+};
 
 /**
  * Bumped whenever prompt text in providers/prompt.ts changes in a way that
@@ -27,6 +49,15 @@ export const PROMPT_VERSION = 1;
  * write. Old `mangalens-cache-v1` databases are swept on first open (item 8).
  */
 export const CACHE_VERSION = 2;
+
+/** Human-readable provider names for the popup/options dropdowns (Phase 6). */
+export const PROVIDER_LABELS: Record<ProviderId, string> = {
+  gemini: "Google Gemini",
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  openrouter: "OpenRouter",
+  custom: "Custom endpoint",
+};
 
 /** Keyboard command id from manifest.json — keep in sync with src/manifest.ts. */
 export const CMD_TOGGLE = "toggle-mangalens";

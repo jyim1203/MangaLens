@@ -117,12 +117,26 @@ export interface ViewportQueueOptions {
   requestTimeoutMs?: number;
 }
 
+/** Priority for "translate all" enqueues — the prefetch/all tier (§7.5). */
+export const TRANSLATE_ALL_PRIORITY = 2;
+
 /** A live viewport queue. */
 export interface ViewportQueue {
   /** Register a candidate for visibility tracking (from the scanner). */
   register(candidate: Candidate): void;
   /** Unregister a candidate: unobserve, cancel any in-flight request, clear overlay. */
   unregister(candidate: Candidate): void;
+  /**
+   * Request translation of every registered, not-yet-requested candidate at
+   * {@link TRANSLATE_ALL_PRIORITY} (F8 "translate all" from the popup).
+   * Visible pages that were already requested keep their better priority —
+   * this only fills in the rest.
+   *
+   * @param dryRun count what would be sent without sending (the popup's
+   *   confirm-first flow for large chapters).
+   * @returns how many candidates were (or would be) requested.
+   */
+  requestAll(dryRun?: boolean): number;
   /** Tear everything down: cancel all in-flight requests and disconnect observers. */
   stop(): void;
 }
@@ -315,6 +329,17 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
       safe(() => nearObserver.unobserve(candidate.el));
       cancel(rec); // stop paying the provider for work nobody will see (item 4)
       safe(() => overlay.clear(candidate));
+    },
+
+    requestAll(dryRun = false): number {
+      // WHY filter on `requested` and not in-flight state: sendTranslate flips
+      // `requested` synchronously before its first await, so double-clicking
+      // "translate all" (or clicking during a visibility burst) can't double-send.
+      const pending = order.filter((c) => !tracked.get(c.el)?.requested);
+      if (!dryRun) {
+        for (const c of pending) void sendTranslate(c, TRANSLATE_ALL_PRIORITY);
+      }
+      return pending.length;
     },
 
     stop(): void {

@@ -17,6 +17,11 @@
  * key so stale translations are never served after a wording change.
  */
 import type { ProviderSettings } from "../../shared/types";
+import { languageName } from "../../shared/languages";
+
+// Re-export so existing importers (tests, adapters) keep working after the
+// Phase 6 move of the name map into shared/ (the UI dropdowns need it too).
+export { languageName };
 
 // --- Canonical JSON schema (PROMPTS.md §2) ---------------------------------
 
@@ -199,66 +204,6 @@ const READING_ORDER_RULE: Record<"rtl" | "ltr" | "auto", string> = {
   ltr: "left-to-right, top-to-bottom.",
   auto: "infer from the artwork's panel layout; Japanese manga is right-to-left, webtoons and western comics are left-to-right, top-to-bottom.",
 };
-
-// --- Language names ---------------------------------------------------------
-
-/**
- * Curated code → English name map for the languages users actually target/read.
- * Region-tagged keys (`zh-tw`) get their tag appended for disambiguation
- * (PROMPTS.md §7: `zh-TW` → "Traditional Chinese (zh-TW)"). Anything not here
- * falls back to `Intl.DisplayNames`, then to the raw code.
- */
-const LANGUAGE_NAMES: Record<string, string> = {
-  en: "English",
-  ja: "Japanese",
-  ko: "Korean",
-  zh: "Chinese",
-  "zh-tw": "Traditional Chinese",
-  "zh-cn": "Simplified Chinese",
-  es: "Spanish",
-  fr: "French",
-  de: "German",
-  it: "Italian",
-  pt: "Portuguese",
-  "pt-br": "Brazilian Portuguese",
-  ru: "Russian",
-  vi: "Vietnamese",
-  th: "Thai",
-  id: "Indonesian",
-  ar: "Arabic",
-  hi: "Hindi",
-  tr: "Turkish",
-  pl: "Polish",
-  nl: "Dutch",
-};
-
-/**
- * Human-readable language name for a code, for the prompt. The name drives
- * translation quality; region tags (`zh-TW`) are preserved in parentheses so
- * the model disambiguates variants.
- *
- * @param code an ISO 639-1 code, optionally region-tagged (e.g. "en", "zh-TW").
- * @returns e.g. "English", "Traditional Chinese (zh-TW)".
- */
-export function languageName(code: string): string {
-  const key = code.toLowerCase();
-  const exact = LANGUAGE_NAMES[key];
-  if (exact) return key.includes("-") ? `${exact} (${code})` : exact;
-
-  // Only reachable for region-tagged keys the exact lookup missed (a bare key
-  // would have hit above), so the tag is always appended for disambiguation.
-  const primary = key.split("-")[0] ?? key;
-  const primaryName = LANGUAGE_NAMES[primary];
-  if (primaryName) return `${primaryName} (${code})`;
-
-  try {
-    const name = new Intl.DisplayNames(["en"], { type: "language" }).of(code);
-    if (name && name.toLowerCase() !== key) return name;
-  } catch {
-    // Intl.DisplayNames unavailable in some contexts — fall through.
-  }
-  return code;
-}
 
 // --- Slot filling -----------------------------------------------------------
 

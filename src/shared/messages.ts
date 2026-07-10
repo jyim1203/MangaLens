@@ -17,7 +17,11 @@
 import browser from "webextension-polyfill";
 import { createLogger } from "./log";
 import type { Settings, SettingsPatch } from "./settings";
-import type { PageTranslation, ProviderErrorKind } from "./types";
+import type {
+  PageTranslation,
+  ProviderErrorKind,
+  ProviderId,
+} from "./types";
 
 const log = createLogger("messages");
 
@@ -96,10 +100,32 @@ export interface MessageMap {
    */
   cancelTranslation: { request: { requestId: string }; response: void };
 
-  /** Validate an API key with a cheap ping (options "test key" button, §7.6). */
+  /** Validate an API key with a cheap ping (options "test key" button, §7.6).
+   *  `customEndpoint` is required in practice when `provider: "custom"` (Phase 6
+   *  contract addition — the custom endpoint has no fixed URL to ping). */
   testApiKey: {
-    request: { provider: PageTranslation["provider"]; apiKey: string };
+    request: { provider: ProviderId; apiKey: string; customEndpoint?: string };
     response: TestKeyResult;
+  };
+
+  /**
+   * Reset the F17 usage/cost totals (options page). WHY a message and not a
+   * direct `resetCostStats()` import in the options page: cost WRITES are
+   * serialized through a per-context promise chain in costTracker.ts — a write
+   * from a second context (the options page) would race the background's chain
+   * and reintroduce the Phase 4.1 lost-update bug. Reads stay direct.
+   */
+  resetCostStats: { request: void; response: void };
+
+  /**
+   * Popup → content: queue every detected image for translation (F8
+   * "translate all"). `dryRun: true` only counts what would be queued, so the
+   * popup can confirm-first when the count is large (Risks: confirm dialog on
+   * "translate all" > 30 pages) without paying for anything.
+   */
+  translateAll: {
+    request: { dryRun?: boolean };
+    response: { count: number };
   };
 }
 

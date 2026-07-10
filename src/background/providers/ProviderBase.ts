@@ -35,22 +35,10 @@ import {
 
 const log = createLogger("provider");
 
-/**
- * The model each provider runs when the user hasn't picked one
- * (`settings.model` empty). SINGLE SOURCE OF TRUTH: every adapter's
- * `defaultModel` and the cache-key model resolver
- * ({@link import("./factory").resolveEffectiveModel}) both read from here, so
- * the stored `PageTranslation.model`, the value actually sent to the provider,
- * and the cache key can never disagree (Phase 4.1 item 3). `custom` has no
- * default — an OpenAI-compatible endpoint may name its model however it likes.
- */
-export const DEFAULT_MODELS: Record<ProviderId, string> = {
-  gemini: "gemini-2.0-flash",
-  anthropic: "claude-haiku-4-5",
-  openai: "gpt-4o-mini",
-  openrouter: "google/gemini-2.0-flash-001",
-  custom: "",
-};
+// Re-exported from shared/constants.ts (moved there in Phase 6 so the
+// popup/options model placeholders can read it without importing this whole
+// provider engine); adapters and the factory keep importing it from here.
+export { DEFAULT_MODELS } from "../../shared/constants";
 
 // --- Error taxonomy (PROMPTS.md §6) ----------------------------------------
 

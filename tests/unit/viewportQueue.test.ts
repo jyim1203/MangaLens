@@ -8,6 +8,7 @@ vi.mock("webextension-polyfill", () => ({ default: fakeBrowser }));
 vi.mock("../../src/shared/messages", () => ({ sendToBackground: vi.fn() }));
 
 import {
+  TRANSLATE_ALL_PRIORITY,
   createViewportQueue,
   planEnqueues,
   type OverlaySink,
@@ -120,6 +121,76 @@ const CAND: Candidate = {
 
 const tick = (ms = 0): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
+
+describe("viewportQueue — requestAll (F8 translate-all)", () => {
+  beforeEach(() => {
+    FakeIO.instances = [];
+    mockSend.mockReset();
+    // insertInDocOrder touches Node.DOCUMENT_POSITION_FOLLOWING once a second
+    // candidate registers; the node test env has no Node global.
+    vi.stubGlobal("Node", { DOCUMENT_POSITION_FOLLOWING: 4 });
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** A fake element whose compareDocumentPosition keeps registration order. */
+  const fakeEl = (): Element =>
+    ({ compareDocumentPosition: () => 2 }) as unknown as Element;
+
+  const candA: Candidate = { id: "a", el: fakeEl(), url: "https://x/a.jpg" };
+  const candB: Candidate = { id: "b", el: fakeEl(), url: "https://x/b.jpg" };
+
+  function makeQueue(overlay: OverlaySink) {
+    return createViewportQueue({
+      overlay,
+      prefetchAhead: 0,
+      makeRequestId: () => "rq",
+      createObserver: (cb, options) =>
+        new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+  }
+
+  it("dry run counts unrequested candidates without sending anything", () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const queue = makeQueue(fakeOverlay());
+    queue.register(candA);
+    queue.register(candB);
+
+    // A becomes visible → requested; B untouched.
+    FakeIO.instances[0]!.fire(candA.el, true);
+    expect(mockSend).toHaveBeenCalledTimes(1);
+
+    expect(queue.requestAll(true)).toBe(1);
+    expect(mockSend).toHaveBeenCalledTimes(1); // dry run sent nothing
+
+    queue.stop();
+  });
+
+  it("real run sends the remaining candidates at the prefetch/all priority", () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay);
+    queue.register(candA);
+    queue.register(candB);
+    FakeIO.instances[0]!.fire(candA.el, true); // A requested at priority 0
+
+    expect(queue.requestAll()).toBe(1);
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    const [, payload] = mockSend.mock.calls[1]!;
+    expect(payload).toMatchObject({
+      imageUrl: candB.url,
+      priority: TRANSLATE_ALL_PRIORITY,
+    });
+    expect(overlay.setPending).toHaveBeenCalledTimes(2);
+
+    // Everything is requested now — a second run is an idempotent no-op.
+    expect(queue.requestAll()).toBe(0);
+    expect(mockSend).toHaveBeenCalledTimes(2);
+
+    queue.stop();
+  });
+});
 
 describe("viewportQueue — retry path re-observes a static image (item 6)", () => {
   beforeEach(() => {
