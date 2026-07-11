@@ -37,8 +37,23 @@ export interface TestKeyResult {
 
 /** Content-script request to translate one on-page image (§7.3). */
 export interface TranslatePageRequest {
-  /** Absolute image URL the background will fetch with host permissions. */
+  /**
+   * Absolute image URL. The background fetches it with host permissions UNLESS
+   * {@link imageBytes} is present — for a blob-sourced page the URL is then
+   * identity/diagnostics only (a document-scoped `blob:` URL can't be fetched
+   * cross-context, §7.3), and the content script ships the bytes instead.
+   */
   imageUrl: string;
+  /**
+   * Raw image bytes for `blob:` sources the background cannot fetch (Phase 7.2 —
+   * MangaDex and other 100%-blob readers). Mirrors
+   * {@link TranslateRegionRequest.imageBytes}. WHY safe: Firefox
+   * `runtime.sendMessage` structured-clones an ArrayBuffer intact; a future
+   * Chrome port (JSON message passing) would need base64.
+   */
+  imageBytes?: ArrayBuffer;
+  /** MIME of {@link imageBytes}; sent with it (defaults to image/jpeg background-side). */
+  imageMime?: string;
   /** Overrides the settings target language when set (e.g. drag-select). */
   targetLang?: string;
   /** 0 = visible, 1 = near viewport, 2 = prefetch/all (§7.5). */

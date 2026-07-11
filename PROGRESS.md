@@ -1101,3 +1101,144 @@ harness was added for items 1–4 (house style: those surfaces stay untested beh
 WHY comments; a jsdom PointerEvent harness for item 1 would be contrived) — the
 suite staying green plus the WHY notes is the house-style bar there. Content bundle
 unchanged at ~28 kB (the factory extraction is size-neutral).
+
+## Phase 7.2 summary (live-site fixes: blob pages, rate-limit cooldown, auto-translate opt-in)
+
+The first live-browser verification (2026-07-10, Firefox release build, real
+Gemini key, mangadex.org) produced three findings; this point-phase fixes all
+three. **Two flagged contract changes** (handoff rule 3, both anticipated by the
+handoff): `shared/messages.ts` `TranslatePageRequest` gained
+`imageBytes?: ArrayBuffer` / `imageMime?: string` (mirroring
+`TranslateRegionRequest` verbatim), and `shared/settings.ts` gained the pure
+`getAutoTranslate`. **NO `shared/types.ts` change; `PROMPT_VERSION` and the
+`buildCacheKey` composition untouched** (pinned by the existing tests, which stay
+green). Every module keeps the pure-core / thin-shell split.
+
+**Item 1 — blob-sourced pages auto-translate (the MangaDex blocker; REVERSES the
+Phase 5 scanner decision).** MangaDex (and other large readers) download page
+images over XHR and assign them `blob:` object URLs; Phase 5's `classifyImageUrl`
+deliberately skipped `blob:` because the background can't fetch a document-scoped
+blob URL (§7.3), so the scanner detected **zero** pages there. The Phase 7
+drag-select path already solved the hard part (content-side bytes over
+structured-clone messaging); this extends it to the auto pipeline. (a)
+`classifyImageUrl` is now three-way — `accept` (http/https/data, background
+fetches by URL) / `accept-bytes` (blob, content ships bytes) / `skip` — and the
+scanner registers both accept kinds; `Candidate` is unchanged (its `url` still
+carries the blob URL as identity/log label). (b) New `content/imageSource.ts` —
+`sourceKindForUrl` / `acquisitionPlan` (pure) and `acquireBlobBytes` /
+`acquireCanvasBytes` (thin `fetch`/`toBlob` shells) were **moved** out of
+`regionSelect.ts` (drag-select stays byte-identical, now a thin dispatcher over
+the shared primitives), so both the auto pipeline and drag-select share one
+acquisition module. (c) `viewportQueue.sendTranslate` acquires the bytes
+content-side lazily *at dispatch* when the URL is `accept-bytes` and adds them to
+the payload — **never at registration**: a chapter can register 200 candidates,
+and holding 200 × ~1–3 MB ArrayBuffers would be a content-side memory bomb, so
+only jobs actually sent pay. Acquisition failure (revoked object URL) →
+`overlay.setError("network")` and **`requested` is NOT reset** — a revoked blob
+never heals by retry; the reader swapping the `<img>` src produces a fresh
+candidate via the scanner reconcile, and that is the retry path (the `requestId`
+is stamped only right before the send, so a teardown mid-acquisition fires no
+phantom cancel). (d) `translatePage` builds a `Blob` from the shipped bytes
+(mime defaulting like regionHandlers) and passes it into `translateImage`, which
+uses it in place of the `fetchImageBytes` result; when bytes are present the URL
+is **never fetched**. **WHY the cache/coalesce layers needed no change:** page
+identity is the CONTENT HASH, not the URL — `sha256Hex(blob)` → composite cache
+key → coalesce/SharedAbort all key on that hash, so two tabs showing the same
+page under different ephemeral blob URLs coalesce onto one provider run, and a
+revisit next session cache-hits even though every blob URL is new (pinned by a
+test: two concurrent identical-byte requests under different blob URLs → ONE
+provider call).
+
+**Item 2 — global rate-limit cooldown (the 429-storm brake; TWO-LAYER design,
+both layers intentional).** `ProviderBase`'s per-job ladder (2s/8s/30s,
+`retry-after`-aware) is correct in isolation but every queued job burned it
+independently — at concurrency 6 the export logged 40+ consecutive 429s with no
+cross-job brake. New `background/rateGate.ts` adds ONE shared cooldown ABOVE the
+per-job ladder (the ladder is untouched — it still handles transient per-request
+limits and honours `retry-after` on retries; the gate stops NEW cross-job
+requests when the key is *globally* exhausted). Pure core: `reportRateLimit` →
+cooldown `min(60s, max(retryAfter ?? 0, 8s·2^strikes))` (8→16→32→60s cap;
+exponent clamped so a long strike run can't wrap the 32-bit shift negative),
+`clearRateLimit`, `waitMsFor`. Thin wrapper `createRateGate(sleep?, now?)` with
+an abortable `waitUntilClear` that re-checks after each sleep (a report landing
+mid-wait extends it). Wired at the single choke point per HTTP request via the
+tested `callWithRateGate(gate, signal, call)` helper — the per-tile fan-out in
+`translateHandlers` AND the region path in `regionHandlers` (a drag-select during
+a storm queues behind the cooldown, not hammers). On a `rate-limit`
+ProviderError → `report(retryAfterMs)`; on success → `clear()`. **WHY the waits
+live inside the queue slots:** sleeping occupies a concurrency lane, so during a
+cooldown at most `concurrency` jobs idle and ZERO new HTTP fires — the queue
+self-paces to the provider's rate. No new UI: the existing once-per-activation
+rate-limit toast is still the surface (the gate rethrows the error so content
+still badges/toasts).
+
+**Item 3 — auto-translate becomes per-site opt-in — FLAGGED F1/F15 SEMANTICS
+CHANGE.** The global toggle auto-translated junk on every enabled site — the
+export showed real Gemini calls billed to the user's key for YouTube thumbnails
+(`i.ytimg.com/vi/…`) and the MangaDex mascot (`mangadex.org/img/miku.jpg`), a
+cost AND privacy bug. **New semantics:** visibility-driven auto-translate runs
+ONLY on sites the user explicitly opted in (`perSiteOverrides[hostname] === true`
+— the popup's per-site "Auto-translate on"). The global toggle alone still
+ACTIVATES the content script everywhere (overlays, drag-select, and the popup
+"Translate all" button all work), **but nothing is sent to a provider without a
+user action**. This **deviates from the shipped F1/F15 "global enable = full
+pipeline everywhere"** — existing behaviour for a user who already site-enabled a
+reader (override `true`) is unchanged (still active AND auto). Implementation:
+pure `getAutoTranslate(settings, hostname)`; the gate emits `re-request` when
+`getAutoTranslate` flips while active in EITHER direction (effective-enabled
+doesn't change on a global-on override add/remove, so without this it would
+misclassify as a lesser action); `createViewportQueue` gained a required
+`autoEnqueue: boolean` — when false, candidates are still registered,
+doc-ordered, and overlay-managed (Translate all + drag-select need the registry)
+but the IntersectionObservers **never observe** them (no tier events, no auto
+sends) and `reobserve()` no-ops (accepted consequence: a timed-out translate-all
+page won't visibility-retry on a non-auto site — the user re-clicks Translate
+all). `content/index.ts` passes `getAutoTranslate(settings, hostname)`. Popup
+copy communicates the split: the site-rule "On" option is now "Auto-translate
+on", and `statusLine` distinguishes "Auto-translating …" (opted in) from "On
+here — use Translate all or Select region (auto-translate is off for this site)"
+(global-on, not opted in — the finding-2 regression messaging).
+
+**Decided-against (recorded per the handoff):** **canvas auto-translate** —
+drag-select already covers `<canvas>` readers, and auto-canvas has
+taint/redraw-churn problems; not built. Screenshot-capture fallback
+(`tabs.captureVisibleTab`) stays P2. `concurrency` default stays 6 (§11 — the
+gate self-paces under limits). Everything in PHASE-8-HANDOFF.md (batching,
+re-prioritization, e2e, AMO prep, the `data_collection_permissions` notice) stays
+Phase 8.
+
+**Manual verification — STATUS: NOT executed in this implementation session (no
+live Firefox + real Gemini key + network access to MangaDex/YouTube from the
+coding environment). Recorded honestly rather than faked.** This is the one
+outstanding DoD item and it is a human/live step by nature (as every prior
+phase's manual pass was). The handoff's 6 steps are ready to run against the
+built `dist/`: (1) load as temporary add-on, grant image access, set a real key;
+(2) a MangaDex chapter with the site opted in → pages overlay as you scroll and
+the Translate-all dry-run counts > 0 (was "No manga images detected"); (3)
+drag-select a bubble on a blob page → skeleton then overlay, a `translateRegion`
+round-trip in the background console; (4) **YouTube with global on but NO site
+override → ZERO provider requests** (finding-2 regression test); (5)
+`tests/fixtures/testpage.html` with the host opted in → pre-7.2 pipeline
+unregressed; (6) on a real 429, requests visibly pace out (gate logs), one toast,
+no 40-request storm. Free-tier note: set `concurrency` 2–3 (or use a
+billing-enabled key), and don't misread daily-quota exhaustion (instant 429s) as
+a code bug.
+
+Tests: **31 net new** (imageSource 5: scheme classification + acquisition-plan
+matrix + blob-shell happy/mime-default/throw — moved from regionSelect, not
+duplicated; rateGate 10: ladder escalation/retry-after/60s-cap/no-shift-wrap/
+success-reset/waitMsFor + wrapper immediate/wait-and-release/report-extends/
+typed-abort; translateBytes 3: bytes path skips fetch + builds the mime'd Blob,
+http path still fetches, identical-bytes-different-URL coalesce onto one run;
+scanner +1: registers a blob-URL `accept-bytes` candidate, existing blob test
+updated to `accept-bytes`; viewportQueue +6: blob dispatch ships bytes / http
+dispatch ships none / acquisition-failure setError-no-send-not-wedged +
+autoEnqueue=false never-observes / requestAll-still-sends / reobserve-no-op; gate
++2: getAutoTranslate flip → re-request both directions; settings +3:
+getAutoTranslate matrix incl. the global-on-not-auto guard and override-true
+active-AND-auto; popupLogic +1: statusLine auto-vs-active-not-auto;
+translateHandlers +3: callWithRateGate waits-then-clears / reports-rate-limit /
+ignores-non-rate-limit), **451 total green**; the existing 420 stay green
+untouched; typecheck + eslint + `vite build` clean; `web-ext lint` 0 errors /
+0 warnings (the lone `data_collection_permissions` notice stays Phase-8-deferred).
+Content bundle unchanged at ~28 kB; background grew ~1 kB (rateGate).

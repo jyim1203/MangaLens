@@ -7,6 +7,7 @@ import { fakeBrowser } from "@webext-core/fake-browser";
 vi.mock("webextension-polyfill", () => ({ default: fakeBrowser }));
 
 import {
+  callWithRateGate,
   createTranslateHandlers,
   errorToTranslateResult,
   mergeTilePages,
@@ -18,6 +19,7 @@ import {
 } from "../../src/background/translateHandlers";
 import { ImageFetchError } from "../../src/background/imageFetcher";
 import { ProviderError } from "../../src/background/providers/ProviderBase";
+import type { RateGate } from "../../src/background/rateGate";
 import type { PageTranslation, TranslatedRegion } from "../../src/shared/types";
 import type browser from "webextension-polyfill";
 
@@ -203,6 +205,62 @@ describe("translateHandlers — cancellation wiring (item 4)", () => {
     expect(() =>
       handlers.cancelTranslation!({ requestId: "req-2" }, SENDER),
     ).not.toThrow();
+  });
+});
+
+describe("translateHandlers — callWithRateGate (global cooldown wiring, Phase 7.2 item 3)", () => {
+  /** A gate that records the order of wait/report/clear calls. */
+  function recordingGate() {
+    const events: string[] = [];
+    const gate: RateGate = {
+      waitUntilClear: vi.fn(async () => {
+        events.push("wait");
+      }),
+      report: vi.fn((ms?: number) => {
+        events.push(`report:${ms}`);
+      }),
+      clear: vi.fn(() => {
+        events.push("clear");
+      }),
+    };
+    return { gate, events };
+  }
+
+  it("waits out the cooldown before the call, then clears on success", async () => {
+    const { gate, events } = recordingGate();
+    const signal = new AbortController().signal;
+    const result = await callWithRateGate(gate, signal, async () => {
+      events.push("call");
+      return 42;
+    });
+    expect(result).toBe(42);
+    // The wait MUST precede the call, and success clears the cooldown.
+    expect(events).toEqual(["wait", "call", "clear"]);
+    expect(gate.report).not.toHaveBeenCalled();
+  });
+
+  it("reports a rate-limit error's retry-after to the gate and re-throws (no clear)", async () => {
+    const { gate, events } = recordingGate();
+    const err = new ProviderError("rate-limit", "429", { retryAfterMs: 5000 });
+    await expect(
+      callWithRateGate(gate, new AbortController().signal, async () => {
+        throw err;
+      }),
+    ).rejects.toBe(err);
+    expect(events).toEqual(["wait", "report:5000"]);
+    expect(gate.clear).not.toHaveBeenCalled();
+  });
+
+  it("does not report or clear for a non-rate-limit failure", async () => {
+    const { gate } = recordingGate();
+    const err = new ProviderError("auth", "401");
+    await expect(
+      callWithRateGate(gate, new AbortController().signal, async () => {
+        throw err;
+      }),
+    ).rejects.toBe(err);
+    expect(gate.report).not.toHaveBeenCalled();
+    expect(gate.clear).not.toHaveBeenCalled();
   });
 });
 

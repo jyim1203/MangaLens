@@ -75,8 +75,8 @@ describe("scanner — classifyImageUrl (URL policy)", () => {
     expect(classifyImageUrl("data:image/png;base64,AAAA")).toBe("accept");
   });
 
-  it("skips blob URLs (background can't fetch them cross-context, §7.3)", () => {
-    expect(classifyImageUrl("blob:https://x/abc-123")).toBe("skip");
+  it("routes blob URLs to accept-bytes (content ships the bytes, Phase 7.2)", () => {
+    expect(classifyImageUrl("blob:https://x/abc-123")).toBe("accept-bytes");
   });
 
   it("skips other schemes and nullish values", () => {
@@ -180,6 +180,28 @@ describe("scanner — DOM walker (jsdom, injected metrics seam)", () => {
     present.splice(0, present.length); // both elements leave the DOM
     scanner.scan();
     expect(removed).toHaveLength(2); // the current page candidate is pruned
+
+    scanner.stop();
+  });
+
+  it("registers a blob-URL page (accept-bytes) as a candidate (Phase 7.2)", () => {
+    // MangaDex-style reader: page image assigned a blob: object URL. Previously
+    // classifyImageUrl skipped blob → zero candidates; now it registers.
+    const blobEl = document.createElement("img");
+    document.body.append(blobEl);
+
+    const added: Candidate[] = [];
+    const scanner = createScanner({
+      onAdded: (c) => added.push(c),
+      onRemoved: () => {},
+      collectElements: () => [blobEl],
+      readMetrics: () => metrics(),
+      resolveUrl: () => "blob:https://reader.example.com/9f8c-uuid",
+    });
+
+    scanner.scan();
+    expect(added).toHaveLength(1);
+    expect(added[0]!.url).toBe("blob:https://reader.example.com/9f8c-uuid");
 
     scanner.stop();
   });

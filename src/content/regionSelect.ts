@@ -5,9 +5,10 @@
  *
  * Split per the pure-core / thin-shell rule:
  *  - PURE, unit-tested: the rect math ({@link normalizeDragRect},
- *    {@link selectionToImageBbox}, {@link pickTargetImage}, {@link isClickNotDrag}),
- *    the source classification ({@link sourceKindForUrl}), and the byte-acquisition
- *    decision ({@link acquisitionPlan}). All browser-free.
+ *    {@link selectionToImageBbox}, {@link pickTargetImage}, {@link isClickNotDrag}).
+ *    Source classification + byte acquisition live in the shared
+ *    {@link import("./imageSource")} module (Phase 7.2 — the auto pipeline reuses
+ *    them for blob-sourced pages), not here. All browser-free.
  *  - THIN shell: {@link createRegionSelector} — the full-viewport marquee overlay
  *    (the FIRST deliberately-interactive surface we put on a host page, §7.2
  *    exception), pointer/keyboard listeners, byte acquisition (fetch/canvas), and
@@ -26,6 +27,13 @@ import { OVERLAY_HOST_ATTR } from "../shared/constants";
 import { t as defaultT } from "../shared/i18n";
 import type { BBox, ProviderErrorKind } from "../shared/types";
 import { MIN_RENDERED_PX, parseCssUrl, type Candidate } from "./scanner";
+import {
+  acquireBlobBytes,
+  acquireCanvasBytes,
+  acquisitionPlan,
+  sourceKindForUrl,
+  type SourceKind,
+} from "./imageSource";
 import type { OverlaySink } from "./viewportQueue";
 import { withTimeout } from "./withTimeout";
 
@@ -143,50 +151,6 @@ export function pickTargetImage(
     }
   }
   return best;
-}
-
-// --- Source classification + byte acquisition decision ----------------------
-
-/** How a drag-select target's bytes reach the background. */
-export type SourceKind = "img-http" | "img-data" | "img-blob" | "canvas" | "unsupported";
-
-/**
- * Classify an `<img>` source URL into a {@link SourceKind} (canvas is decided by
- * element type in the shell, not here). Pure.
- */
-export function sourceKindForUrl(url: string | null | undefined): SourceKind {
-  if (!url) return "unsupported";
-  if (url.startsWith("http://") || url.startsWith("https://")) return "img-http";
-  if (url.startsWith("data:")) return "img-data";
-  if (url.startsWith("blob:")) return "img-blob";
-  return "unsupported";
-}
-
-/** What the shell must do to get a target's bytes to the background. */
-export type AcquisitionPlan =
-  /** Send the URL; the background fetches (reuses the HTTP cache, §7.3). */
-  | { send: "url" }
-  /** Read the bytes content-side and ship them (the background can't fetch these). */
-  | { send: "bytes" }
-  /** Not translatable. */
-  | { send: "unsupported" };
-
-/**
- * Decide how to acquire a target's bytes from its {@link SourceKind} (Phase 7
- * item 2). `http(s)`/`data:` go by URL (background fetch); `blob:`/`<canvas>` are
- * read content-side because only the page's own origin can. Pure.
- */
-export function acquisitionPlan(kind: SourceKind): AcquisitionPlan {
-  switch (kind) {
-    case "img-http":
-    case "img-data":
-      return { send: "url" };
-    case "img-blob":
-    case "canvas":
-      return { send: "bytes" };
-    case "unsupported":
-      return { send: "unsupported" };
-  }
 }
 
 // --- Shell (untested) -------------------------------------------------------
@@ -556,38 +520,22 @@ function defaultCollectTargets(): RegionTarget[] {
   return targets;
 }
 
-/** Default byte acquisition: URL for http/data, read bytes for blob/canvas. */
+/**
+ * Default byte acquisition: URL for http/data, read bytes for blob/canvas — a
+ * thin dispatcher over the shared {@link import("./imageSource")} primitives
+ * (identical behavior to pre-7.2; the primitives just moved).
+ */
 async function defaultAcquireSource(target: RegionTarget): Promise<RegionSource> {
   const plan = acquisitionPlan(target.kind);
   if (plan.send === "url") {
     return { imageUrl: target.url as string };
   }
   if (plan.send === "bytes") {
-    if (target.kind === "canvas") {
-      const blob = await canvasToBlob(target.el as HTMLCanvasElement);
-      return { imageBytes: await blob.arrayBuffer(), imageMime: blob.type || "image/png" };
-    }
-    // img-blob: the content script's own origin CAN fetch a page blob: URL.
-    const response = await fetch(target.url as string);
-    const blob = await response.blob();
-    return { imageBytes: await blob.arrayBuffer(), imageMime: blob.type || "image/jpeg" };
+    return target.kind === "canvas"
+      ? acquireCanvasBytes(target.el as HTMLCanvasElement)
+      : acquireBlobBytes(target.url as string);
   }
   throw new Error("unsupported region source");
-}
-
-/** Promise-wrap `canvas.toBlob`; a cross-origin-tainted canvas throws SecurityError. */
-function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
-  return new Promise((resolve, reject) => {
-    try {
-      canvas.toBlob(
-        (blob) => (blob ? resolve(blob) : reject(new Error("canvas.toBlob returned null"))),
-        "image/png",
-      );
-    } catch (err) {
-      // Some engines throw synchronously for a tainted canvas.
-      reject(err instanceof Error ? err : new Error(String(err)));
-    }
-  });
 }
 
 /** Swallow + log any throw so a listener can never break the host page (rule 6). */

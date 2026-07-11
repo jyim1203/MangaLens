@@ -7,6 +7,7 @@ import type { CostStats } from "../background/costTracker";
 import { formatUsd } from "../shared/format";
 import {
   deriveProviderSettings,
+  getAutoTranslate,
   getEffectiveEnabled,
   type Settings,
   type SettingsPatch,
@@ -58,20 +59,30 @@ export function hostnameFromUrl(url: string | undefined): string | undefined {
   }
 }
 
-/** One-line status of what MangaLens is doing on the current page. */
+/**
+ * One-line status of what MangaLens is doing on the current page. Communicates
+ * the Phase 7.2 split: the content script can be ACTIVE (overlays, drag-select,
+ * Translate all) without AUTO-translating — auto-sending page images to the
+ * provider needs a per-site opt-in ({@link getAutoTranslate}).
+ */
 export function statusLine(
   settings: Settings,
   hostname: string | undefined,
 ): string {
   if (!hostname) return "Not available on this page.";
   const active = getEffectiveEnabled(settings, hostname);
-  const overridden = typeof settings.perSiteOverrides[hostname] === "boolean";
-  if (active) {
-    return overridden ? `Active on ${hostname} (site rule).` : "Active on this page.";
+  if (!active) {
+    const overridden = typeof settings.perSiteOverrides[hostname] === "boolean";
+    return overridden
+      ? `Off on ${hostname} (site rule).`
+      : "Off — flip the switch to translate.";
   }
-  return overridden
-    ? `Off on ${hostname} (site rule).`
-    : "Off — flip the switch to translate.";
+  if (getAutoTranslate(settings, hostname)) {
+    return `Auto-translating ${hostname} as you scroll.`;
+  }
+  // Active but not auto: global-on with no per-site opt-in. Manual actions work;
+  // nothing is auto-sent to the provider (the finding-2 privacy/cost guard).
+  return "On here — use Translate all or Select region (auto-translate is off for this site).";
 }
 
 /** True when the active provider has no stored API key (drives the setup banner). */

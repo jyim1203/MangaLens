@@ -54,6 +54,7 @@ import { dedupeRegions, prepareImage } from "./imagePrep";
 import { PriorityQueue } from "./queue";
 import { ProviderError } from "./providers/ProviderBase";
 import { createProvider, resolveEffectiveModel } from "./providers/factory";
+import { createRateGate, type RateGate } from "./rateGate";
 
 const log = createLogger("translate");
 
@@ -84,6 +85,59 @@ export function getTranslationQueue(concurrency: number): PriorityQueue {
 /** Reset the shared queue — test seam only; no production caller. */
 export function resetTranslationQueueForTest(): void {
   translationQueue = undefined;
+}
+
+/**
+ * The one process-wide rate-limit cooldown gate (Phase 7.2 item 3). Shared by
+ * page AND region translation so an exhausted key brakes the whole pipeline, not
+ * per-job. Lazily created (event-page lifetime; a cooldown is transient state we
+ * don't persist).
+ */
+let rateGate: RateGate | undefined;
+
+/** Get/create the shared rate gate. */
+export function getRateGate(): RateGate {
+  if (!rateGate) rateGate = createRateGate();
+  return rateGate;
+}
+
+/** Reset the shared rate gate — test seam only; no production caller. */
+export function resetRateGateForTest(): void {
+  rateGate = undefined;
+}
+
+/**
+ * Run one provider call gated by the global cooldown (Phase 7.2 item 3): wait out
+ * any active cooldown, make the call, then feed the outcome back to the gate — a
+ * `rate-limit` {@link ProviderError} reports (starting/extending the cooldown),
+ * any success clears it. The wait lives INSIDE the concurrency slot on purpose:
+ * sleeping occupies a lane, so during a cooldown at most `concurrency` jobs idle
+ * and ZERO new HTTP fires — the queue self-paces to the provider's rate.
+ *
+ * Extracted (rather than inlined at each call site) so the gate wiring is
+ * unit-testable without OffscreenCanvas (the tile fan-out that calls it needs
+ * `prepareImage`). Pure w.r.t. its injected `gate`/`call`.
+ *
+ * @param gate the shared rate gate.
+ * @param signal abort signal (rejects the wait promptly if it fires).
+ * @param call the actual provider request.
+ */
+export async function callWithRateGate<T>(
+  gate: RateGate,
+  signal: AbortSignal,
+  call: () => Promise<T>,
+): Promise<T> {
+  await gate.waitUntilClear(signal);
+  try {
+    const result = await call();
+    gate.clear();
+    return result;
+  } catch (err) {
+    if (err instanceof ProviderError && err.kind === "rate-limit") {
+      gate.report(err.retryAfterMs);
+    }
+    throw err;
+  }
 }
 
 /**
@@ -236,10 +290,12 @@ async function translatePrepared(
   });
 
   const provider = createProvider(providerSettings);
+  const gate = getRateGate();
   // WHY parallel: tiles of one strip are independent requests, and §7.5's
-  // latency target dies on a 10-tile strip translated serially. Rate limits
-  // self-correct via the provider's 429/529 backoff; the global concurrency
-  // cap (settings.concurrency) is enforced by the queue one level up.
+  // latency target dies on a 10-tile strip translated serially. The global
+  // concurrency cap (settings.concurrency) is enforced by the queue one level up;
+  // the rate gate (callWithRateGate) is the single choke point per HTTP request —
+  // during a cooldown these awaits idle inside their queue slot and fire nothing.
   const tilePages: PageTranslation[] = await Promise.all(
     prepared.tiles.map(async (tile): Promise<PageTranslation> => {
       const imageHash = await sha256Hex(tile.blob);
@@ -251,7 +307,9 @@ async function translatePrepared(
         sourceLangHint: providerSettings.sourceLangHint,
         priority: 0,
       };
-      return provider.translatePage(job, providerSettings, signal);
+      return callWithRateGate(gate, signal, () =>
+        provider.translatePage(job, providerSettings, signal),
+      );
     }),
   );
 
@@ -279,6 +337,9 @@ async function translatePrepared(
  * @param signal abort signal from the caller.
  * @param priority scheduling priority from the request (§7.5); orders the queue.
  * @param origin hostname the image belongs to (F15 per-site cache clear), if known.
+ * @param providedBlob content-acquired bytes for a blob-sourced page (Phase 7.2
+ *   item 1). When present the fetch is skipped and `imageUrl` is identity/
+ *   diagnostics only.
  */
 export async function translateImage(
   imageUrl: string,
@@ -287,13 +348,21 @@ export async function translateImage(
   signal: AbortSignal,
   priority = 0,
   origin?: string,
+  providedBlob?: Blob,
 ): Promise<PageTranslation> {
-  // Fetch reuses the browser's HTTP cache (imageFetcher: force-cache), so this
-  // is cheap even on a repeat visit; the expensive part we're guarding is the
-  // provider call. The page identity is the hash of the ORIGINAL bytes — stable
+  // A blob-sourced page (MangaDex etc.) ships its bytes content-side because the
+  // background can't fetch a document-scoped blob URL (§7.3); otherwise fetch
+  // reuses the browser's HTTP cache (imageFetcher: force-cache), so a repeat
+  // visit is cheap. The page identity is the hash of the ORIGINAL bytes — stable
   // regardless of how many tiles it is later split into.
-  const fetched = await fetchImageBytes(imageUrl, signal);
-  const pageHash = await sha256Hex(fetched.blob);
+  //
+  // WHY the bytes path needs zero cache/coalesce changes: page identity is the
+  // CONTENT HASH, not the URL. `sha256Hex(blob)` → the composite cache key →
+  // coalesce/SharedAbort all key on that hash, so two tabs showing the same page
+  // under different ephemeral blob URLs coalesce onto one provider run, and a
+  // revisit next session cache-hits even though every blob URL is new.
+  const blob = providedBlob ?? (await fetchImageBytes(imageUrl, signal)).blob;
+  const pageHash = await sha256Hex(blob);
   const cacheKey = buildCacheKey({
     provider: providerSettings.provider,
     imageHash: pageHash,
@@ -340,7 +409,7 @@ export async function translateImage(
     runTranslateMiss(
       cacheKey,
       pageHash,
-      fetched.blob,
+      blob,
       settings,
       providerSettings,
       shared.signal,
@@ -485,6 +554,14 @@ export function createTranslateHandlers(): MessageHandlers {
         // A request-level target language (e.g. drag-select) overrides settings.
         if (req.targetLang) providerSettings.targetLang = req.targetLang;
 
+        // Blob-sourced pages ship bytes content-side; build the Blob (mime
+        // defaults like regionHandlers does) and pass it in so `imageUrl` is
+        // never fetched (§7.3). Item 1.
+        const providedBlob =
+          req.imageBytes instanceof ArrayBuffer && req.imageBytes.byteLength > 0
+            ? new Blob([req.imageBytes], { type: req.imageMime || "image/jpeg" })
+            : undefined;
+
         const page = await translateImage(
           req.imageUrl,
           settings,
@@ -492,6 +569,7 @@ export function createTranslateHandlers(): MessageHandlers {
           controller.signal,
           req.priority,
           originFromSender(sender),
+          providedBlob,
         );
         return { ok: true, page };
       } catch (err) {

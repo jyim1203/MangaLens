@@ -11,6 +11,7 @@
  */
 import {
   deriveProviderSettings,
+  getAutoTranslate,
   getEffectiveEnabled,
   type Settings,
 } from "../shared/settings";
@@ -98,6 +99,17 @@ export function computeGateAction(
 
   const prevSettings = prev.settings;
   if (!prevSettings) return "no-op"; // defensive; active always carries settings
+
+  // Auto-translate opt-in flip (Phase 7.2 item 3): the content script stays
+  // active either way (effective-enabled didn't change — e.g. global flag ON,
+  // per-site override added/removed), so without this an override flip that
+  // toggles auto-sending would classify as a lesser action and the viewport
+  // queue would keep its old observe/no-observe wiring. re-request rebuilds the
+  // queue with the new `autoEnqueue` (index.ts reads getAutoTranslate on
+  // activate). Fires in BOTH directions.
+  if (getAutoTranslate(prevSettings, hostname) !== getAutoTranslate(settings, hostname)) {
+    return "re-request";
+  }
 
   if (translationSignature(prevSettings) !== translationSignature(settings)) {
     return "re-request";

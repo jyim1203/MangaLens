@@ -128,6 +128,27 @@ describe("gate — computeGateAction (enable-gate reducer)", () => {
     ).toBe("no-op");
   });
 
+  it("re-requests when auto-translate opt-in flips ON (override added, global on) — item 3", () => {
+    // Global ON, no override → active but not auto. Adding the per-site opt-in
+    // keeps effective-enabled true, so without the getAutoTranslate check this
+    // would be a no-op; it must re-request to rebuild the queue with autoEnqueue.
+    const prev = s({ enabled: true });
+    const next = s({ enabled: true, perSiteOverrides: { [HOST]: true } });
+    expect(
+      computeGateAction({ active: true, settings: prev }, next, HOST),
+    ).toBe("re-request");
+  });
+
+  it("re-requests when auto-translate opt-in flips OFF (override removed, global on) — item 3", () => {
+    // The reverse: removing the opt-in while the global flag keeps the site active
+    // must rebuild the queue with autoEnqueue=false (stop auto-sending).
+    const prev = s({ enabled: true, perSiteOverrides: { [HOST]: true } });
+    const next = s({ enabled: true });
+    expect(
+      computeGateAction({ active: true, settings: prev }, next, HOST),
+    ).toBe("re-request");
+  });
+
   it("re-request wins when both a translation field AND the font change", () => {
     const prev = s({ enabled: true, targetLang: "en" });
     const next = s({

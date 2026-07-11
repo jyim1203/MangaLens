@@ -146,6 +146,7 @@ describe("viewportQueue — requestAll (F8 translate-all)", () => {
     return createViewportQueue({
       overlay,
       prefetchAhead: 0,
+      autoEnqueue: true,
       makeRequestId: () => "rq",
       createObserver: (cb, options) =>
         new FakeIO(cb, options) as unknown as IntersectionObserver,
@@ -203,6 +204,7 @@ describe("viewportQueue — onProviderError toast hook (Phase 7 item 6)", () => 
     return createViewportQueue({
       overlay,
       prefetchAhead: 0,
+      autoEnqueue: true,
       makeRequestId: () => "rq",
       onProviderError,
       createObserver: (cb, options) =>
@@ -253,6 +255,7 @@ describe("viewportQueue — retry path re-observes a static image (item 6)", () 
     return createViewportQueue({
       overlay,
       prefetchAhead: 0,
+      autoEnqueue: true,
       makeRequestId: () => "rq",
       requestTimeoutMs,
       createObserver: (cb, options) =>
@@ -308,6 +311,167 @@ describe("viewportQueue — retry path re-observes a static image (item 6)", () 
     visible!.fire(CAND.el, true); // requested was reset → re-sends
     expect(mockSend).toHaveBeenCalledTimes(2);
 
+    queue.stop();
+  });
+});
+
+describe("viewportQueue — blob bytes dispatch (item 1)", () => {
+  beforeEach(() => {
+    FakeIO.instances = [];
+    mockSend.mockReset();
+  });
+
+  const BLOB: Candidate = {
+    id: "b1",
+    el: {} as unknown as Element,
+    url: "blob:https://reader.example.com/9f8c",
+  };
+  const HTTP: Candidate = {
+    id: "h1",
+    el: {} as unknown as Element,
+    url: "https://reader.example.com/page.jpg",
+  };
+
+  function makeQueue(
+    overlay: OverlaySink,
+    acquireBytes?: (url: string) => Promise<{ imageBytes: ArrayBuffer; imageMime: string }>,
+  ) {
+    return createViewportQueue({
+      overlay,
+      prefetchAhead: 0,
+      autoEnqueue: true,
+      makeRequestId: () => "rq",
+      acquireBytes,
+      createObserver: (cb, options) =>
+        new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+  }
+
+  it("a blob candidate acquires bytes content-side and ships them in the payload", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const bytes = new Uint8Array([7, 7, 7]).buffer;
+    const acquireBytes = vi.fn(async () => ({ imageBytes: bytes, imageMime: "image/webp" }));
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay, acquireBytes);
+
+    queue.register(BLOB);
+    FakeIO.instances[0]!.fire(BLOB.el, true);
+    await tick();
+
+    expect(acquireBytes).toHaveBeenCalledWith(BLOB.url);
+    const [type, payload] = mockSend.mock.calls[0]!;
+    expect(type).toBe("translatePage");
+    expect(payload).toMatchObject({
+      imageUrl: BLOB.url,
+      imageBytes: bytes,
+      imageMime: "image/webp",
+    });
+    queue.stop();
+  });
+
+  it("an http candidate never acquires bytes and sends no bytes in the payload", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const acquireBytes = vi.fn();
+    const queue = makeQueue(fakeOverlay(), acquireBytes);
+
+    queue.register(HTTP);
+    FakeIO.instances[0]!.fire(HTTP.el, true);
+    await tick();
+
+    expect(acquireBytes).not.toHaveBeenCalled();
+    const [, payload] = mockSend.mock.calls[0]!;
+    expect(payload).not.toHaveProperty("imageBytes");
+    queue.stop();
+  });
+
+  it("acquisition failure shows a network error, sends nothing, and doesn't reset requested", async () => {
+    const acquireBytes = vi.fn(async () => {
+      throw new Error("blob revoked");
+    });
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay, acquireBytes);
+
+    queue.register(BLOB);
+    FakeIO.instances[0]!.fire(BLOB.el, true);
+    await tick();
+
+    expect(overlay.setError).toHaveBeenCalledWith(BLOB, "network");
+    expect(mockSend).not.toHaveBeenCalled(); // no translatePage sent
+
+    // requested stayed true → a repeat visibility event does NOT re-acquire the
+    // dead URL (the fresh candidate from a src swap is the real retry path).
+    FakeIO.instances[0]!.fire(BLOB.el, true);
+    await tick();
+    expect(acquireBytes).toHaveBeenCalledTimes(1);
+    queue.stop();
+  });
+});
+
+describe("viewportQueue — autoEnqueue=false (per-site opt-in, item 3)", () => {
+  beforeEach(() => {
+    FakeIO.instances = [];
+    mockSend.mockReset();
+    vi.stubGlobal("Node", { DOCUMENT_POSITION_FOLLOWING: 4 });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const fakeEl = (): Element =>
+    ({ compareDocumentPosition: () => 2 }) as unknown as Element;
+  const candA: Candidate = { id: "a", el: fakeEl(), url: "https://x/a.jpg" };
+  const candB: Candidate = { id: "b", el: fakeEl(), url: "https://x/b.jpg" };
+
+  function makeQueue(overlay: OverlaySink, requestTimeoutMs?: number) {
+    return createViewportQueue({
+      overlay,
+      prefetchAhead: 3,
+      autoEnqueue: false,
+      makeRequestId: () => "rq",
+      requestTimeoutMs,
+      createObserver: (cb, options) =>
+        new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+  }
+
+  it("registers candidates but never observes them (no auto sends)", () => {
+    const queue = makeQueue(fakeOverlay());
+    queue.register(candA);
+    queue.register(candB);
+
+    // Both observers exist but watch nothing — no tier event can ever fire.
+    for (const io of FakeIO.instances) expect(io.observeLog).toEqual([]);
+    expect(mockSend).not.toHaveBeenCalled();
+    queue.stop();
+  });
+
+  it("requestAll still sends every registered candidate (translate-all works)", () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay);
+    queue.register(candA);
+    queue.register(candB);
+
+    expect(queue.requestAll()).toBe(2);
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    expect(overlay.setPending).toHaveBeenCalledTimes(2);
+    queue.stop();
+  });
+
+  it("reobserve is a no-op: a timed-out translate-all send does not re-observe", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {})); // never settles → timeout
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay, 10);
+    queue.register(candA);
+
+    queue.requestAll(); // sends candA at the translate-all priority
+    expect(mockSend).toHaveBeenCalledTimes(1);
+
+    await tick(30); // the 10 ms timeout fires → catch path calls reobserve
+
+    // autoEnqueue=false → reobserve returns early, touching neither observer.
+    for (const io of FakeIO.instances) {
+      expect(io.observeLog).toEqual([]);
+      expect(io.unobserveLog).toEqual([]);
+    }
     queue.stop();
   });
 });

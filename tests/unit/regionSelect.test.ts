@@ -6,12 +6,10 @@ vi.mock("webextension-polyfill", () => ({ default: fakeBrowser }));
 
 import {
   MIN_DRAG_PX,
-  acquisitionPlan,
   isClickNotDrag,
   normalizeDragRect,
   pickTargetImage,
   selectionToImageBbox,
-  sourceKindForUrl,
   type Rect,
 } from "../../src/content/regionSelect";
 
@@ -111,22 +109,5 @@ describe("regionSelect — pickTargetImage", () => {
   });
 });
 
-describe("regionSelect — sourceKindForUrl + acquisitionPlan (item 2)", () => {
-  it("classifies image URLs by scheme", () => {
-    expect(sourceKindForUrl("https://x/a.jpg")).toBe("img-http");
-    expect(sourceKindForUrl("http://x/a.jpg")).toBe("img-http");
-    expect(sourceKindForUrl("data:image/png;base64,AAAA")).toBe("img-data");
-    expect(sourceKindForUrl("blob:https://x/uuid")).toBe("img-blob");
-    expect(sourceKindForUrl("")).toBe("unsupported");
-    expect(sourceKindForUrl(null)).toBe("unsupported");
-    expect(sourceKindForUrl("about:blank")).toBe("unsupported");
-  });
-
-  it("routes http/data by URL, blob/canvas by bytes, unsupported as unsupported", () => {
-    expect(acquisitionPlan("img-http")).toEqual({ send: "url" });
-    expect(acquisitionPlan("img-data")).toEqual({ send: "url" });
-    expect(acquisitionPlan("img-blob")).toEqual({ send: "bytes" });
-    expect(acquisitionPlan("canvas")).toEqual({ send: "bytes" });
-    expect(acquisitionPlan("unsupported")).toEqual({ send: "unsupported" });
-  });
-});
+// Source classification + acquisition plan moved to imageSource.test.ts in
+// Phase 7.2 (the pure helpers now live in the shared imageSource module).

@@ -299,6 +299,28 @@ export function getEffectiveEnabled(
 }
 
 /**
+ * Whether visibility-driven auto-translate should run on a hostname (Phase 7.2
+ * item 3 — the per-site opt-in). ONLY an explicit per-site "On"
+ * (`perSiteOverrides[hostname] === true`) enables auto-sending; the global
+ * {@link Settings.enabled} flag alone activates the content script (overlays,
+ * drag-select, "Translate all") but sends nothing to a provider without this
+ * per-site decision.
+ *
+ * WHY stricter than {@link getEffectiveEnabled}: page images leaving the browser
+ * (and costing money) should follow an explicit per-site choice — the live test
+ * billed YouTube thumbnails and a site mascot to the user's key on day one.
+ *
+ * Note the intended overlap: a site override of `true` with the global flag OFF
+ * already force-enables the site (see {@link getEffectiveEnabled}), so such a
+ * site is both active AND auto — exactly right.
+ *
+ * @param hostname bare hostname, e.g. `location.hostname`.
+ */
+export function getAutoTranslate(settings: Settings, hostname: string): boolean {
+  return settings.perSiteOverrides[hostname] === true;
+}
+
+/**
  * Extract the provider-facing slice a {@link import("./types").Translator}
  * needs, picking the active provider's key/model. Keeps the providers/ layer
  * decoupled from the full settings object.

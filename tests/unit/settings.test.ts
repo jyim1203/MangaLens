@@ -11,6 +11,7 @@ import {
   SETTINGS_KEY,
   SETTINGS_SCHEMA_VERSION,
   deriveProviderSettings,
+  getAutoTranslate,
   getEffectiveEnabled,
   loadSettings,
   mergeSettings,
@@ -110,6 +111,29 @@ describe("shared/settings — getEffectiveEnabled", () => {
     expect(getEffectiveEnabled(off, "reader.io")).toBe(false);
     // A different host still follows the global flag.
     expect(getEffectiveEnabled(off, "other.io")).toBe(true);
+  });
+});
+
+describe("shared/settings — getAutoTranslate (Phase 7.2 per-site opt-in)", () => {
+  it("is true ONLY for an explicit per-site override of true", () => {
+    const on = { ...DEFAULT_SETTINGS, perSiteOverrides: { "a.com": true } };
+    expect(getAutoTranslate(on, "a.com")).toBe(true);
+    // override false / absent → not auto, regardless of the global flag.
+    const off = { ...DEFAULT_SETTINGS, perSiteOverrides: { "a.com": false } };
+    expect(getAutoTranslate(off, "a.com")).toBe(false);
+    expect(getAutoTranslate({ ...DEFAULT_SETTINGS }, "a.com")).toBe(false);
+  });
+
+  it("the global flag alone does NOT enable auto-translate (the finding-2 guard)", () => {
+    const globalOnNoOverride = { ...DEFAULT_SETTINGS, enabled: true };
+    expect(getEffectiveEnabled(globalOnNoOverride, "a.com")).toBe(true); // active…
+    expect(getAutoTranslate(globalOnNoOverride, "a.com")).toBe(false); // …but not auto
+  });
+
+  it("a site override of true is auto even when the global flag is off (active AND auto)", () => {
+    const s = { ...DEFAULT_SETTINGS, enabled: false, perSiteOverrides: { "a.com": true } };
+    expect(getEffectiveEnabled(s, "a.com")).toBe(true);
+    expect(getAutoTranslate(s, "a.com")).toBe(true);
   });
 });
 

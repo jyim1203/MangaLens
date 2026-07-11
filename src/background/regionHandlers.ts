@@ -37,7 +37,9 @@ import { recordUsage, usageFromPage } from "./costTracker";
 import { ProviderError } from "./providers/ProviderBase";
 import { createProvider } from "./providers/factory";
 import {
+  callWithRateGate,
   errorToTranslateResult,
+  getRateGate,
   getTranslationQueue,
   registerRequestController,
   unregisterRequestController,
@@ -108,9 +110,15 @@ async function translateRegionImage(
 
   const provider = createProvider(providerSettings);
   const queue = getTranslationQueue(settings.concurrency);
+  const gate = getRateGate();
   // Priority 0: a user gesture is the most urgent thing we have (handoff item 3).
+  // Gated by the SAME global cooldown as page translation (Phase 7.2 item 3): a
+  // drag-select during a 429 storm must queue behind the cooldown, not hammer.
   const page = await queue.add(
-    (qSignal) => provider.translatePage(job, providerSettings, qSignal),
+    (qSignal) =>
+      callWithRateGate(gate, qSignal, () =>
+        provider.translatePage(job, providerSettings, qSignal),
+      ),
     0,
     signal,
   );

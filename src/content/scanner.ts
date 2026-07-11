@@ -103,15 +103,25 @@ export function scoreCandidate(m: CandidateMetrics): number {
   return area * (1 + centeredness);
 }
 
-/** Whether an image URL can be sent to the background for translation (§7.1/§7.3). */
-export type UrlPolicy = "accept" | "skip";
+/**
+ * How the pipeline should source an image URL's bytes (§7.1/§7.3):
+ *  - `accept` — `http(s)`/`data:`: the background fetches by URL, as always.
+ *  - `accept-bytes` — `blob:`: the CONTENT script must read the bytes and ship
+ *    them (the background cannot fetch a document-scoped blob URL). Both accept
+ *    kinds are registered as candidates; the viewport queue picks the acquisition
+ *    path from the URL at dispatch time.
+ *  - `skip` — everything else.
+ */
+export type UrlPolicy = "accept" | "accept-bytes" | "skip";
 
 /**
- * Decide whether a resolved image URL is translatable (§7.1). `http(s):` and
- * `data:` are accepted (the background can fetch/decode both). `blob:` is
- * skipped — a blob URL is scoped to the document that created it, so the
- * background context cannot fetch it (§7.3); the Phase 7 drag-select/screenshot
- * path covers those. Anything else (`about:`, `chrome:`, empty) is skipped.
+ * Decide how a resolved image URL should be translated (§7.1). `http(s):` and
+ * `data:` are `accept` (the background fetches/decodes both by URL). `blob:` is
+ * `accept-bytes` — a blob URL is scoped to the document that created it, so the
+ * background context cannot fetch it (§7.3); instead the content script reads its
+ * bytes and sends them, exactly as drag-select does (Phase 7.2 — MangaDex and
+ * other readers are 100% blob-served, so skipping blob detected zero pages). Any
+ * other scheme (`about:`, `chrome:`, empty) is `skip`.
  *
  * @param url the (already absolute) URL, or a nullish value.
  */
@@ -124,7 +134,7 @@ export function classifyImageUrl(url: string | null | undefined): UrlPolicy {
   ) {
     return "accept";
   }
-  // WHY skip blob: — cross-context fetch fails; not our problem until Phase 7.
+  if (url.startsWith("blob:")) return "accept-bytes";
   return "skip";
 }
 
@@ -333,7 +343,10 @@ export function createScanner(opts: ScannerOptions): Scanner {
       const metrics = readMetrics(el);
       if (!metrics || !isCandidate(metrics)) continue;
       const url = resolveUrl(el);
-      if (classifyImageUrl(url) !== "accept" || !url) continue;
+      // Register both fetch-by-URL (`accept`) and ship-bytes (`accept-bytes`,
+      // blob) candidates; only the scheme differs, and the viewport queue chooses
+      // the acquisition path from the URL at dispatch (Phase 7.2).
+      if (classifyImageUrl(url) === "skip" || !url) continue;
       found.push({ el, url });
     }
 

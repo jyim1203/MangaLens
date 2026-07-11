@@ -16,7 +16,8 @@
 import { createLogger } from "../shared/log";
 import { sendToBackground } from "../shared/messages";
 import type { PageTranslation, ProviderErrorKind } from "../shared/types";
-import type { Candidate } from "./scanner";
+import { classifyImageUrl, type Candidate } from "./scanner";
+import { acquireBlobBytes, type AcquiredBytes } from "./imageSource";
 import { withTimeout } from "./withTimeout";
 
 const log = createLogger("viewport-queue");
@@ -104,10 +105,26 @@ export interface ViewportQueueOptions {
   overlay: OverlaySink;
   /** How many pages ahead to prefetch (from settings). */
   prefetchAhead: number;
+  /**
+   * Whether visibility auto-enqueues candidates (Phase 7.2 item 3). When false,
+   * candidates are still registered, doc-ordered, and overlay-managed (so
+   * {@link ViewportQueue.requestAll} still works), but the IntersectionObservers
+   * never observe them — no tier events, no auto sends. The content composition
+   * root sets this from {@link import("../shared/settings").getAutoTranslate}: the
+   * global toggle activates the content script everywhere, but page images only
+   * leave the browser on a per-site opt-in.
+   */
+  autoEnqueue: boolean;
   /** Optional per-request target-language override (drag-select etc.). */
   targetLang?: string;
   /** Generate a request id; defaulted to `crypto.randomUUID()`. */
   makeRequestId?: () => string;
+  /**
+   * Read a blob-sourced candidate's bytes content-side (Phase 7.2 item 1); seam
+   * for tests. Defaulted to {@link import("./imageSource").acquireBlobBytes}. Only
+   * invoked for `accept-bytes` (blob) candidates.
+   */
+  acquireBytes?: (url: string) => Promise<AcquiredBytes>;
   /** IntersectionObserver factory seam (tests inject a fake). */
   createObserver?: (
     cb: IntersectionObserverCallback,
@@ -168,7 +185,9 @@ interface Tracked {
  */
 export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
   const overlay = opts.overlay;
+  const autoEnqueue = opts.autoEnqueue;
   const makeRequestId = opts.makeRequestId ?? (() => crypto.randomUUID());
+  const acquireBytes = opts.acquireBytes ?? acquireBlobBytes;
   const requestTimeoutMs = opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
   const makeObserver =
     opts.createObserver ??
@@ -240,6 +259,11 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
    * has been reset to false, or the re-fired callback is a no-op.
    */
   const reobserve = (el: Element): void => {
+    // WHY no-op when auto-enqueue is off: there are no observers watching this
+    // element to re-fire (a non-auto site never observes), so a timed-out
+    // translate-all page won't visibility-retry there — the user re-clicks
+    // Translate all (Phase 7.2 item 3, accepted).
+    if (!autoEnqueue) return;
     safe(() => visibleObserver.unobserve(el));
     safe(() => nearObserver.unobserve(el));
     safe(() => visibleObserver.observe(el));
@@ -257,9 +281,38 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
 
     rec.requested = true;
     const requestId = makeRequestId();
-    rec.requestId = requestId;
     safe(() => overlay.setPending(candidate));
 
+    // Blob-sourced pages (MangaDex etc.): the background can't fetch a
+    // document-scoped blob URL (§7.3), so read the bytes content-side and ship
+    // them — exactly as drag-select does. // WHY lazy at dispatch, never at
+    // registration: a chapter can register 200 candidates, and holding
+    // 200 × ~1–3 MB ArrayBuffers would be a content-side memory bomb; only jobs
+    // actually SENT pay for their bytes.
+    let acquired: AcquiredBytes | undefined;
+    if (classifyImageUrl(candidate.url) === "accept-bytes") {
+      try {
+        acquired = await acquireBytes(candidate.url);
+      } catch (err) {
+        // Revoked object URL / fetch throw. // WHY do NOT reset `requested`: a
+        // revoked blob never heals by retry — the reader swapping the <img> src
+        // produces a FRESH candidate via the scanner reconcile, and that new
+        // registration IS the retry path. Re-acquiring the same dead URL on the
+        // next visibility event would just fail again. `requestId` was never
+        // stamped on the record (no request was sent), so teardown fires no
+        // phantom cancel.
+        log.warn(`byte acquisition failed for ${candidate.url}`, err);
+        safe(() => overlay.setError(candidate, "network"));
+        return;
+      }
+      // Torn down while acquiring? Don't send for a candidate that's gone.
+      const still = tracked.get(candidate.el);
+      if (!still || still.candidate.id !== candidate.id) return;
+    }
+
+    // Stamp the id only now that we're actually about to send, so a teardown
+    // during byte acquisition has no requestId to (needlessly) cancel.
+    rec.requestId = requestId;
     try {
       const result = await withTimeout(
         sendToBackground("translatePage", {
@@ -267,6 +320,7 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
           priority,
           requestId,
           targetLang: opts.targetLang,
+          ...acquired,
         }),
         requestTimeoutMs,
       );
@@ -323,10 +377,17 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
     register(candidate: Candidate): void {
       if (tracked.has(candidate.el)) return; // de-duped by the scanner already
       tracked.set(candidate.el, { candidate, requested: false });
-      // Keep `order` in document order so prefetch (N+1..N+3) is meaningful.
+      // Keep `order` in document order so prefetch (N+1..N+3) and translate-all
+      // fill in document order (both read `order`), independent of auto-enqueue.
       insertInDocOrder(order, candidate);
-      safe(() => visibleObserver.observe(candidate.el));
-      safe(() => nearObserver.observe(candidate.el));
+      // WHY only observe when auto-enqueue is on (Phase 7.2 item 3): on a non-auto
+      // site the registry still drives Translate all / drag-select, but nothing is
+      // sent to the provider without a user action — so the visibility observers
+      // that would auto-send must not watch these elements.
+      if (autoEnqueue) {
+        safe(() => visibleObserver.observe(candidate.el));
+        safe(() => nearObserver.observe(candidate.el));
+      }
     },
 
     unregister(candidate: Candidate): void {

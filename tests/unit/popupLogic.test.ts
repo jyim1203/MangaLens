@@ -65,14 +65,25 @@ describe("popupLogic — hostnameFromUrl", () => {
   });
 });
 
-describe("popupLogic — statusLine", () => {
-  it("explains non-web pages, global state, and site rules", () => {
+describe("popupLogic — statusLine (Phase 7.2 active-vs-auto split)", () => {
+  it("explains non-web pages and the disabled state", () => {
     expect(statusLine(settings(), undefined)).toMatch(/not available/i);
-    expect(statusLine(settings({ enabled: true }), "a.com")).toMatch(/active/i);
     expect(statusLine(settings(), "a.com")).toMatch(/off/i);
     expect(
       statusLine(settings({ perSiteOverrides: { "a.com": false }, enabled: true }), "a.com"),
     ).toMatch(/site rule/i);
+  });
+
+  it("distinguishes auto-translating (per-site opt-in) from active-but-not-auto", () => {
+    // Per-site opt-in → auto-translating.
+    expect(
+      statusLine(settings({ perSiteOverrides: { "a.com": true } }), "a.com"),
+    ).toMatch(/auto-translat/i);
+    // Global on, no override → active but auto is off; the line must say so and
+    // point at the manual actions (the finding-2 messaging).
+    const activeNotAuto = statusLine(settings({ enabled: true }), "a.com");
+    expect(activeNotAuto).toMatch(/translate all|select region/i);
+    expect(activeNotAuto).toMatch(/auto-translate is off/i);
   });
 });
 

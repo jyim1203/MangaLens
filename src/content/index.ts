@@ -24,6 +24,7 @@ import { createLogger } from "../shared/log";
 import { createMessageRouter, sendToBackground } from "../shared/messages";
 import {
   SETTINGS_KEY,
+  getAutoTranslate,
   migrateSettings,
   peekSettings,
   type Settings,
@@ -70,9 +71,15 @@ function activate(settings: Settings): void {
   });
   overlay.start();
 
+  // Auto-translate only on a per-site opt-in (Phase 7.2 item 3): global-enabled
+  // activates the content script everywhere (overlays, drag-select, Translate
+  // all), but visibility never auto-sends page images to the provider unless the
+  // user turned this site on. A re-request on the getAutoTranslate flip rebuilds
+  // the queue with the new value (see gate.ts).
   viewportQueue = createViewportQueue({
     overlay,
     prefetchAhead: settings.prefetchAhead,
+    autoEnqueue: getAutoTranslate(settings, hostname),
     onProviderError: (kind) => toast?.showError(kind),
   });
 
