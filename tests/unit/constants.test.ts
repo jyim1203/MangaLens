@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { CMD_TOGGLE, PROMPT_VERSION } from "../../src/shared/constants";
+import {
+  CMD_PEEK_ORIGINAL,
+  CMD_SELECT_REGION,
+  CMD_TOGGLE,
+  PROMPT_VERSION,
+} from "../../src/shared/constants";
 import manifest from "../../src/manifest";
 
 describe("shared/constants", () => {
@@ -8,9 +13,16 @@ describe("shared/constants", () => {
     expect(PROMPT_VERSION).toBeGreaterThan(0);
   });
 
-  it("toggle command id stays in sync with the manifest (edge: drift)", () => {
+  it("command ids stay in sync with the manifest (edge: drift)", () => {
     const commands = manifest["commands"] as Record<string, unknown>;
-    expect(Object.keys(commands)).toContain(CMD_TOGGLE);
+    const ids = Object.keys(commands);
+    expect(ids).toContain(CMD_TOGGLE);
+    expect(ids).toContain(CMD_SELECT_REGION);
+    expect(ids).toContain(CMD_PEEK_ORIGINAL);
+  });
+
+  it("declares a default_locale so __MSG_*__ manifest strings resolve", () => {
+    expect(manifest["default_locale"]).toBe("en");
   });
 
   it("manifest is Firefox MV3 with an event page, not a service worker (edge: platform regressions)", () => {

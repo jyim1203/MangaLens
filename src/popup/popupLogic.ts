@@ -93,6 +93,19 @@ export function costSummary(stats: CostStats): string {
 }
 
 /**
+ * Whether the "Select region" button (F10 drag-select, Phase 7) should be
+ * enabled: only when MangaLens is effectively active on the current page (the
+ * content script has a live region selector to enter). Same gate as
+ * translate-all. Pure.
+ */
+export function regionSelectEnabled(
+  settings: Settings,
+  hostname: string | undefined,
+): boolean {
+  return hostname ? getEffectiveEnabled(settings, hostname) : false;
+}
+
+/**
  * Above this many pages, "translate all" asks for confirmation first
  * (Architecture §10 Risks: cost surprises).
  */

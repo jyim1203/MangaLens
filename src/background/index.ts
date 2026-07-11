@@ -11,13 +11,20 @@
  */
 import browser from "webextension-polyfill";
 import { createLogger } from "../shared/log";
-import { CMD_TOGGLE } from "../shared/constants";
+import {
+  CMD_PEEK_ORIGINAL,
+  CMD_SELECT_REGION,
+  CMD_TOGGLE,
+} from "../shared/constants";
 import { createMessageRouter } from "../shared/messages";
 import {
+  createOptionsPageHandlers,
   createSettingsHandlers,
+  sendCommandToActiveTab,
   toggleEnabled,
 } from "./settingsHandlers";
 import { createTranslateHandlers } from "./translateHandlers";
+import { createRegionHandlers } from "./regionHandlers";
 import { createKeyTestHandlers } from "./providers/keyTest";
 import { resetCostStats } from "./costTracker";
 
@@ -32,7 +39,9 @@ const router = createMessageRouter({
     return { ok: true };
   },
   ...createSettingsHandlers(),
+  ...createOptionsPageHandlers(),
   ...createTranslateHandlers(),
+  ...createRegionHandlers(),
   ...createKeyTestHandlers(),
   // WHY here and not a direct import in the options page: cost writes are
   // serialized through costTracker's per-context chain — a second context
@@ -44,9 +53,17 @@ const router = createMessageRouter({
 browser.runtime.onMessage.addListener(router);
 
 browser.commands.onCommand.addListener((command) => {
+  // Fail soft: a storage/messaging error must never leave an unhandled rejection.
   if (command === CMD_TOGGLE) {
-    // Fail soft: a storage error must never leave an unhandled rejection.
     void toggleEnabled().catch((err) => log.warn("toggle command failed", err));
+  } else if (command === CMD_SELECT_REGION) {
+    void sendCommandToActiveTab("startRegionSelect").catch((err) =>
+      log.warn("select-region command failed", err),
+    );
+  } else if (command === CMD_PEEK_ORIGINAL) {
+    void sendCommandToActiveTab("togglePeekOriginal").catch((err) =>
+      log.warn("peek-original command failed", err),
+    );
   }
 });
 

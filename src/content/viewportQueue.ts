@@ -17,6 +17,7 @@ import { createLogger } from "../shared/log";
 import { sendToBackground } from "../shared/messages";
 import type { PageTranslation, ProviderErrorKind } from "../shared/types";
 import type { Candidate } from "./scanner";
+import { withTimeout } from "./withTimeout";
 
 const log = createLogger("viewport-queue");
 
@@ -115,6 +116,12 @@ export interface ViewportQueueOptions {
   /** Per-request timeout (ms); defaulted to {@link REQUEST_TIMEOUT_MS}. Injectable
    *  so the retry path (item 6) is testable without a 2-minute fake-timer wait. */
   requestTimeoutMs?: number;
+  /**
+   * Called with the error kind when a translation fails with a rendered badge
+   * (Phase 7 item 6) — drives the actionable-error toast policy. NOT called for
+   * `aborted` (silent) or on timeout (a transient wedge, not a provider verdict).
+   */
+  onProviderError?: (kind: ProviderErrorKind) => void;
 }
 
 /** Priority for "translate all" enqueues — the prefetch/all tier (§7.5). */
@@ -281,6 +288,9 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
         reobserve(live.candidate.el);
       } else {
         safe(() => overlay.setError(candidate, result.errorKind));
+        // Actionable failures (auth/rate-limit) also raise a once-per-activation
+        // toast; the policy in the toast manager decides (Phase 7 item 6).
+        if (opts.onProviderError) safe(() => opts.onProviderError!(result.errorKind));
       }
     } catch (err) {
       // Timeout or channel close (event page died mid-request, gap #8): return
@@ -367,26 +377,6 @@ function insertInDocOrder(order: Candidate[], candidate: Candidate): void {
     }
   }
   order.push(candidate);
-}
-
-/** Reject with a timeout error if `p` hasn't settled within `ms` (gap #8). */
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`translate request timed out after ${ms} ms`)),
-      ms,
-    );
-    p.then(
-      (v) => {
-        clearTimeout(timer);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(timer);
-        reject(e);
-      },
-    );
-  });
 }
 
 /** Swallow + log any throw so an observer callback can never break the page (rule 6). */

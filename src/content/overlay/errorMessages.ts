@@ -1,10 +1,16 @@
 /**
  * Map a {@link ProviderErrorKind} to a short, user-facing overlay message
- * (§7.2 error state). Pure and total over the taxonomy; shared with the Phase
- * 6/7 toast surfaces later. `aborted` returns `null` — the request was cancelled
- * because the user scrolled away or toggled off, so the overlay renders nothing
- * (nothing is wrong).
+ * (§7.2 error state). Pure and total over the taxonomy; shared with the Phase 7
+ * toast surface. `aborted` returns `null` — the request was cancelled because the
+ * user scrolled away or toggled off, so the overlay renders nothing (nothing is
+ * wrong).
+ *
+ * Strings are localized via {@link t} with the English text as the fallback
+ * (Phase 7 i18n): under the built extension `browser.i18n` returns the
+ * `_locales` message; under node tests the fallback IS today's string, so the
+ * totality/wording tests keep passing untouched.
  */
+import { t } from "../../shared/i18n";
 import type { ProviderErrorKind } from "../../shared/types";
 
 /**
@@ -14,17 +20,33 @@ import type { ProviderErrorKind } from "../../shared/types";
 export function errorKindToMessage(kind: ProviderErrorKind): string | null {
   switch (kind) {
     case "auth":
-      return "MangaLens: check your API key";
+      return t("errorAuth", undefined, "MangaLens: check your API key");
     case "rate-limit":
-      return "MangaLens: rate limited — try again shortly";
+      return t(
+        "errorRateLimit",
+        undefined,
+        "MangaLens: rate limited — try again shortly",
+      );
     case "refusal":
-      return "MangaLens: the provider declined this image";
+      return t(
+        "errorRefusal",
+        undefined,
+        "MangaLens: the provider declined this image",
+      );
     case "network":
-      return "MangaLens: network error — couldn't reach the provider";
+      return t(
+        "errorNetwork",
+        undefined,
+        "MangaLens: network error — couldn't reach the provider",
+      );
     case "malformed":
-      return "MangaLens: couldn't read the provider's response";
+      return t(
+        "errorMalformed",
+        undefined,
+        "MangaLens: couldn't read the provider's response",
+      );
     case "unknown":
-      return "MangaLens: translation failed";
+      return t("errorUnknown", undefined, "MangaLens: translation failed");
     case "aborted":
       return null;
   }

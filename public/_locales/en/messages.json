@@ -1,0 +1,66 @@
+{
+  "extensionName": {
+    "message": "MangaLens",
+    "description": "Extension name shown in about:addons and the toolbar."
+  },
+  "extensionDescription": {
+    "message": "Detect manga/comic images, translate the text via your own LLM API key, and overlay the translation in place.",
+    "description": "Extension description shown in about:addons and on AMO."
+  },
+  "commandToggleDescription": {
+    "message": "Toggle MangaLens on/off",
+    "description": "Keyboard shortcut description (Manage Extension Shortcuts)."
+  },
+  "commandSelectRegionDescription": {
+    "message": "Drag-select a region to translate",
+    "description": "Keyboard shortcut description for the region-select fallback (F10)."
+  },
+  "commandPeekOriginalDescription": {
+    "message": "Peek at the original (untranslated) text",
+    "description": "Keyboard shortcut description for the peek-original toggle (F14)."
+  },
+  "errorAuth": {
+    "message": "MangaLens: check your API key",
+    "description": "Overlay badge / toast message for an authentication failure."
+  },
+  "errorRateLimit": {
+    "message": "MangaLens: rate limited — try again shortly",
+    "description": "Overlay badge / toast message for a rate-limit failure."
+  },
+  "errorRefusal": {
+    "message": "MangaLens: the provider declined this image",
+    "description": "Overlay badge message when the provider safety-refuses."
+  },
+  "errorNetwork": {
+    "message": "MangaLens: network error — couldn't reach the provider",
+    "description": "Overlay badge message for a network failure."
+  },
+  "errorMalformed": {
+    "message": "MangaLens: couldn't read the provider's response",
+    "description": "Overlay badge message for a malformed provider response."
+  },
+  "errorUnknown": {
+    "message": "MangaLens: translation failed",
+    "description": "Overlay badge message for an unclassified failure."
+  },
+  "regionSelectHint": {
+    "message": "Drag to select · Esc to cancel",
+    "description": "Hint shown on the drag-select crosshair overlay (F10)."
+  },
+  "regionNoImage": {
+    "message": "MangaLens: no image under the selection",
+    "description": "Toast when a drag-select rectangle intersects no image."
+  },
+  "regionCantAccess": {
+    "message": "MangaLens: can't access this image",
+    "description": "Toast when a tainted canvas / blob image can't be read (§7.3)."
+  },
+  "regionTooSmall": {
+    "message": "MangaLens: selection too small",
+    "description": "Toast when the drag-select crop is too small to translate."
+  },
+  "toastOpenSettings": {
+    "message": "Open settings",
+    "description": "Action button on the auth error toast; opens the options page."
+  }
+}

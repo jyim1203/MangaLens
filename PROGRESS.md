@@ -848,3 +848,256 @@ Phase-8-deferred) all clean. **Manual re-verify (needs a real browser):** with
 a valid key stored, the popup shows no key banner; remove the key → banner
 returns and ✕ dismisses it for that popup instance; in options, switching Font
 sizing between auto/fixed swaps the two rows.
+
+## Phase 7 summary (drag-select fallback + peek + toasts + i18n)
+
+Landed the "universal fallback" phase: click-and-drag region translation (F10),
+peek-original (F14), the two actionable error toasts, the new keyboard shortcuts,
+and i18n scaffolding for the extension chrome. After this a user can translate
+text on ANY image — including the `blob:`/`<canvas>` sources the scanner
+deliberately skips — and gets an actionable nudge when a key is bad or a provider
+throttles. Every module keeps the pure-core / thin-shell split.
+
+**Flagged contract changes.** (1) `shared/types.ts`: `TranslateJob` gained
+optional `isRegion?: boolean` — the ONE pre-authorized handoff-rule-4 exception.
+ProviderBase threads it into `buildUserText({ region })`, which appends the
+PROMPTS §4.3 suffix verbatim (new exported `REGION_SUFFIX`); `region:false` is
+byte-identical to the pre-Phase-7 message, so **`PROMPT_VERSION` is untouched**
+(pinned by a test) and cached page translations stay valid — the suffix only
+exists on never-cached region jobs. (2) `shared/messages.ts`: four new messages
+— `translateRegion` (crop → provider, reuses `TranslatePageResult`),
+`startRegionSelect` (`void → {started}`), `togglePeekOriginal`, `openOptionsPage`.
+(3) `src/manifest.ts`: two commands (`select-region` Alt+Shift+S, `peek-original`
+Alt+Shift+O), `default_locale: "en"`, and `name`/`description`/command
+descriptions switched to `__MSG_*__`. **No other `shared/types.ts` change.**
+
+**Item 1/2 — `content/regionSelect.ts` (F10).** Pure, tested rect math:
+`normalizeDragRect` (any drag direction), `selectionToImageBbox` (page-space
+selection → normalized crop clipped to the image; browser zoom cancels because
+both rects are CSS px), `isClickNotDrag`/`MIN_DRAG_PX` (a sub-8-px drag is an
+escape), `pickTargetImage` (largest intersection wins), plus the byte-acquisition
+*decision* `sourceKindForUrl` + `acquisitionPlan` (`http`/`data` → send URL;
+`blob`/`canvas` → send bytes; else unsupported). The thin shell is a full-viewport
+`position:fixed` **open-shadow** crosshair host (the FIRST deliberately-interactive
+surface on a host page — the §7.2 exception), `setPointerCapture` so a drag
+leaving the window still finishes, Esc-to-cancel, one-shot teardown, and — the
+load-bearing detail — the drag anchor stored in **page coordinates** so a mid-drag
+scroll doesn't shift the selection (the §8 "scrolled pages" case; the marquee
+redraws from `lastClient + scroll` on scroll). Byte acquisition (shell) reads a
+`blob:` via `fetch(currentSrc)` and a `<canvas>` via `toBlob()` (a tainted canvas
+throws `SecurityError` → "can't access this image" notice), shipping an
+`ArrayBuffer` over `runtime.sendMessage`. // WHY Firefox-only-safe: structured
+clone carries the ArrayBuffer intact; a future Chrome port (JSON messaging) would
+need base64. The scanner does NOT start accepting blob/canvas — the fallback is
+drag-select only.
+
+**Item 3 — `background/regionHandlers.ts`.** `translateRegion` resolves bytes
+(URL → `fetchImageBytes`; bytes → a `Blob`; both/neither → a `network`-kind
+failure), crops via the new pure `planRegionCrop` (integer source rect clamped to
+the image, long-edge-capped, no upscale, rejects < 16 px → "selection too small"
+`malformed`) + the browser shell `prepareRegionCrop` (one `OffscreenCanvas`
+source-rect draw, white underlay), and builds a job with `tileOffset: crop` +
+`isRegion: true` so ProviderBase's existing `remapBboxFromTile` lifts crop-local
+bboxes to full-image space with **zero new remap code**. Runs through the SAME
+shared `PriorityQueue` (exported from translateHandlers) at **priority 0** (a user
+gesture is the most urgent work), registers its `AbortController` in the SAME
+`requestControllers` map (exported register/unregister helpers) so the existing
+`cancelTranslation` covers regions, and records usage (F17, one image per crop).
+**No caching / no coalescing** — two hand-drawn rects are never pixel-identical,
+so a cache entry would never be hit again; cache functions are never imported into
+the region path (proven by a spy test).
+
+**Item 4/5 — overlay reuse + peek (F14).** Region results render through the same
+`OverlayManager` via a synthesized one-off `Candidate` (`region-<uuid>`), so
+position sync, resize re-paint, filters, textFit, and teardown come for free; a
+repeated selection stacks a SECOND overlay entry (accepted for v1). Peek adds a
+pure `overlay/peek.ts` — `hitTestRegion` (smallest-area containing rect wins on
+nesting) and `peekRepaintTargets` (repaint ONLY on an enter/leave transition, so
+constant mousemove is a tested no-op). The OverlayManager grew a document-level
+passive `mousemove` (rAF-coalesced like the position sync), a `peekAll` flag
+(`togglePeekOriginal` message), and per-entry `paintedRects` for hit-testing;
+`BubbleBox` takes a `peek` flag that swaps to `region.original` with a dashed
+outline. // WHY repaint (not a `textContent` swap): the original is often CJK and
+fits differently, so textFit must re-run. **Zero `pointer-events` changes
+anywhere** — page-forward-on-image-click still reaches the reader (§7.2); peek is
+purely geometric.
+
+**Item 6 — error toasts.** `content/toast.ts`: pure `toastPolicy` (only
+`auth`/`rate-limit` toast, each at most once per activation — 10 images failing
+auth ⇒ one toast; the set resets because a fresh `ToastManager` is built per
+activate), and a thin shell (one bottom-corner shadow host, `pointer-events:none`
+except the card's ✕ / action). The auth toast carries an "Open settings" action
+→ the new `openOptionsPage` message (content can't call `openOptionsPage()`
+itself). Wired into the viewport queue's `setError` path via a new
+`onProviderError` hook and into the region controller's error path; per-image
+badges are unchanged.
+
+**Item 7/8 — commands, popup, i18n.** The `commands.onCommand` listener stays in
+`background/index.ts` (where the toggle command already lived — the handoff's
+"settingsHandlers owns it" was inaccurate about the current tree); its fan-out
+helper `sendCommandToActiveTab` is extracted to `settingsHandlers.ts` so it's
+testable without `browser.commands` (fake-browser lacks it). // WHY no `tabs`
+permission: querying + messaging by tabId are permission-free. The content
+bootstrap router (registered even while inert, same inert-safety as `translateAll`)
+answers `startRegionSelect`/`togglePeekOriginal`; the popup gained a "Select
+region…" button that sends `startRegionSelect` then `window.close()` (or shows a
+hint if `{started:false}`), gated by the pure `regionSelectEnabled`.
+`shared/i18n.ts` `t(key, subs?, fallback?)` reads `globalThis.browser?.i18n`
+(NOT importing the polyfill — so pure modules calling `t()` need no test mock and
+node tests get the English fallback); `overlay/errorMessages.ts` now routes
+through `t(...)` with today's strings as fallbacks (its totality/wording tests
+pass untouched). `public/_locales/en/messages.json` holds the manifest, command,
+error, region, and toast strings (Vite copies `public/` → `dist/_locales`; verified
+in the build, `web-ext lint` resolves every `__MSG_`).
+
+**Design choices flagged:** (1) no region caching/coalescing (identity would be
+the crop hash, never re-hit). (2) Stacked region overlays on repeat selection
+(accepted v1). (3) Hover-peek via geometric hit-test with zero pointer-events
+changes. (4) Bytes-over-message is Firefox-structured-clone-only (Chrome-port
+note in-source). (5) `pickTargetImage` tie-breaks on plain rect area, NOT the
+scanner's `scoreCandidate` (a bare `Rect` carries no viewport/centered metrics,
+and the tie is a near-impossible edge) — `scoreCandidate`'s "reserved" JSDoc was
+updated per the handoff's permission rather than forcing the scorer in. (6) A
+too-small crop surfaces as a `malformed`-kind result (badge text is generic; the
+carried message says "selection too small"). (7) The peek `mousemove` is attached
+unconditionally in `overlay.start()` and early-returns when no `done` overlay has
+painted bubbles (cheaper than add/remove churn per transition). (8) `withTimeout`
+was extracted to `content/withTimeout.ts` (shared by the viewport queue and the
+region controller). **Deferred (Phase 8, per the handoff):** screenshot-capture
+fallback for tainted-canvas/auth-walled images (P2), auto-translate of
+blob/canvas (fallback stays drag-select only), the popup/options static-string
+i18n migration (needs a `data-i18n` walker), endpoint-mode persistence, prefetch
+tuning/batching/scroll-away cancel, `data_collection_permissions`. The
+`startRegionSelect`/`togglePeekOriginal` content-router wiring in `index.ts` stays
+untested composition (like `translateAll`); the region selector + popup decision
++ command fan-out are all tested at their unit boundaries instead.
+
+**Manual verification (NOT executed here — needs a real browser + key):** the
+handoff's 7 steps are ready against `tests/fixtures/testpage.html` (served over
+http), which now includes a same-origin (untainted) `<canvas>` fixture for the
+bytes path: Alt+Shift+S / the popup button raises the crosshair; Esc and tiny
+click-drags cancel without a request; a real drag over a page shows the skeleton
+then bubbles ONLY inside the rect, aligned to the full image; scrolling mid-drag
+keeps the anchor glued to the artwork; a drag over the `<canvas>` translates with
+no background fetch (bytes path); hovering a bubble reveals the original and
+clicks still reach the page; Alt+Shift+O flips every bubble; a bad key raises
+exactly ONE toast whose button opens options; toggling off mid-selection clears
+the crosshair, toasts, and peek; `about:addons` shows all three localized
+shortcuts and the localized name/description.
+
+Tests: **59 new** (i18n 7; regionSelect 15 — rect math incl. inverted-drag,
+zoom-invariance, page-anchor-survives-scroll, target picking, source
+classification + acquisition plan; peek 12 — hit-test in/out/edge/nested +
+repaint-transition reducer; toast 4 — policy once-per-activation + independence +
+non-actionable skip; regionHandlers 6 — url/bytes happy paths, both/neither
+failure, too-small, cancellation via the shared registry, usage recorded, cache
+never called; imagePrep +5 `planRegionCrop`; prompt +2 region-suffix +
+byte-identical stability; providerBase +1 isRegion threading; viewportQueue +2
+onProviderError hook; settingsHandlers +2 command fan-out + openOptionsPage;
+popupLogic +2 regionSelectEnabled; constants +1 default_locale + command-drift),
+**413 total green**; typecheck + eslint + build + `web-ext lint` (0 errors /
+0 warnings; the lone `data_collection_permissions` notice stays Phase-8-deferred)
+all clean. Content bundle grew ~14 kB → ~28 kB (region select + peek + toast +
+i18n); background grew ~1 kB (regionHandlers).
+
+## Phase 7.1 summary (review fixes)
+
+A review of the Phase 7 drag-select / peek / toast implementation against
+`docs/PHASE-7-HANDOFF.md`, Architecture §7.2/§7.3, and real-input behavior found
+**no P1s** (the geometry, remap, caching-bypass, cancellation, and
+prompt-stability cores are all correct) — five follow-ups, all fixed, keeping the
+pure-core / thin-shell split. **No `shared/types.ts` or `shared/messages.ts`
+change** (both untouched, as the DoD expected); `PROMPT_VERSION` untouched.
+
+**(1) Region-select pointer state machine — cancel + identity guards
+(`content/regionSelect.ts`, P2).** Three "weird but real input" gaps in the
+marquee shell. (a) **No `pointercancel` handler → phantom selection**: if the
+browser cancelled the pointer mid-drag (touch scroll/pinch takeover, the OS
+stealing the pointer, capture loss), `pointerup` never arrived, `anchor` stayed
+set, the marquee then followed a button-less mouse, and the NEXT plain click
+finalized a selection the user thought was dead — an unintended paid request. Now
+handled exactly like Esc (full `teardown()`; the mode is one-shot anyway),
+WHY-noted because it is invisible in mouse-only testing. (b) **No primary/left
+check**: `onPointerDown` anchored on ANY button, so a right-button drag started a
+marquee under the native context menu — now `if (!e.isPrimary || e.button !== 0)
+return;`. (c) **No pointerId identity on move/up**: with multi-touch a second
+finger's `pointerup` (different `pointerId`) would finalize the FIRST finger's drag
+at the wrong coordinates — move/up now ignore events whose `pointerId` doesn't
+match the anchored one (reusing the id already stored for capture). The pure rect
+math is untouched.
+
+**(2) Stale hover-peek after toggling peek-all off
+(`content/overlay/OverlayManager.ts`, P3).** While `peekAll` is on, `processPeek`
+early-returns, so `peekHover` freezes at whatever bubble the pointer was over when
+peek-all engaged; toggling peek-all OFF then repainted every done entry consulting
+that frozen hover, leaving a bubble the pointer left long ago stuck on its original
+for a keyboard-only user until the next mousemove re-ran the hit-test.
+`togglePeekAll()` now resets `this.peekHover = null` (both directions, simplest),
+so the next real mousemove re-establishes a live hover; WHY-noted that hover state
+is unmaintained while peekAll is on.
+
+**(3) Region request timeout abandoned the background job
+(`content/regionSelect.ts`, P3).** On the 120 s `withTimeout` reject in
+`translateCrop`, the catch deleted the `requestId` and cleared the overlay but
+never cancelled — so a slow-but-alive event page kept running the provider call,
+and because a region result is NEVER cached that orphan run was pure wasted spend
+for a result nobody will render. The catch now fire-and-forgets
+`cancelTranslation({ requestId })` (same pattern as `stop()`; a truly-dead event
+page makes the unknown id a silent no-op per the existing contract).
+
+**(4) Overlay host created for an already-removed image
+(`content/overlay/OverlayManager.ts`, P3).** `ensure()` happily built a host for a
+candidate whose element had left the DOM — the realistic path being a region result
+rendering after the reader swapped/removed the image during the multi-second round
+trip, appending an invisible zero-size host to `<body>` that only the next
+scroll/resize sync reaps (never, if the page doesn't scroll). Guarded with
+`if (!candidate.el.isConnected) return null;` (all callers already tolerate null);
+matches `syncPositions`' disconnected⇒no-overlay convention and hardens the page
+path's render-vs-removal race for free.
+
+**(5) The handoff's item-7 router seam is now tested (tests).** The Phase 7 content
+router shipped as untested composition (PROGRESS self-flagged it). The handler-map
+construction is extracted from `content/index.ts` into a browser-free
+`content/contentRouter.ts` — `buildContentRouterHandlers({ getQueue,
+getRegionSelector, getOverlay })` — which now OWNS the inert-gate (the former
+standalone `startRegionSelection`, which had no other caller, is folded in) so its
+behavior is unit-testable without booting the whole content script (importing
+`index.ts` runs `bootstrap()` + drags in the polyfill). `index.ts` stays a
+composition root, passing getters over its module state. **Toast-reset pin — chose
+the test, not the comment fallback**: a jsdom `toastManager.test.ts` proves a FRESH
+`ToastManager` shows an auth toast again after a prior instance already did (the
+per-activation reset that the pure `toastPolicy` test only implied), plus
+dedupe-within-instance and `stop()` clearing the set.
+
+**Reviewed and accepted as-is (noted, not built):** region prep running outside the
+shared queue (human-paced drag gestures can't overwhelm decode); stacked-overlay
+hover precedence breaking at the first containing entry (cross-entry precedence
+accepted alongside v1 overlay stacking; smallest-wins still holds within an entry);
+`object-fit: contain/cover` divergence (a shared pre-Phase-5 limitation of the
+overlay renderer, not a Phase 7 regression); inner-container scroll mid-drag (WINDOW
+scroll is handled — the §8 case); notice toasts not policy-deduped (immediate
+per-gesture feedback by design, auto-dismiss 8 s); `defaultCollectTargets` dropping
+the scanner's natural-size floor (deliberate — canvas/blob targets can lack an
+intrinsic size, and a user-drawn rect is its own relevance signal); one
+`getBoundingClientRect` per done entry per mousemove frame (rAF-coalesced, no
+interleaved writes); and hover-peek repainting every region of the affected entry
+(transitions are rare relative to mousemove and the repaint is rAF-driven).
+
+**Manual verification — still outstanding (human step, NOT executed here).** The
+Phase 7 DoD's 7 manual-verification steps (PHASE-7-HANDOFF.md §"Manual
+verification") need a real Firefox, the built extension, and a live API key; they
+should run AFTER this phase lands (item 1 changes drag behavior) against
+`tests/fixtures/testpage.html` served over http, and the results recorded here when
+done. Not faked or skipped — status left accurate.
+
+Tests: **7 new** (contentRouter 4 — inert⇒`{started:false}`+selector-untouched,
+active⇒`{started:true}`+`start()`-called, togglePeekOriginal no-op-while-inert vs
+flip-while-active, translateAll count-0-while-inert vs forwarded-while-active;
+toastManager 3 — fresh-instance re-shows / within-instance dedupe / `stop()` reset),
+**420 total green**; the existing 413 stay green untouched; typecheck + eslint +
+`vite build` clean; `web-ext lint` 0 errors / 0 warnings (the lone
+`data_collection_permissions` notice stays Phase-8-deferred). No shell pointer/DOM
+harness was added for items 1–4 (house style: those surfaces stay untested behind
+WHY comments; a jsdom PointerEvent harness for item 1 would be contrived) — the
+suite staying green plus the WHY notes is the house-style bar there. Content bundle
+unchanged at ~28 kB (the factory extraction is size-neutral).

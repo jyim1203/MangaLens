@@ -18,9 +18,14 @@ import pkg from "../package.json";
  */
 const manifest: Record<string, unknown> = {
   manifest_version: 3,
-  name: "MangaLens",
+  // WHY __MSG_*__ + default_locale (Phase 7 i18n scaffolding): the store name and
+  // description are localized from public/_locales/<lang>/messages.json. `en` is
+  // the only bundled locale for now; the existing popup/options static strings
+  // stay literal (their data-i18n migration is Phase-8 deferred).
+  default_locale: "en",
+  name: "__MSG_extensionName__",
   version: pkg.version,
-  description: pkg.description,
+  description: "__MSG_extensionDescription__",
   background: {
     scripts: ["src/background/index.ts"],
   },
@@ -46,10 +51,21 @@ const manifest: Record<string, unknown> = {
   // scary "tabs" permission.
   permissions: ["storage", "activeTab"],
   optional_host_permissions: ["<all_urls>"],
+  // WHY only 3 commands: Firefox has no 4-command ceiling (Chrome does), but we
+  // stay lean. Descriptions are localized (__MSG_*__). Command ids mirror the
+  // CMD_* constants in shared/constants.ts (constants.test.ts guards the drift).
   commands: {
     "toggle-mangalens": {
       suggested_key: { default: "Alt+Shift+M" },
-      description: "Toggle MangaLens on/off",
+      description: "__MSG_commandToggleDescription__",
+    },
+    "select-region": {
+      suggested_key: { default: "Alt+Shift+S" },
+      description: "__MSG_commandSelectRegionDescription__",
+    },
+    "peek-original": {
+      suggested_key: { default: "Alt+Shift+O" },
+      description: "__MSG_commandPeekOriginalDescription__",
     },
   },
   browser_specific_settings: {

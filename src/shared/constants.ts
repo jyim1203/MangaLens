@@ -62,6 +62,12 @@ export const PROVIDER_LABELS: Record<ProviderId, string> = {
 /** Keyboard command id from manifest.json — keep in sync with src/manifest.ts. */
 export const CMD_TOGGLE = "toggle-mangalens";
 
+/** Drag-select command id (F10, Phase 7) — keep in sync with src/manifest.ts. */
+export const CMD_SELECT_REGION = "select-region";
+
+/** Peek-original toggle command id (F14, Phase 7) — keep in sync with src/manifest.ts. */
+export const CMD_PEEK_ORIGINAL = "peek-original";
+
 /**
  * The attribute the {@link import("../content/overlay/OverlayManager").OverlayManager}
  * stamps on every overlay HOST element. Lives here (dependency-free) so the

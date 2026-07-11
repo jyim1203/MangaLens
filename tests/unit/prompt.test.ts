@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  REGION_SUFFIX,
   buildPromptContext,
   buildSystemPrompt,
   buildUserText,
@@ -72,6 +73,20 @@ describe("prompt — buildUserText", () => {
   it("appends the repair nudge on the retry pass", () => {
     const text = buildUserText(buildPromptContext(settings()), { repair: true });
     expect(text).toContain("not valid JSON");
+  });
+
+  it("appends the §4.3 region suffix for a drag-select crop (F10)", () => {
+    const text = buildUserText(buildPromptContext(settings()), { region: true });
+    expect(text).toContain(REGION_SUFFIX);
+    expect(text.startsWith("Translate this page to English.")).toBe(true);
+  });
+
+  it("region:false is byte-identical to no options (PROMPT_VERSION stability)", () => {
+    const ctx = buildPromptContext(settings({ sourceLangHint: "ja" }));
+    // The whole point: the Phase-7 addition must not change the cached-page
+    // prompt at all, so the version stays 1 and cached translations stay valid.
+    expect(buildUserText(ctx, { region: false })).toBe(buildUserText(ctx));
+    expect(buildUserText(ctx, {})).toBe(buildUserText(ctx));
   });
 });
 

@@ -386,6 +386,86 @@ export function planPrep(
   };
 }
 
+// --- Region crop (F10 drag-select, §7.3) -----------------------------------
+
+/** Below this many source px on a side, a crop is too small to translate usefully. */
+export const MIN_CROP_PX = 16;
+
+/** The integer source rect + capped output dims for one drag-select crop. */
+export interface RegionCropPlan {
+  /** Source rectangle in the ORIGINAL image, integer px, clamped to bounds. */
+  sx: number;
+  sy: number;
+  sw: number;
+  sh: number;
+  /** Output (downscaled) dimensions, long edge ≤ `maxEdgePx`, never upscaled. */
+  outWidthPx: number;
+  outHeightPx: number;
+}
+
+/**
+ * Plan the crop for a drag-select region (F10). Converts the normalized crop to
+ * an integer source rect clamped to the image, and long-edge-caps the output at
+ * `maxEdgePx` without upscaling. Unlike {@link planPrep} there is NO tiling — a
+ * user selection is one region by construction; an extreme-aspect crop just
+ * takes the long-edge cap.
+ *
+ * @param naturalWidthPx decoded image width in px.
+ * @param naturalHeightPx decoded image height in px.
+ * @param crop normalized crop (0–1) in full-image space.
+ * @param maxEdgePx cap on the output long edge (settings.maxImageEdgePx).
+ * @returns the crop plan, or null when the crop is degenerate or smaller than
+ *   {@link MIN_CROP_PX} on a side after clamping (caller fails soft with a
+ *   "selection too small" message).
+ */
+export function planRegionCrop(
+  naturalWidthPx: number,
+  naturalHeightPx: number,
+  crop: BBox,
+  maxEdgePx: number,
+): RegionCropPlan | null {
+  if (
+    !Number.isFinite(naturalWidthPx) ||
+    !Number.isFinite(naturalHeightPx) ||
+    naturalWidthPx <= 0 ||
+    naturalHeightPx <= 0
+  ) {
+    return null;
+  }
+
+  // Clamp the crop fractions to [0,1] first, then to integer pixel bounds so the
+  // source rect never reaches past the image (a slightly-out-of-range drag from
+  // rounding/zoom can't overrun the bitmap).
+  const x = clampFraction(crop.x);
+  const y = clampFraction(crop.y);
+  const w = clampFraction(crop.w);
+  const h = clampFraction(crop.h);
+
+  let sx = Math.round(x * naturalWidthPx);
+  let sy = Math.round(y * naturalHeightPx);
+  let sw = Math.round(w * naturalWidthPx);
+  let sh = Math.round(h * naturalHeightPx);
+  sx = Math.min(Math.max(0, sx), naturalWidthPx - 1);
+  sy = Math.min(Math.max(0, sy), naturalHeightPx - 1);
+  sw = Math.min(sw, naturalWidthPx - sx);
+  sh = Math.min(sh, naturalHeightPx - sy);
+
+  if (sw < MIN_CROP_PX || sh < MIN_CROP_PX) return null;
+
+  const longEdge = Math.max(sw, sh);
+  const scale = maxEdgePx > 0 && longEdge > maxEdgePx ? maxEdgePx / longEdge : 1;
+  const outWidthPx = Math.max(1, Math.round(sw * scale));
+  const outHeightPx = Math.max(1, Math.round(sh * scale));
+
+  return { sx, sy, sw, sh, outWidthPx, outHeightPx };
+}
+
+/** Clamp a value to [0, 1]; non-finite → 0. */
+function clampFraction(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(1, Math.max(0, value));
+}
+
 // --- Browser-only layer (canvas driver) ------------------------------------
 // Everything below needs a real OffscreenCanvas + createImageBitmap and so runs
 // only in the event page, not in unit tests. It is a thin shell over the pure
@@ -517,6 +597,92 @@ export async function prepareImage(
     };
   } finally {
     // Release decoded pixels promptly — event-page memory is precious.
+    bitmap.close();
+  }
+}
+
+/** Options for {@link prepareRegionCrop}. */
+export interface RegionCropOptions {
+  /** Cap on the output long edge (settings.maxImageEdgePx). */
+  maxEdgePx: number;
+  /** JPEG quality 0–1 (settings.jpegQuality). */
+  jpegQuality: number;
+}
+
+/** A ready-to-send crop plus the exact region it covers in full-image space. */
+export interface PreparedRegion {
+  /** JPEG-encoded, downscaled crop bytes — ready for a region {@link import("../shared/types").TranslateJob}. */
+  blob: Blob;
+  /**
+   * The crop's ACTUAL position in the full ORIGINAL image, normalized — set as
+   * the job's `tileOffset` so {@link remapBboxFromTile} lifts crop-local bboxes
+   * back to full-image space (a crop is geometrically a tile). Derived from the
+   * integer source rect, so it reflects any pixel-clamping {@link planRegionCrop}
+   * applied rather than the raw requested crop.
+   */
+  offset: BBox;
+  widthPx: number;
+  heightPx: number;
+}
+
+/**
+ * Decode, crop, downscale, and JPEG-encode one drag-select region into
+ * ready-to-send bytes (F10, §7.3). Browser-only (uses `createImageBitmap`/
+ * `OffscreenCanvas`); all geometry lives in the pure {@link planRegionCrop}.
+ *
+ * @param blob the full source image bytes.
+ * @param crop normalized crop (0–1) in full-image space.
+ * @param options long-edge cap + JPEG quality.
+ * @returns the prepared crop, or null when the crop is too small to translate
+ *   (propagates {@link planRegionCrop}'s null).
+ * @throws if the bytes can't be decoded (propagates `createImageBitmap` errors).
+ */
+export async function prepareRegionCrop(
+  blob: Blob,
+  crop: BBox,
+  options: RegionCropOptions,
+): Promise<PreparedRegion | null> {
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const plan = planRegionCrop(bitmap.width, bitmap.height, crop, options.maxEdgePx);
+    if (!plan) return null;
+
+    const canvas = new OffscreenCanvas(plan.outWidthPx, plan.outHeightPx);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Could not get 2D context for region crop");
+    // WHY white underlay: JPEG has no alpha, so transparent pixels would encode
+    // black and drown the text (Phase 2.1's rule); white matches paper.
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, plan.outWidthPx, plan.outHeightPx);
+    // One source-rect draw: crop and downscale in a single step.
+    ctx.drawImage(
+      bitmap,
+      plan.sx,
+      plan.sy,
+      plan.sw,
+      plan.sh,
+      0,
+      0,
+      plan.outWidthPx,
+      plan.outHeightPx,
+    );
+    const quality = Number.isFinite(options.jpegQuality)
+      ? Math.min(1, Math.max(0, options.jpegQuality))
+      : undefined;
+    const outBlob = await canvas.convertToBlob({ type: OUTPUT_MIME, quality });
+
+    return {
+      blob: outBlob,
+      offset: {
+        x: plan.sx / bitmap.width,
+        y: plan.sy / bitmap.height,
+        w: plan.sw / bitmap.width,
+        h: plan.sh / bitmap.height,
+      },
+      widthPx: plan.outWidthPx,
+      heightPx: plan.outHeightPx,
+    };
+  } finally {
     bitmap.close();
   }
 }

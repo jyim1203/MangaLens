@@ -119,6 +119,20 @@
         opacity: 0.5;
         cursor: default;
       }
+      button.secondary {
+        width: 100%;
+        margin-top: 6px;
+        padding: 6px 10px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--bg);
+        color: var(--fg);
+        font-weight: 500;
+      }
+      button.secondary:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
       button.link {
         border: none;
         background: none;
@@ -225,6 +239,7 @@
     </section>
 
     <button id="translate-all" class="primary">Translate all pages</button>
+    <button id="select-region" class="secondary" title="Drag-select a region to translate (Alt+Shift+S)">Select region…</button>
     <p id="action-status" class="hint"></p>
 
     <footer>

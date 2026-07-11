@@ -556,11 +556,13 @@ export abstract class ProviderBase implements Translator {
       mode: "json_schema",
     };
 
-    // Primary attempt.
+    // Primary attempt. `region` appends the PROMPTS.md §4.3 suffix for
+    // drag-select crops (F10) and is a no-op (byte-identical output) otherwise.
+    const region = job.isRegion === true;
     const output = await this.callAndExtract(
       {
         ...baseCtx,
-        userText: buildUserText(promptCtx),
+        userText: buildUserText(promptCtx, { region }),
         temperature: settings.temperature,
       },
       signal,
@@ -578,7 +580,7 @@ export abstract class ProviderBase implements Translator {
         const repaired = await this.callAndExtract(
           {
             ...baseCtx,
-            userText: buildUserText(promptCtx, { repair: true }),
+            userText: buildUserText(promptCtx, { repair: true, region }),
             temperature: 0,
           },
           signal,

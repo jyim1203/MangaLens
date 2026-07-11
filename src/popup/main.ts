@@ -27,6 +27,7 @@ import {
   hostnameFromUrl,
   needsApiKey,
   planTranslateAll,
+  regionSelectEnabled,
   siteChoice,
   siteChoicePatch,
   statusLine,
@@ -56,6 +57,7 @@ const els = {
   provider: must<HTMLSelectElement>("provider"),
   model: must<HTMLInputElement>("model"),
   translateAll: must<HTMLButtonElement>("translate-all"),
+  selectRegion: must<HTMLButtonElement>("select-region"),
   actionStatus: must<HTMLParagraphElement>("action-status"),
   cost: must<HTMLSpanElement>("cost"),
   openOptions: must<HTMLButtonElement>("open-options"),
@@ -137,6 +139,11 @@ function render(settings: Settings): void {
   els.translateAll.title = active
     ? "Queue every detected image on this page"
     : "Enable MangaLens on this page first";
+
+  els.selectRegion.disabled = !regionSelectEnabled(settings, tabHost);
+  els.selectRegion.title = active
+    ? "Drag-select a region to translate (Alt+Shift+S)"
+    : "Enable MangaLens on this page first";
 }
 
 /** Re-check the optional <all_urls> grant and toggle its banner (§7.3). */
@@ -203,6 +210,27 @@ async function onTranslateAllClick(): Promise<void> {
   }
 }
 
+/**
+ * Enter drag-select mode on the active tab, then close the popup so it isn't
+ * covering the page during the drag (item 7). If the content script reports it
+ * didn't start (site disabled / extension off), keep the popup open and surface a
+ * hint instead of closing on nothing.
+ */
+async function onSelectRegionClick(): Promise<void> {
+  if (tabId === undefined) return;
+  try {
+    const { started } = await sendToTab(tabId, "startRegionSelect");
+    if (started) {
+      window.close();
+    } else {
+      els.actionStatus.textContent = "Enable MangaLens on this page first.";
+    }
+  } catch (err) {
+    log.warn("startRegionSelect failed", err);
+    els.actionStatus.textContent = "Couldn't reach this page — reload it and try again.";
+  }
+}
+
 function wireEvents(): void {
   els.enabled.addEventListener("change", () => {
     void sendToBackground("toggleEnabled")
@@ -242,6 +270,8 @@ function wireEvents(): void {
   });
 
   els.translateAll.addEventListener("click", () => void onTranslateAllClick());
+
+  els.selectRegion.addEventListener("click", () => void onSelectRegionClick());
 
   els.grantPerm.addEventListener("click", () => {
     // permissions.request MUST run in a user-input handler (§7.3 in-flow grant).

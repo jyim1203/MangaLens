@@ -250,6 +250,16 @@ export function buildSystemPrompt(ctx: PromptContext): string {
   });
 }
 
+/**
+ * The drag-select region suffix (PROMPTS.md §4.3), appended verbatim to the
+ * user message when a job is a user-drawn crop (F10). Do not reflow — like the
+ * rest of the prompt it is load-bearing. WHY it need NOT bump PROMPT_VERSION:
+ * it only ever appears on region jobs, which are never cached, so no stored page
+ * translation's cache key is affected (see {@link import("../../shared/types").TranslateJob.isRegion}).
+ */
+export const REGION_SUFFIX =
+  "This is a cropped region of a comic page selected by the user. It may contain one or several text regions, or text that is not inside a bubble. Transcribe and translate everything legible.";
+
 /** Options for {@link buildUserText}. */
 export interface UserTextOptions {
   /**
@@ -257,16 +267,22 @@ export interface UserTextOptions {
    * previous output was invalid JSON. Used after a parse/validate failure.
    */
   repair?: boolean;
+  /**
+   * Drag-select crop (F10): appends the PROMPTS.md §4.3 {@link REGION_SUFFIX}.
+   * When false/absent the output is byte-identical to the pre-Phase-7 single-page
+   * message (the PROMPT_VERSION-stability guarantee — pinned in tests).
+   */
+  region?: boolean;
 }
 
 /**
  * Build the single-page user message (PROMPTS.md §4.1). A `{{source_hint}}` is
- * added only when the source language is pinned; the repair suffix is added on
- * the retry pass.
+ * added only when the source language is pinned; the region suffix (§4.3) is
+ * added for drag-select crops; the repair suffix is added on the retry pass.
  *
- * NOTE: multi-page batch (§4.2) and drag-select (§4.3) variants are deferred
- * with their features (F12 / F10) — the {@link import("../../shared/types").Translator}
- * interface is one-image-per-call, so batching is a queue-layer concern.
+ * NOTE: multi-page batch (§4.2) is deferred with F12 — the
+ * {@link import("../../shared/types").Translator} interface is one-image-per-call,
+ * so batching is a queue-layer concern.
  */
 export function buildUserText(
   ctx: PromptContext,
@@ -276,6 +292,9 @@ export function buildUserText(
     ? `The source language is ${ctx.sourceLangName}.`
     : "";
   let text = `Translate this page to ${ctx.targetLangName}. ${sourceHint}`.trim();
+  if (options.region) {
+    text += `\n${REGION_SUFFIX}`;
+  }
   if (options.repair) {
     text +=
       "\nYour previous output was not valid JSON. Return only the JSON object.";

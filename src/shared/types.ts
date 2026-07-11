@@ -131,6 +131,15 @@ export interface TranslateJob {
   sourceLangHint?: string;
   /** Scheduling priority: 0 = visible now, 1 = near viewport, 2 = prefetch/all (§7.5). */
   priority: number;
+  /**
+   * True when this job is a user-drawn drag-select crop (F10), not an
+   * auto-detected page/tile. The prompt layer appends the PROMPTS.md §4.3
+   * region suffix ("This is a cropped region…") when set. Added in Phase 7 (the
+   * one pre-authorized handoff-rule-4 contract change). Does NOT bump
+   * PROMPT_VERSION: the shared page-prompt strings are untouched, so cached page
+   * translations stay valid; the suffix only exists on never-cached region jobs.
+   */
+  isRegion?: boolean;
 }
 
 /**

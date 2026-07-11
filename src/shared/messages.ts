@@ -18,6 +18,7 @@ import browser from "webextension-polyfill";
 import { createLogger } from "./log";
 import type { Settings, SettingsPatch } from "./settings";
 import type {
+  BBox,
   PageTranslation,
   ProviderErrorKind,
   ProviderId,
@@ -62,6 +63,34 @@ export interface TranslatePageRequest {
 export type TranslatePageResult =
   | { ok: true; page: PageTranslation }
   | { ok: false; errorKind: ProviderErrorKind; message: string };
+
+/**
+ * Content-script request to translate a user-drawn crop of an image (F10
+ * drag-select, Phase 7). Exactly one of {@link imageUrl} / {@link imageBytes}
+ * is present: `http(s)`/`data:` sources send the URL (the background fetches,
+ * reusing the HTTP cache, §7.3); `blob:`/`<canvas>` sources are read
+ * content-side (only the page's own origin can) and their bytes shipped over
+ * the structured-clone message boundary.
+ */
+export interface TranslateRegionRequest {
+  /** `http(s)`/`data:` source URL — the background fetches it. */
+  imageUrl?: string;
+  /**
+   * Raw image bytes for `blob:`/`<canvas>` sources the background cannot fetch.
+   * WHY safe: Firefox `runtime.sendMessage` uses structured clone, so an
+   * ArrayBuffer crosses intact. Firefox-only-safe — a future Chrome port (JSON
+   * message passing) would need base64 here.
+   */
+  imageBytes?: ArrayBuffer;
+  /** MIME of {@link imageBytes}; required with it. */
+  imageMime?: string;
+  /** The crop, normalized 0–1 in FULL-image space (treated as a tile offset). */
+  crop: BBox;
+  /** Overrides the settings target language when set. */
+  targetLang?: string;
+  /** Content-generated id, shared cancellation contract with {@link TranslatePageRequest}. */
+  requestId?: string;
+}
 
 /**
  * The complete set of messages and their request/response shapes. Add a new
@@ -127,6 +156,40 @@ export interface MessageMap {
     request: { dryRun?: boolean };
     response: { count: number };
   };
+
+  /**
+   * Translate one drag-select crop (F10, Phase 7). Reuses
+   * {@link TranslatePageResult} — it never rejects (fail soft, rule 6) and
+   * carries the §6 error-kind across the boundary as data. Region results are
+   * NOT cached (two hand-drawn rects are never pixel-identical), so this bypasses
+   * the cache entirely; the crop is treated as a tile so the existing
+   * `tileOffset` remap lifts crop-local bboxes back to full-image space.
+   */
+  translateRegion: {
+    request: TranslateRegionRequest;
+    response: TranslatePageResult;
+  };
+
+  /**
+   * Background command fan-out → content: enter drag-select mode (F10). Replies
+   * `{ started: false }` when MangaLens is inert on this tab (the passive
+   * bootstrap router is registered even while inactive — same inert-safety as
+   * {@link translateAll}); `{ started: true }` when selection mode was entered.
+   */
+  startRegionSelect: { request: void; response: { started: boolean } };
+
+  /**
+   * Background command fan-out → content: flip "peek original" on every done
+   * overlay (F14 toggle-all). No-op while inert.
+   */
+  togglePeekOriginal: { request: void; response: void };
+
+  /**
+   * Content → background: open the options page (F14/error-toast "Open
+   * settings" action). WHY a message: content scripts cannot call
+   * `runtime.openOptionsPage()` — only an extension page can.
+   */
+  openOptionsPage: { request: void; response: void };
 }
 
 /** Every valid message `type`. */

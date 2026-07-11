@@ -18,10 +18,11 @@ import { OVERLAY_HOST_ATTR } from "../../shared/constants";
 import type { Settings } from "../../shared/settings";
 import type { PageTranslation } from "../../shared/types";
 import type { Candidate } from "../scanner";
-import { displayedSizeChanged, regionToPx, type Size } from "./geometry";
+import { displayedSizeChanged, regionToPx, type PxRect, type Size } from "./geometry";
 import { filterRegions } from "./regionFilter";
 import { errorKindToMessage } from "./errorMessages";
 import { createShadowMeasurer, renderBubbleBox } from "./BubbleBox";
+import { hitTestRegion, peekRepaintTargets, type PeekHover } from "./peek";
 import type { ProviderErrorKind } from "../../shared/types";
 
 const log = createLogger("overlay");
@@ -53,6 +54,11 @@ interface OverlayEntry {
    *  (window/zoom/re-flow) can re-run layout only when it actually changed
    *  (item 1). Undefined until the entry has been painted at least once. */
   lastPaintedSize?: Size;
+  /** Overlay-local pixel rects of the regions drawn at the last paint (post-filter),
+   *  in draw order, for peek hover hit-testing (F14). Rebuilt each paint; a peek
+   *  index is into THIS array, and paint() re-derives the same order deterministically
+   *  (filterRegions is pure), so hit-test and repaint stay aligned. */
+  paintedRects?: PxRect[];
 }
 
 /**
@@ -70,6 +76,22 @@ export class OverlayManager {
   /** rAF coalescing state for position syncs (item 1). */
   private syncScheduled = false;
   private rafHandle: number | undefined;
+
+  /** Peek-original (F14) state. `peekAll` (hotkey/command) shows every bubble's
+   *  original; `peekHover` shows just the hovered one; peekAll dominates. */
+  private peekAll = false;
+  private peekHover: PeekHover | null = null;
+  private lastMouse: { x: number; y: number } | undefined;
+  private peekScheduled = false;
+  private peekRafHandle: number | undefined;
+
+  // rAF-coalesced peek hover: mousemove fires constantly, so mark dirty and
+  // hit-test once per frame (like the position sync), repainting only on an
+  // enter/leave transition (peekRepaintTargets).
+  private readonly onMouseMove = (e: MouseEvent): void => {
+    this.lastMouse = { x: e.clientX, y: e.clientY };
+    this.schedulePeek();
+  };
 
   // WHY coalesce through one rAF: the capture-phase scroll listener and every
   // per-image ResizeObserver would otherwise do a getBoundingClientRect + style
@@ -94,6 +116,12 @@ export class OverlayManager {
       capture: true,
     });
     window.addEventListener("resize", this.onScrollOrResize, { passive: true });
+    // One document-level passive mousemove drives hover-peek (F14). WHY attach
+    // unconditionally rather than only "while ≥1 done overlay exists": the
+    // handler early-returns when no done entry has painted bubbles, so the extra
+    // state of add/removing the listener per transition isn't worth it. No
+    // pointer-events change anywhere — peek is purely geometric hit-testing (§7.2).
+    window.addEventListener("mousemove", this.onMouseMove, { passive: true });
   }
 
   /** Show the pending skeleton for a candidate (creating its host if needed). */
@@ -172,6 +200,87 @@ export class OverlayManager {
     }
   }
 
+  /**
+   * Toggle "peek original" on every done overlay (F14 hotkey / `peek-original`
+   * command → `togglePeekOriginal` message). Flips the global flag and repaints
+   * every done entry so each bubble swaps to its source text (and back).
+   */
+  togglePeekAll(): void {
+    this.peekAll = !this.peekAll;
+    // WHY reset the hover here: hover state is UNMAINTAINED while peekAll is on
+    // (processPeek early-returns, so peekHover is frozen at whatever bubble the
+    // pointer was over when peek-all engaged). Toggling peek-all OFF then repaints
+    // every done entry consulting that STALE hover — a bubble the pointer left long
+    // ago would stay stuck showing its original for a keyboard-only user until the
+    // next mousemove happens to re-run the hit-test. Clearing it (both directions is
+    // simplest) lets the next real mousemove re-establish a live hover.
+    this.peekHover = null;
+    for (const entry of this.entries.values()) {
+      if (entry.state === "done" && entry.page) this.paint(entry);
+    }
+  }
+
+  /** Whether a region should render its ORIGINAL text for the given entry (F14). */
+  private shouldPeek(entryId: string, regionIndex: number): boolean {
+    if (this.peekAll) return true;
+    return (
+      this.peekHover !== null &&
+      this.peekHover.entryId === entryId &&
+      this.peekHover.regionIndex === regionIndex
+    );
+  }
+
+  /** Mark the hover peek dirty; hit-test once on the next frame. */
+  private schedulePeek(): void {
+    if (this.peekScheduled) return;
+    this.peekScheduled = true;
+    if (typeof requestAnimationFrame === "function") {
+      this.peekRafHandle = requestAnimationFrame(() => {
+        this.peekRafHandle = undefined;
+        this.peekScheduled = false;
+        this.processPeek();
+      });
+    } else {
+      this.peekScheduled = false;
+      this.processPeek();
+    }
+  }
+
+  /**
+   * Hit-test the last pointer position against every done overlay's painted
+   * bubbles and repaint only the entries whose hovered bubble changed
+   * ({@link peekRepaintTargets}). A no-op while `peekAll` is on (everything is
+   * already showing its original) or when the pointer is over no bubble and
+   * wasn't before.
+   */
+  private processPeek(): void {
+    if (this.peekAll) return; // toggle-all wins; hover would just fight it
+    const pt = this.lastMouse;
+    if (!pt) return;
+
+    let hover: PeekHover | null = null;
+    for (const entry of this.entries.values()) {
+      if (entry.state !== "done" || !entry.paintedRects?.length) continue;
+      const rect = entry.candidate.el.getBoundingClientRect();
+      const local = { x: pt.x - rect.left, y: pt.y - rect.top };
+      if (local.x < 0 || local.y < 0 || local.x > rect.width || local.y > rect.height) {
+        continue;
+      }
+      const idx = hitTestRegion(local, entry.paintedRects);
+      if (idx !== null) {
+        hover = { entryId: entry.candidate.id, regionIndex: idx };
+        break;
+      }
+    }
+
+    const targets = peekRepaintTargets(this.peekHover, hover);
+    this.peekHover = hover;
+    for (const id of targets) {
+      const entry = this.entries.get(id);
+      if (entry && entry.state === "done" && entry.page) this.paint(entry);
+    }
+  }
+
   /** Mark positions dirty and flush once on the next animation frame (item 1). */
   private scheduleSync(): void {
     if (this.syncScheduled) return;
@@ -211,14 +320,27 @@ export class OverlayManager {
     if (this.rafHandle !== undefined && typeof cancelAnimationFrame === "function") {
       cancelAnimationFrame(this.rafHandle);
     }
+    if (
+      this.peekRafHandle !== undefined &&
+      typeof cancelAnimationFrame === "function"
+    ) {
+      cancelAnimationFrame(this.peekRafHandle);
+    }
     this.rafHandle = undefined;
+    this.peekRafHandle = undefined;
     this.syncScheduled = false;
+    this.peekScheduled = false;
+    // Reset peek so a re-activate starts clean (handoff item 6 / deactivate resets).
+    this.peekAll = false;
+    this.peekHover = null;
+    this.lastMouse = undefined;
     for (const id of [...this.entries.keys()]) this.teardownEntry(id);
     if (this.started) {
       window.removeEventListener("scroll", this.onScrollOrResize, {
         capture: true,
       } as EventListenerOptions);
       window.removeEventListener("resize", this.onScrollOrResize);
+      window.removeEventListener("mousemove", this.onMouseMove);
       this.started = false;
     }
   }
@@ -229,6 +351,14 @@ export class OverlayManager {
   private ensure(candidate: Candidate): OverlayEntry | null {
     const existing = this.entries.get(candidate.id);
     if (existing) return existing;
+    // WHY bail on a disconnected element: a region result (or the page path's narrow
+    // render-vs-removal race) can arrive after the reader swapped/removed the image
+    // during the multi-second provider round trip. Creating a host for it would append
+    // an invisible zero-size node to <body> that only the NEXT scroll/resize position
+    // sync reaps — never, if the page doesn't scroll, so it lingers until deactivate.
+    // Matches syncPositions' convention (disconnected ⇒ no overlay); all callers
+    // already tolerate a null return.
+    if (!candidate.el.isConnected) return null;
     try {
       const host = document.createElement("div");
       // Marker the scanner uses to skip our own hosts' style mutations (item 4).
@@ -316,15 +446,26 @@ export class OverlayManager {
     entry.lastPaintedSize = { w: displayedW, h: displayedH };
     const makeMeasure = createShadowMeasurer(entry.measureEl, this.settings.font);
 
+    // Record the painted rects so a peek hover hit-tests and indexes the SAME
+    // regions it will repaint (F14). The peek index is the PAINTED index (not the
+    // raw region index) so a skipped region can't desync hit-test vs. repaint.
+    const paintedRects: PxRect[] = [];
+
     for (const region of regions) {
       try {
         const px = regionToPx(region.bbox, displayedW, displayedH);
-        const box = renderBubbleBox(region, px, this.settings.font, makeMeasure);
+        const peek = this.shouldPeek(entry.candidate.id, paintedRects.length);
+        const box = renderBubbleBox(region, px, this.settings.font, makeMeasure, {
+          peek,
+        });
         entry.container.appendChild(box);
+        paintedRects.push(px);
       } catch (err) {
         log.warn("failed to render region (skipping)", err);
       }
     }
+
+    entry.paintedRects = paintedRects;
   }
 
   /** Position an entry's host over its image (rect + page scroll offset, §7.2). */

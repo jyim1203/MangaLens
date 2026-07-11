@@ -3,8 +3,9 @@
  * is a thin DOM shell: it builds a positioned box (rounded-rect fill + centered,
  * auto-fitted text) and delegates the only real decision — the font size — to the
  * pure {@link resolveFontSize}. Horizontal text regardless of source direction
- * (§7.7 normal case). `pointer-events: none` throughout (no interactive bits this
- * phase — F14 peek-original is Phase 7).
+ * (§7.7 normal case). `pointer-events: none` throughout — F14 peek-original swaps
+ * the text via a REPAINT (see {@link RenderBubbleOptions.peek}), not interactivity,
+ * so page-forward-on-click still reaches the reader (§7.2).
  *
  * WHY a separate fill layer instead of an rgba background: it renders the fill
  * opacity without fading the text and without parsing arbitrary CSS colors —
@@ -60,13 +61,25 @@ export function createShadowMeasurer(
     };
 }
 
+/** Options for {@link renderBubbleBox}. */
+export interface RenderBubbleOptions {
+  /**
+   * Peek-original (F14): show `region.original` instead of `region.translated`,
+   * with a dashed outline cue so users know it's the source text. WHY a repaint
+   * (this whole function) rather than a `textContent` swap: the original is often
+   * CJK and fits differently, so textFit must re-run or it overflows.
+   */
+  peek?: boolean;
+}
+
 /**
  * Render one region as a positioned overlay box.
  *
- * @param region the region to draw (its `translated` text is shown).
+ * @param region the region to draw.
  * @param rect overlay-local pixel rect from {@link regionToPx}.
  * @param font user font settings (family/color/stroke/fill).
  * @param makeMeasure a factory from {@link createShadowMeasurer} for auto-fit.
+ * @param options peek toggle (F14); defaults to showing the translation.
  * @returns the box element (caller appends it to the overlay container).
  */
 export function renderBubbleBox(
@@ -74,6 +87,7 @@ export function renderBubbleBox(
   rect: PxRect,
   font: FontSettings,
   makeMeasure: (boxW: number) => Measure,
+  options: RenderBubbleOptions = {},
 ): HTMLElement {
   const box = document.createElement("div");
   box.className = "mangalens-bubble";
@@ -90,6 +104,11 @@ export function renderBubbleBox(
     justifyContent: "center",
     pointerEvents: "none",
   } satisfies Partial<CSSStyleDeclaration>);
+  if (options.peek) {
+    // Dashed outline cue (outline doesn't affect layout, unlike border).
+    box.style.outline = "2px dashed rgba(80, 80, 80, 0.9)";
+    box.style.outlineOffset = "-2px";
+  }
 
   // Fill layer: separate node so opacity doesn't touch the text.
   const fill = document.createElement("div");
@@ -103,7 +122,7 @@ export function renderBubbleBox(
   } satisfies Partial<CSSStyleDeclaration>);
   box.appendChild(fill);
 
-  const text = region.translated;
+  const text = options.peek ? region.original : region.translated;
   const innerW = rect.width * (1 - 2 * PADDING_RATIO);
   const innerH = rect.height * (1 - 2 * PADDING_RATIO);
   const px = resolveFontSize(font, text, innerW, innerH, makeMeasure(innerW));

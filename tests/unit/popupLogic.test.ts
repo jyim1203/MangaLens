@@ -15,6 +15,7 @@ import {
   hostnameFromUrl,
   needsApiKey,
   planTranslateAll,
+  regionSelectEnabled,
   siteChoice,
   siteChoicePatch,
   statusLine,
@@ -72,6 +73,21 @@ describe("popupLogic — statusLine", () => {
     expect(
       statusLine(settings({ perSiteOverrides: { "a.com": false }, enabled: true }), "a.com"),
     ).toMatch(/site rule/i);
+  });
+});
+
+describe("popupLogic — regionSelectEnabled (Phase 7)", () => {
+  it("is enabled only when MangaLens is effectively active on the page", () => {
+    expect(regionSelectEnabled(settings({ enabled: true }), "a.com")).toBe(true);
+    expect(regionSelectEnabled(settings({ enabled: false }), "a.com")).toBe(false);
+    // A per-site override wins over the global flag (same gate as translate-all).
+    expect(
+      regionSelectEnabled(settings({ enabled: false, perSiteOverrides: { "a.com": true } }), "a.com"),
+    ).toBe(true);
+  });
+
+  it("is disabled on non-web pages (no hostname)", () => {
+    expect(regionSelectEnabled(settings({ enabled: true }), undefined)).toBe(false);
   });
 });
 

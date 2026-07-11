@@ -15,6 +15,7 @@ import {
 } from "../../src/content/viewportQueue";
 import { sendToBackground } from "../../src/shared/messages";
 import type { Candidate } from "../../src/content/scanner";
+import type { ProviderErrorKind } from "../../src/shared/types";
 
 const mockSend = vi.mocked(sendToBackground);
 
@@ -188,6 +189,53 @@ describe("viewportQueue — requestAll (F8 translate-all)", () => {
     expect(queue.requestAll()).toBe(0);
     expect(mockSend).toHaveBeenCalledTimes(2);
 
+    queue.stop();
+  });
+});
+
+describe("viewportQueue — onProviderError toast hook (Phase 7 item 6)", () => {
+  beforeEach(() => {
+    FakeIO.instances = [];
+    mockSend.mockReset();
+  });
+
+  function makeQueue(overlay: OverlaySink, onProviderError: (k: ProviderErrorKind) => void) {
+    return createViewportQueue({
+      overlay,
+      prefetchAhead: 0,
+      makeRequestId: () => "rq",
+      onProviderError,
+      createObserver: (cb, options) =>
+        new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+  }
+
+  it("fires on a badge-rendered error (auth) alongside setError", async () => {
+    mockSend.mockResolvedValue({ ok: false, errorKind: "auth", message: "bad key" });
+    const overlay = fakeOverlay();
+    const onErr = vi.fn();
+    const queue = makeQueue(overlay, onErr);
+
+    queue.register(CAND);
+    FakeIO.instances[0]!.fire(CAND.el, true);
+    await tick();
+
+    expect(overlay.setError).toHaveBeenCalledWith(CAND, "auth");
+    expect(onErr).toHaveBeenCalledWith("auth");
+    queue.stop();
+  });
+
+  it("does NOT fire for an aborted result (silent, no toast)", async () => {
+    mockSend.mockResolvedValue({ ok: false, errorKind: "aborted" });
+    const overlay = fakeOverlay();
+    const onErr = vi.fn();
+    const queue = makeQueue(overlay, onErr);
+
+    queue.register(CAND);
+    FakeIO.instances[0]!.fire(CAND.el, true);
+    await tick();
+
+    expect(onErr).not.toHaveBeenCalled();
     queue.stop();
   });
 });

@@ -82,9 +82,12 @@ export function isCandidate(m: CandidateMetrics): boolean {
  * so a big centered page beats a small sidebar/footer thumbnail. Pure.
  *
  * RESERVED / not yet consumed: the scanner no longer sorts by score (the viewport
- * queue re-orders everything into document order, so it had no effect — item 7).
+ * queue re-orders everything into document order, so it had no effect — item 7),
+ * and Phase 7's drag-select target picker ({@link import("./regionSelect").pickTargetImage})
+ * tie-breaks on plain rect area rather than this scorer (a bare page-space Rect
+ * carries no viewport/centered metrics, and the tie is a near-impossible edge).
  * This stays exported + tested for the §7.1 main-image ranking a later consumer
- * will use (drag-select default target / main-image heuristics, Phase 7).
+ * may still use.
  *
  * @param m metrics for the element.
  * @returns a non-negative score; higher is more manga-page-like.

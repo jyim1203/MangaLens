@@ -6,6 +6,7 @@ import {
   type ProviderOutput,
   type ProviderRequest,
 } from "../../src/background/providers/ProviderBase";
+import { REGION_SUFFIX } from "../../src/background/providers/prompt";
 import type { ProviderSettings, TranslateJob } from "../../src/shared/types";
 
 /**
@@ -148,6 +149,23 @@ describe("ProviderBase — translatePage happy path", () => {
     );
 
     expect(provider.temperatures).toEqual([0.3]);
+  });
+
+  it("threads job.isRegion into the prompt (§4.3 suffix), and omits it otherwise", async () => {
+    // Fresh Response per call — a shared instance's body can only be read once.
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse(VALID_OUTPUT)));
+    const { provider } = makeProvider(fetchMock);
+
+    await provider.translatePage(
+      makeJob({ isRegion: true }),
+      makeSettings(),
+      new AbortController().signal,
+    );
+    expect(provider.userTexts[0]).toContain(REGION_SUFFIX);
+
+    const { provider: plain } = makeProvider(fetchMock);
+    await plain.translatePage(makeJob(), makeSettings(), new AbortController().signal);
+    expect(plain.userTexts[0]).not.toContain(REGION_SUFFIX);
   });
 
   it("remaps tile-local bboxes into full-image space when tileOffset is set", async () => {

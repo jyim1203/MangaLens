@@ -64,8 +64,13 @@ const log = createLogger("translate");
  */
 let translationQueue: PriorityQueue | undefined;
 
-/** Get/create the shared queue, syncing its concurrency to current settings. */
-function getTranslationQueue(concurrency: number): PriorityQueue {
+/**
+ * Get/create the shared queue, syncing its concurrency to current settings.
+ * Exported so region translation (regionHandlers.ts) shares the SAME global
+ * concurrency cap as page translation — a burst of drag-selects can't blow past
+ * the in-flight limit that page requests respect.
+ */
+export function getTranslationQueue(concurrency: number): PriorityQueue {
   if (!translationQueue) {
     // maxRetries: 0 — the provider layer owns rate-limit backoff; retrying here
     // would double it. The queue's job is concurrency + priority, not backoff.
@@ -124,6 +129,25 @@ const requestControllers = new Map<string, AbortController>();
 /** Reset the request-controller registry — test seam only; no production caller. */
 export function resetRequestControllersForTest(): void {
   requestControllers.clear();
+}
+
+/**
+ * Register an {@link AbortController} under a `requestId` so a later
+ * {@link MessageHandlers.cancelTranslation} aborts it. Exported so region
+ * requests (regionHandlers.ts) share the SAME registry — the existing
+ * `cancelTranslation` message then covers drag-select regions too (Phase 7
+ * item 3), with no second cancellation path.
+ */
+export function registerRequestController(
+  requestId: string,
+  controller: AbortController,
+): void {
+  requestControllers.set(requestId, controller);
+}
+
+/** Remove a request's controller from the shared registry (in the handler's finally). */
+export function unregisterRequestController(requestId: string): void {
+  requestControllers.delete(requestId);
 }
 
 /**

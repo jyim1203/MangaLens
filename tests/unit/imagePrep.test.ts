@@ -9,7 +9,9 @@ import {
   iou,
   isLongStrip,
   LONG_STRIP_RATIO,
+  MIN_CROP_PX,
   planPrep,
+  planRegionCrop,
   remapBboxFromTile,
 } from "../../src/background/imagePrep";
 
@@ -287,5 +289,49 @@ describe("background/imagePrep — dedupeRegions", () => {
     // IoU ≈ 0.143 — below 0.5 so both survive, above 0.1 so a low threshold merges.
     expect(dedupeRegions([a, b], 0.5)).toHaveLength(2);
     expect(dedupeRegions([a, b], 0.1)).toHaveLength(1);
+  });
+});
+
+describe("background/imagePrep — planRegionCrop (F10 drag-select)", () => {
+  it("converts a normalized crop to an integer source rect", () => {
+    const plan = planRegionCrop(1000, 800, { x: 0.25, y: 0.5, w: 0.5, h: 0.25 }, 1200);
+    expect(plan).toEqual({
+      sx: 250,
+      sy: 400,
+      sw: 500,
+      sh: 200,
+      outWidthPx: 500,
+      outHeightPx: 200,
+    });
+  });
+
+  it("long-edge-caps the output but never upscales", () => {
+    // Crop is 2000×1000 source px; cap 1200 halves it. A small crop stays 1:1.
+    const big = planRegionCrop(4000, 2000, { x: 0, y: 0, w: 0.5, h: 0.5 }, 1200);
+    expect(big?.sw).toBe(2000);
+    expect(big?.outWidthPx).toBe(1200);
+    expect(big?.outHeightPx).toBe(600);
+
+    const small = planRegionCrop(4000, 2000, { x: 0, y: 0, w: 0.1, h: 0.1 }, 1200);
+    expect(small?.outWidthPx).toBe(400); // 0.1*4000, no upscale
+    expect(small?.outHeightPx).toBe(200);
+  });
+
+  it("clamps an over-range crop to the image bounds (no overrun)", () => {
+    // x+w and y+h exceed 1 → source rect stays inside the bitmap.
+    const plan = planRegionCrop(1000, 1000, { x: 0.8, y: 0.9, w: 0.5, h: 0.5 }, 2000);
+    expect(plan!.sx + plan!.sw).toBeLessThanOrEqual(1000);
+    expect(plan!.sy + plan!.sh).toBeLessThanOrEqual(1000);
+  });
+
+  it("rejects a crop smaller than MIN_CROP_PX on a side", () => {
+    // 1% of 1000 = 10 px < 16 px minimum.
+    expect(planRegionCrop(1000, 1000, { x: 0, y: 0, w: 0.01, h: 0.5 }, 1200)).toBeNull();
+    expect(MIN_CROP_PX).toBe(16);
+  });
+
+  it("rejects a degenerate (zero-area) crop and degenerate image dims", () => {
+    expect(planRegionCrop(1000, 1000, { x: 0.5, y: 0.5, w: 0, h: 0 }, 1200)).toBeNull();
+    expect(planRegionCrop(0, 0, { x: 0, y: 0, w: 1, h: 1 }, 1200)).toBeNull();
   });
 });

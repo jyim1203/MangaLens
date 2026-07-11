@@ -52,6 +52,29 @@ export async function applySettingsPatch(
   return next;
 }
 
+/**
+ * Fire a void command message at the active tab's content script (Phase 7
+ * keyboard commands `select-region` / `peek-original`).
+ *
+ * WHY no `tabs`/`activeTab` permission needed: querying tabs and messaging BY
+ * tabId are permission-free; only reading `tab.url` needs a permission, and we
+ * don't. WHY fail-soft: a tab with no content script (about:, AMO pages) rejects
+ * the send — that's expected, swallowed here (handoff rule 6). Kept in
+ * settingsHandlers.ts (not index.ts) so it's unit-testable without
+ * `browser.commands`, which @webext-core/fake-browser doesn't stub.
+ */
+export async function sendCommandToActiveTab(
+  type: "startRegionSelect" | "togglePeekOriginal",
+): Promise<void> {
+  const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+  if (tab?.id === undefined) return;
+  try {
+    await sendToTab(tab.id, type);
+  } catch (err) {
+    log.debug(`command "${type}" not delivered to tab ${tab.id}`, err);
+  }
+}
+
 /** Flip the global enabled flag (F1) — used by both the `toggleEnabled`
  *  message and the keyboard command. */
 export async function toggleEnabled(): Promise<Settings> {
@@ -67,5 +90,19 @@ export function createSettingsHandlers(): MessageHandlers {
     getSettings: () => loadSettings(),
     setSettings: (patch) => applySettingsPatch(patch),
     toggleEnabled: () => toggleEnabled(),
+  };
+}
+
+/**
+ * The `openOptionsPage` handler (Phase 7): content scripts can't open the
+ * options page themselves, so the F14/error-toast "Open settings" action sends
+ * this. Extracted here (not inlined in index.ts) so it's unit-testable without
+ * `browser.commands`, which @webext-core/fake-browser doesn't stub.
+ */
+export function createOptionsPageHandlers(): MessageHandlers {
+  return {
+    openOptionsPage: async () => {
+      await browser.runtime.openOptionsPage();
+    },
   };
 }

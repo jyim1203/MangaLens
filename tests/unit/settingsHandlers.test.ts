@@ -15,7 +15,9 @@ import {
 } from "../../src/shared/settings";
 import {
   broadcastSettingsChanged,
+  createOptionsPageHandlers,
   createSettingsHandlers,
+  sendCommandToActiveTab,
   toggleEnabled,
 } from "../../src/background/settingsHandlers";
 
@@ -57,6 +59,34 @@ describe("background/settingsHandlers", () => {
     // Direct call — the same function the commands.onCommand listener uses.
     const off = await toggleEnabled();
     expect(off.enabled).toBe(false);
+  });
+
+  it("sendCommandToActiveTab messages the active tab and swallows a rejecting tab (Phase 7 commands)", async () => {
+    // fake-browser's tabs.query doesn't filter by {active}; return a known tab.
+    vi.spyOn(fakeBrowser.tabs, "query").mockResolvedValue([
+      { id: 42 } as never,
+    ]);
+    const spy = vi
+      .spyOn(fakeBrowser.tabs, "sendMessage")
+      .mockResolvedValue(undefined);
+
+    await sendCommandToActiveTab("startRegionSelect");
+    const [tabId, env] = spy.mock.calls.at(-1) as [number, Envelope<"startRegionSelect">];
+    expect(tabId).toBe(42);
+    expect(env.type).toBe("startRegionSelect");
+
+    // A tab with no content script rejects — must not throw (fail-soft).
+    spy.mockRejectedValueOnce(new Error("no receiver"));
+    await expect(sendCommandToActiveTab("togglePeekOriginal")).resolves.toBeUndefined();
+  });
+
+  it("openOptionsPage handler calls the browser API (Phase 7 toast action)", async () => {
+    const spy = vi
+      .spyOn(fakeBrowser.runtime, "openOptionsPage")
+      .mockResolvedValue(undefined);
+    const handlers = createOptionsPageHandlers();
+    await handlers.openOptionsPage!(undefined, {} as never);
+    expect(spy).toHaveBeenCalledTimes(1);
   });
 
   it("broadcastSettingsChanged fans out to every tab and survives tabs without a listener (edge: dead tabs)", async () => {
