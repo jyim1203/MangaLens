@@ -121,6 +121,13 @@ function clampCoord(value: number, size: number): number {
   return value;
 }
 
+/** Clamp `value` into the inclusive [lo, hi] range (used to pull a seed into a window). */
+function clampToRange(value: number, lo: number, hi: number): number {
+  if (value < lo) return lo;
+  if (value > hi) return hi;
+  return value;
+}
+
 /** The bounding box (inclusive pixel coords) + area of a flood-filled blob. */
 interface FilledBlob {
   area: number;
@@ -145,6 +152,10 @@ function floodFill(
   sy: number,
   threshold: number,
   leakArea: number,
+  winMinX = 0,
+  winMinY = 0,
+  winMaxX = width - 1,
+  winMaxY = height - 1,
 ): FilledBlob | "leak" {
   const visited = new Uint8Array(width * height);
   const start = sy * width + sx;
@@ -156,7 +167,10 @@ function floodFill(
   let maxX = sx;
   let maxY = sy;
 
-  const tryPush = (np: number): void => {
+  // Out-of-window pixels are walls (Phase 7.6 stage-3 windowed re-fill): the fill
+  // can't cross the cut into a neighbouring lobe's slab.
+  const tryPush = (np: number, nx: number, ny: number): void => {
+    if (nx < winMinX || nx > winMaxX || ny < winMinY || ny > winMaxY) return;
     if (visited[np]) return;
     visited[np] = 1;
     if (luminanceAt(data, np) >= threshold) stack.push(np);
@@ -172,10 +186,10 @@ function floodFill(
     if (x > maxX) maxX = x;
     if (y < minY) minY = y;
     if (y > maxY) maxY = y;
-    if (x > 0) tryPush(p - 1);
-    if (x < width - 1) tryPush(p + 1);
-    if (y > 0) tryPush(p - width);
-    if (y < height - 1) tryPush(p + width);
+    if (x > 0) tryPush(p - 1, x - 1, y);
+    if (x < width - 1) tryPush(p + 1, x + 1, y);
+    if (y > 0) tryPush(p - width, x, y - 1);
+    if (y < height - 1) tryPush(p + width, x, y + 1);
   }
   return { area, minX, minY, maxX, maxY };
 }
@@ -187,6 +201,16 @@ export interface SnapOptions {
   minBlobFraction?: number;
   maxBlobBoxRatio?: number;
   maxBlobImageFraction?: number;
+  /**
+   * Confine the flood fill to this normalized sub-rectangle (Phase 7.6 stage 3):
+   * pixels outside it are walls, and seed coordinates are clamped into it, so a
+   * shared-blob member fills only its own lobe/slab. Omitted → the whole bitmap.
+   */
+  window?: BBox;
+  /** IoU at/above which two accepted snaps are grouped as one blob ({@link snapAllRegions} stage 2). */
+  sharedBlobIou?: number;
+  /** Coverage at/above which a snap "swallows" a neighbour ({@link snapAllRegions} stages 2 & 4). */
+  swallowCoverage?: number;
 }
 
 /**
@@ -254,14 +278,49 @@ export function snapRegionToBubble(
   );
   const minArea = minBlobFraction * seedBoxArea;
 
+  // Optional stage-3 window (Phase 7.6): confine the fill to a sub-rectangle and
+  // clamp every seed into it, so a group member fills only its own lobe. Defaults
+  // to the whole bitmap.
+  let winMinX = 0;
+  let winMinY = 0;
+  let winMaxX = width - 1;
+  let winMaxY = height - 1;
+  if (opts.window) {
+    winMinX = clampCoord(Math.floor(opts.window.x * width), width);
+    winMinY = clampCoord(Math.floor(opts.window.y * height), height);
+    winMaxX = clampCoord(Math.ceil((opts.window.x + opts.window.w) * width) - 1, width);
+    winMaxY = clampCoord(Math.ceil((opts.window.y + opts.window.h) * height) - 1, height);
+    if (winMaxX < winMinX || winMaxY < winMinY) return null; // degenerate window
+  }
+
   for (const [dy, dx] of SEED_OFFSETS) {
-    const sx = clampCoord(Math.round(boxX + boxW * (0.5 + dx)), width);
-    const sy = clampCoord(Math.round(boxY + boxH * (0.5 + dy)), height);
+    const sx = clampToRange(
+      clampCoord(Math.round(boxX + boxW * (0.5 + dx)), width),
+      winMinX,
+      winMaxX,
+    );
+    const sy = clampToRange(
+      clampCoord(Math.round(boxY + boxH * (0.5 + dy)), height),
+      winMinY,
+      winMaxY,
+    );
     const seedLum = luminanceAt(data, sy * width + sx);
     if (seedLum < lightFloor) continue; // dark seed (stroke/art) — next
 
     const threshold = Math.max(lightFloor, seedLum - seedTolerance);
-    const blob = floodFill(data, width, height, sx, sy, threshold, leakArea);
+    const blob = floodFill(
+      data,
+      width,
+      height,
+      sx,
+      sy,
+      threshold,
+      leakArea,
+      winMinX,
+      winMinY,
+      winMaxX,
+      winMaxY,
+    );
     if (blob === "leak") return null; // rule 5: give up on every seed
     if (blob.area < minArea) continue; // rule 4: glyph counter / speck — next seed
 
@@ -354,6 +413,266 @@ export function clampBoxToRect(box: BBox, rect: BBox): BBox | null {
   return { x: x1, y: y1, w, h };
 }
 
+// --- Phase 7.6: connected-bubble shared-blob split + swallow guard ----------
+// A single connected light blob (two speech bubbles joined by a light neck — a
+// common manga idiom) is filled identically by BOTH bubbles' seeds. The 7.5
+// per-region core then either snaps both to the union bounding box (leak cap
+// missed, because ~1.5–2.5× the seed box is under the 4× cap) or leaks the
+// smaller one to null — one huge box swallowing the pair, or a huge box + a
+// loose box stacked. These pure helpers model that case: detect the shared-blob
+// claim, split it between claimants with axis-aligned cuts + windowed re-fills,
+// and back everything with a guard that reverts any snap that swallows a
+// neighbour. The overlay only draws rectangles, so this gives each region its
+// own lobe box — it does NOT attempt shaped fitting.
+
+/** IoU at/above which two accepted snaps are treated as the SAME filled blob
+ *  (connected-bubble twin snaps) and grouped. Tunable via {@link SnapOptions}. */
+export const SHARED_BLOB_IOU = 0.8;
+
+/** Coverage (area(a∩b)/area(b)) at/above which a snap is judged to "swallow" a
+ *  neighbour — the group trigger (stage 2) and the final guard (stage 4). */
+export const SWALLOW_COVERAGE = 0.65;
+
+/** Area of a normalized box (non-negative). */
+function boxArea(b: BBox): number {
+  return Math.max(0, b.w) * Math.max(0, b.h);
+}
+
+/** Area of the intersection of two normalized boxes (0 when disjoint). */
+function intersectArea(a: BBox, b: BBox): number {
+  const x1 = Math.max(a.x, b.x);
+  const y1 = Math.max(a.y, b.y);
+  const x2 = Math.min(a.x + a.w, b.x + b.w);
+  const y2 = Math.min(a.y + a.h, b.y + b.h);
+  const w = x2 - x1;
+  const h = y2 - y1;
+  return w > 0 && h > 0 ? w * h : 0;
+}
+
+/** Intersection-over-union of two normalized boxes (0 when disjoint/degenerate). */
+function boxIou(a: BBox, b: BBox): number {
+  const inter = intersectArea(a, b);
+  if (inter <= 0) return 0;
+  const union = boxArea(a) + boxArea(b) - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+/** Fraction of `b` covered by `a`: area(a ∩ b) / area(b). */
+function coverage(a: BBox, b: BBox): number {
+  const bArea = boxArea(b);
+  return bArea > 0 ? intersectArea(a, b) / bArea : 0;
+}
+
+/** The bounding box that contains both `a` and `b`. */
+function unionBox(a: BBox, b: BBox): BBox {
+  const x1 = Math.min(a.x, b.x);
+  const y1 = Math.min(a.y, b.y);
+  const x2 = Math.max(a.x + a.w, b.x + b.w);
+  const y2 = Math.max(a.y + a.h, b.y + b.h);
+  return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+}
+
+/**
+ * Stage 2 — group snap-eligible regions that filled ONE shared blob, by two
+ * triggers over normalized boxes:
+ *  - *twin snaps*: accepted snaps with pairwise IoU ≥ `iouThresh` (both filled
+ *    the same union);
+ *  - *swallowed neighbour*: region i's snap NEWLY covers region j's box
+ *    (`coverage(snapᵢ, boxⱼ) ≥ covThresh` while `coverage(origᵢ, origⱼ) <
+ *    covThresh`, boxⱼ = snapⱼ ?? origⱼ) — i snapped the union, j is its lobe.
+ * Only eligible regions (with, for the anchor, an accepted snap) can group.
+ * Returns member-index groups of size ≥ 2; singletons are not groups.
+ */
+function detectSharedBlobGroups(
+  orig: readonly BBox[],
+  snaps: readonly (BBox | null)[],
+  eligible: readonly boolean[],
+  iouThresh: number,
+  covThresh: number,
+): number[][] {
+  const n = orig.length;
+  const parent = Array.from({ length: n }, (_, i) => i);
+  const find = (x: number): number => {
+    let root = x;
+    while (parent[root] !== root) root = parent[root]!;
+    while (parent[x] !== root) {
+      const next = parent[x]!;
+      parent[x] = root;
+      x = next;
+    }
+    return root;
+  };
+  const union = (a: number, b: number): void => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent[Math.max(ra, rb)] = Math.min(ra, rb);
+  };
+
+  for (let i = 0; i < n; i++) {
+    const snapI = snaps[i];
+    if (!eligible[i] || !snapI) continue; // a group anchor must have an accepted snap
+    for (let j = 0; j < n; j++) {
+      if (j === i || !eligible[j]) continue; // only eligible regions join groups
+      const snapJ = snaps[j];
+      // Twin snaps: i and j filled near-identical boxes → the same blob.
+      if (snapJ && boxIou(snapI, snapJ) >= iouThresh) {
+        union(i, j);
+        continue;
+      }
+      // Swallowed neighbour: i's snap covers j's box, and that coverage is NEW
+      // (not already present in the loose provider boxes) → i snapped the union.
+      const boxJ = snapJ ?? orig[j]!;
+      if (
+        coverage(snapI, boxJ) >= covThresh &&
+        coverage(orig[i]!, orig[j]!) < covThresh
+      ) {
+        union(i, j);
+      }
+    }
+  }
+
+  const byRoot = new Map<number, number[]>();
+  for (let i = 0; i < n; i++) {
+    if (!eligible[i]) continue;
+    const list = byRoot.get(find(i)) ?? [];
+    list.push(i);
+    byRoot.set(find(i), list);
+  }
+  return [...byRoot.values()].filter((g) => g.length >= 2);
+}
+
+/**
+ * Stage 3 — split one shared-blob group into per-lobe boxes with windowed
+ * re-fills. Cut along the axis with the larger spread of member ORIGINAL-box
+ * centers (the snapped boxes are the identical union — only the provider boxes
+ * know which lobe is whose), at the midpoints between consecutive centers; each
+ * member re-fills confined to its slab window. Returns each member's lobe box,
+ * or `null` if ANY member's windowed fill fails — all-or-nothing, so a group
+ * built on bad evidence reverts wholesale to provider boxes rather than cutting
+ * a real bubble in half.
+ */
+function splitGroup(
+  img: SnapBitmap,
+  group: readonly number[],
+  orig: readonly BBox[],
+  snaps: readonly (BBox | null)[],
+  opts: SnapOptions,
+): { index: number; box: BBox }[] | null {
+  const { width, height } = img;
+  // Group blob box = union of members' snapped (or, for a leaked member, provider) boxes.
+  let blobBox = snaps[group[0]!] ?? orig[group[0]!]!;
+  for (const idx of group) blobBox = unionBox(blobBox, snaps[idx] ?? orig[idx]!);
+
+  // Cut axis: the larger spread of member centers, measured in BITMAP px so the
+  // image's aspect ratio doesn't distort the choice.
+  const centerXpx = (i: number): number => (orig[i]!.x + orig[i]!.w / 2) * width;
+  const centerYpx = (i: number): number => (orig[i]!.y + orig[i]!.h / 2) * height;
+  const xs = group.map(centerXpx);
+  const ys = group.map(centerYpx);
+  const axisX = Math.max(...xs) - Math.min(...xs) >= Math.max(...ys) - Math.min(...ys);
+
+  // Sort members by their normalized center along the cut axis; cut at midpoints.
+  const centerN = (i: number): number =>
+    axisX ? orig[i]!.x + orig[i]!.w / 2 : orig[i]!.y + orig[i]!.h / 2;
+  const sorted = [...group].sort((a, b) => centerN(a) - centerN(b));
+  const lo = axisX ? blobBox.x : blobBox.y;
+  const hi = axisX ? blobBox.x + blobBox.w : blobBox.y + blobBox.h;
+
+  const out: { index: number; box: BBox }[] = [];
+  for (let k = 0; k < sorted.length; k++) {
+    const member = sorted[k]!;
+    const slabLo = k === 0 ? lo : (centerN(sorted[k - 1]!) + centerN(member)) / 2;
+    const slabHi =
+      k === sorted.length - 1 ? hi : (centerN(member) + centerN(sorted[k + 1]!)) / 2;
+    // Window = the group blob box, clamped on the cut axis to this member's slab.
+    const window: BBox = axisX
+      ? { x: slabLo, y: blobBox.y, w: slabHi - slabLo, h: blobBox.h }
+      : { x: blobBox.x, y: slabLo, w: blobBox.w, h: slabHi - slabLo };
+    const box = snapRegionToBubble(img, orig[member]!, { ...opts, window });
+    if (!box) return null; // dark/degenerate slab → revert the whole group
+    out.push({ index: member, box });
+  }
+  return out;
+}
+
+/**
+ * Stage 4 — the final safety net over ALL results: revert any accepted snap that
+ * NEWLY swallows a neighbour (eligible or not) — coverage the snap introduced,
+ * not already present in the provider's loose boxes. Catches everything stage 3
+ * couldn't split (a lobe still over a caption, a group revert that left a twin in
+ * place, future drift). A false revert costs only the status quo; a false accept
+ * costs the screenshot. Computed over a snapshot so it is order-independent.
+ */
+function applySwallowGuard(
+  results: readonly (BBox | null)[],
+  orig: readonly BBox[],
+  covThresh: number,
+): (BBox | null)[] {
+  const out = results.slice();
+  for (let i = 0; i < results.length; i++) {
+    const ri = results[i];
+    if (!ri) continue; // only an accepted snap can swallow
+    for (let j = 0; j < results.length; j++) {
+      if (j === i) continue;
+      const boxJ = results[j] ?? orig[j]!;
+      if (coverage(ri, boxJ) >= covThresh && coverage(orig[i]!, orig[j]!) < covThresh) {
+        out[i] = null;
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Snap every region of a page, handling connected bubbles (Phase 7.6). The
+ * per-region loop is PURE — this is the tested orchestrator that
+ * {@link snapPageRegions} decodes into. Four stages: (1) independent 7.5 snaps,
+ * (2) shared-blob group detection, (3) slab split with windowed re-fills, (4) a
+ * swallow guard. Returns one entry per input region — a tighter {@link BBox}, or
+ * `null` to keep that region's provider box (exactly as {@link snapRegionToBubble}
+ * alone). A single isolated bubble is byte-identical to the 7.5 result. Never
+ * mutates the input.
+ *
+ * @param img the decoded RGBA snap bitmap.
+ * @param regions the page's regions (bbox + optional kind), normalized 0–1.
+ * @param opts threshold overrides (tests tune {@link SHARED_BLOB_IOU} /
+ *   {@link SWALLOW_COVERAGE} and the 7.5 fill thresholds through here).
+ */
+export function snapAllRegions(
+  img: SnapBitmap,
+  regions: readonly { bbox: BBox; kind?: RegionKind }[],
+  opts: SnapOptions = {},
+): (BBox | null)[] {
+  const iouThresh = opts.sharedBlobIou ?? SHARED_BLOB_IOU;
+  const covThresh = opts.swallowCoverage ?? SWALLOW_COVERAGE;
+  const orig = regions.map((r) => r.bbox);
+  const eligible = regions.map((r) => shouldSnapKind(r.kind));
+
+  // Stage 1: independent snaps (null for non-eligible / no seed accepted).
+  const results: (BBox | null)[] = regions.map((r, i) =>
+    eligible[i] ? snapRegionToBubble(img, r.bbox, opts) : null,
+  );
+
+  // Stage 2: group regions that filled one shared blob.
+  const groups = detectSharedBlobGroups(orig, results, eligible, iouThresh, covThresh);
+
+  // Stage 3: split each group into per-lobe boxes (all-or-nothing per group).
+  // Groups are a disjoint partition, so mutating one never disturbs another's
+  // blob-box computation.
+  for (const group of groups) {
+    const lobes = splitGroup(img, group, orig, results, opts);
+    if (lobes) {
+      for (const { index, box } of lobes) results[index] = box;
+    } else {
+      for (const index of group) results[index] = null; // revert to provider boxes
+    }
+  }
+
+  // Stage 4: revert any result that still swallows a neighbour.
+  return applySwallowGuard(results, orig, covThresh);
+}
+
 // --- Browser-only layer (OffscreenCanvas decode shell) ---------------------
 // Everything below needs `createImageBitmap` + `OffscreenCanvas` and so runs
 // only in the event page, not in unit tests. It is a thin shell over the pure
@@ -404,10 +723,11 @@ export async function snapPageRegions(
       height: size.height,
     };
 
-    const regions = page.regions.map((region) => {
-      if (!shouldSnapKind(region.kind)) return region;
-      const snapped = snapRegionToBubble(snapBitmap, region.bbox);
-      if (!snapped) return region;
+    // Pure orchestrator: independent snaps → shared-blob split → swallow guard.
+    const snaps = snapAllRegions(snapBitmap, page.regions);
+    const regions = page.regions.map((region, i) => {
+      const snapped = snaps[i];
+      if (!snapped) return region; // non-eligible / no accept / reverted → provider box
       const box = clampRect ? clampBoxToRect(snapped, clampRect) : snapped;
       if (!box) return region; // snapped entirely outside the selection — keep it
       return { ...region, bbox: box };

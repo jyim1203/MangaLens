@@ -116,7 +116,9 @@ describe("translateHandlers — errorToTranslateResult", () => {
       new ImageFetchError("not-image", "got text/html"),
     );
     expect(notImage).toMatchObject({ ok: false, errorKind: "network" });
-    if (!notImage.ok) expect(notImage.message).toContain("not-image");
+    if (!notImage.ok && notImage.errorKind !== "not-cached") {
+      expect(notImage.message).toContain("not-image");
+    }
   });
 
   it("maps anything unrecognized to unknown (edge: non-Error throw)", () => {

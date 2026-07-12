@@ -362,6 +362,10 @@ export function createRegionSelector(opts: RegionSelectorOptions): RegionSelecto
         safe(() => overlay.render(candidate, result.page));
       } else if (result.errorKind === "aborted") {
         safe(() => overlay.clear(candidate)); // cancelled — silent
+      } else if (result.errorKind === "not-cached") {
+        // Unreachable: a drag-select region is never a cacheOnly probe (Phase 7.6).
+        // Guard it so `errorKind` narrows to ProviderErrorKind for setError below.
+        safe(() => overlay.clear(candidate));
       } else {
         safe(() => overlay.setError(candidate, result.errorKind));
         if (opts.onError) safe(() => opts.onError!(result.errorKind));

@@ -15,7 +15,7 @@ import {
 } from "../../src/content/viewportQueue";
 import { sendToBackground } from "../../src/shared/messages";
 import type { Candidate } from "../../src/content/scanner";
-import type { ProviderErrorKind } from "../../src/shared/types";
+import type { PageTranslation, ProviderErrorKind } from "../../src/shared/types";
 
 const mockSend = vi.mocked(sendToBackground);
 
@@ -147,6 +147,7 @@ describe("viewportQueue — requestAll (F8 translate-all)", () => {
       overlay,
       prefetchAhead: 0,
       autoEnqueue: true,
+      hydrate: false,
       makeRequestId: () => "rq",
       createObserver: (cb, options) =>
         new FakeIO(cb, options) as unknown as IntersectionObserver,
@@ -205,6 +206,7 @@ describe("viewportQueue — onProviderError toast hook (Phase 7 item 6)", () => 
       overlay,
       prefetchAhead: 0,
       autoEnqueue: true,
+      hydrate: false,
       makeRequestId: () => "rq",
       onProviderError,
       createObserver: (cb, options) =>
@@ -256,6 +258,7 @@ describe("viewportQueue — retry path re-observes a static image (item 6)", () 
       overlay,
       prefetchAhead: 0,
       autoEnqueue: true,
+      hydrate: false,
       makeRequestId: () => "rq",
       requestTimeoutMs,
       createObserver: (cb, options) =>
@@ -340,6 +343,7 @@ describe("viewportQueue — blob bytes dispatch (item 1)", () => {
       overlay,
       prefetchAhead: 0,
       autoEnqueue: true,
+      hydrate: false,
       makeRequestId: () => "rq",
       acquireBytes,
       createObserver: (cb, options) =>
@@ -428,6 +432,7 @@ describe("viewportQueue — pause/resume (Phase 7.4 item 4)", () => {
       overlay,
       prefetchAhead: 0,
       autoEnqueue: true,
+      hydrate: false,
       makeRequestId: () => "rq",
       acquireBytes,
       createObserver: (cb, options) =>
@@ -558,6 +563,209 @@ describe("viewportQueue — pause/resume (Phase 7.4 item 4)", () => {
   });
 });
 
+describe("viewportQueue — cache-only hydrate (Phase 7.6)", () => {
+  beforeEach(() => {
+    FakeIO.instances = [];
+    mockSend.mockReset();
+    vi.stubGlobal("Node", { DOCUMENT_POSITION_FOLLOWING: 4 });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const fakeEl = (): Element =>
+    ({ compareDocumentPosition: () => 2 }) as unknown as Element;
+  const httpCand = (id: string): Candidate => ({ id, el: fakeEl(), url: `https://x/${id}.jpg` });
+  const BLOB: Candidate = { id: "b", el: fakeEl(), url: "blob:https://x/9f8c" };
+  const PAGE = { imageHash: "h", regions: [] } as unknown as PageTranslation;
+
+  function makeQueue(
+    overlay: OverlaySink,
+    hydrate = true,
+    acquireBytes?: (url: string) => Promise<{ imageBytes: ArrayBuffer; imageMime: string }>,
+    requestTimeoutMs?: number,
+  ) {
+    return createViewportQueue({
+      overlay,
+      prefetchAhead: 0,
+      autoEnqueue: false, // hydrate is the non-auto complement
+      hydrate,
+      makeRequestId: () => "rq",
+      acquireBytes,
+      requestTimeoutMs,
+      createObserver: (cb, options) =>
+        new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+  }
+
+  /** Count translatePage sends by whether they were cacheOnly probes. */
+  const probeCalls = () =>
+    mockSend.mock.calls.filter(
+      (c) => c[0] === "translatePage" && (c[1] as { cacheOnly?: boolean }).cacheOnly,
+    );
+  const realCalls = () =>
+    mockSend.mock.calls.filter(
+      (c) => c[0] === "translatePage" && !(c[1] as { cacheOnly?: boolean }).cacheOnly,
+    );
+
+  it("gate: an origin with zero cache entries sends no probes", async () => {
+    mockSend.mockImplementation((type: string) =>
+      type === "countCachedForSite" ? Promise.resolve({ count: 0 }) : Promise.resolve(undefined),
+    );
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay);
+    queue.register(httpCand("a"));
+    await tick();
+    expect(probeCalls()).toHaveLength(0);
+    expect(overlay.setPending).not.toHaveBeenCalled();
+    queue.stop();
+  });
+
+  it("a cache hit renders, flips requested, and shows NO skeleton", async () => {
+    mockSend.mockImplementation((type: string) => {
+      if (type === "countCachedForSite") return Promise.resolve({ count: 5 });
+      if (type === "translatePage") return Promise.resolve({ ok: true, page: PAGE });
+      return Promise.resolve(undefined);
+    });
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay);
+    const cand = httpCand("a");
+    queue.register(cand);
+    await tick();
+
+    expect(probeCalls()).toHaveLength(1);
+    expect(probeCalls()[0]![1]).toMatchObject({ cacheOnly: true });
+    expect(overlay.render).toHaveBeenCalledWith(cand, PAGE);
+    expect(overlay.setPending).not.toHaveBeenCalled(); // no skeleton flash
+    // A later Translate all skips it — it's already requested.
+    expect(queue.requestAll()).toBe(0);
+    queue.stop();
+  });
+
+  it("a not-cached probe leaves the candidate unrequested and badge-free; requestAll then sends a real request", async () => {
+    mockSend.mockImplementation((type: string, payload?: unknown) => {
+      if (type === "countCachedForSite") return Promise.resolve({ count: 5 });
+      if (type === "translatePage") {
+        return (payload as { cacheOnly?: boolean }).cacheOnly
+          ? Promise.resolve({ ok: false, errorKind: "not-cached" })
+          : new Promise<never>(() => {}); // real send hangs (just proving it fired)
+      }
+      return Promise.resolve(undefined);
+    });
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay);
+    const cand = httpCand("a");
+    queue.register(cand);
+    await tick();
+
+    expect(probeCalls()).toHaveLength(1);
+    expect(overlay.render).not.toHaveBeenCalled();
+    expect(overlay.setError).not.toHaveBeenCalled();
+    expect(overlay.setPending).not.toHaveBeenCalled();
+
+    // The record stayed unrequested → a real translate-all still sends it.
+    expect(queue.requestAll()).toBe(1);
+    expect(realCalls()).toHaveLength(1);
+    queue.stop();
+  });
+
+  it("a probe timeout renders nothing and leaves the candidate retryable", async () => {
+    mockSend.mockImplementation((type: string) => {
+      if (type === "countCachedForSite") return Promise.resolve({ count: 5 });
+      if (type === "translatePage") return new Promise<never>(() => {}); // never settles
+      return Promise.resolve(undefined);
+    });
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay, true, undefined, 10);
+    queue.register(httpCand("a"));
+    await tick(30); // the 10 ms probe timeout fires
+
+    expect(overlay.render).not.toHaveBeenCalled();
+    expect(overlay.setError).not.toHaveBeenCalled();
+    // Still unrequested → a real send is available.
+    expect(queue.requestAll()).toBe(1);
+    queue.stop();
+  });
+
+  it("bounds probe concurrency to HYDRATE_CONCURRENCY (3)", async () => {
+    mockSend.mockImplementation((type: string) => {
+      if (type === "countCachedForSite") return Promise.resolve({ count: 5 });
+      if (type === "translatePage") return new Promise<never>(() => {}); // hang → stays in-flight
+      return Promise.resolve(undefined);
+    });
+    const queue = makeQueue(fakeOverlay());
+    for (const id of ["a", "b", "c", "d", "e"]) queue.register(httpCand(id));
+    await tick();
+    expect(probeCalls().length).toBeLessThanOrEqual(3);
+    queue.stop();
+  });
+
+  it("a blob candidate's probe ships its bytes", async () => {
+    const bytes = new Uint8Array([9, 9]).buffer;
+    const acquireBytes = vi.fn(async () => ({ imageBytes: bytes, imageMime: "image/webp" }));
+    mockSend.mockImplementation((type: string) => {
+      if (type === "countCachedForSite") return Promise.resolve({ count: 5 });
+      if (type === "translatePage") return new Promise<never>(() => {});
+      return Promise.resolve(undefined);
+    });
+    const queue = makeQueue(fakeOverlay(), true, acquireBytes);
+    queue.register(BLOB);
+    await tick();
+
+    expect(acquireBytes).toHaveBeenCalledWith(BLOB.url);
+    expect(probeCalls()[0]![1]).toMatchObject({
+      cacheOnly: true,
+      imageBytes: bytes,
+      imageMime: "image/webp",
+    });
+    queue.stop();
+  });
+
+  it("unregister cancels an in-flight probe", async () => {
+    mockSend.mockImplementation((type: string) => {
+      if (type === "countCachedForSite") return Promise.resolve({ count: 5 });
+      if (type === "translatePage") return new Promise<never>(() => {}); // in-flight
+      return Promise.resolve(undefined);
+    });
+    const cand = httpCand("a");
+    const queue = makeQueue(fakeOverlay());
+    queue.register(cand);
+    await tick();
+    expect(probeCalls()).toHaveLength(1);
+
+    queue.unregister(cand);
+    expect(mockSend).toHaveBeenCalledWith("cancelTranslation", { requestId: "rq" });
+    queue.stop();
+  });
+
+  it("hydrate=false (auto site) sends no probes and never counts the cache", async () => {
+    mockSend.mockResolvedValue({ count: 5 });
+    const queue = makeQueue(fakeOverlay(), false);
+    queue.register(httpCand("a"));
+    await tick();
+    expect(mockSend).not.toHaveBeenCalledWith("countCachedForSite");
+    expect(probeCalls()).toHaveLength(0);
+    queue.stop();
+  });
+
+  it("probes ignore pause (they spend no provider budget)", async () => {
+    mockSend.mockImplementation((type: string) => {
+      if (type === "countCachedForSite") return Promise.resolve({ count: 5 });
+      if (type === "translatePage") return Promise.resolve({ ok: true, page: PAGE });
+      if (type === "cancelQueuedTranslations") return Promise.resolve({ cancelled: 0 });
+      return Promise.resolve(undefined);
+    });
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay);
+    await queue.setPaused(true);
+    const cand = httpCand("a");
+    queue.register(cand);
+    await tick();
+
+    expect(probeCalls()).toHaveLength(1);
+    expect(overlay.render).toHaveBeenCalledWith(cand, PAGE); // hit still rendered while paused
+    queue.stop();
+  });
+});
+
 describe("viewportQueue — autoEnqueue=false (per-site opt-in, item 3)", () => {
   beforeEach(() => {
     FakeIO.instances = [];
@@ -576,6 +784,7 @@ describe("viewportQueue — autoEnqueue=false (per-site opt-in, item 3)", () => 
       overlay,
       prefetchAhead: 3,
       autoEnqueue: false,
+      hydrate: false,
       makeRequestId: () => "rq",
       requestTimeoutMs,
       createObserver: (cb, options) =>

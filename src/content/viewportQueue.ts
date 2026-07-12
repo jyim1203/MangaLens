@@ -115,6 +115,16 @@ export interface ViewportQueueOptions {
    * leave the browser on a per-site opt-in.
    */
   autoEnqueue: boolean;
+  /**
+   * Whether to run the Phase 7.6 cache-only hydrate pass: on register, probe each
+   * candidate for an existing cached translation and render it with ZERO provider
+   * spend, so a previously-translated page reappears on reload with no click. The
+   * composition root passes `!getAutoTranslate(...)` — // WHY only non-auto sites:
+   * an auto site already self-hydrates (visibility fires real requests whose cache
+   * hits render in <50 ms), so doubling sends there buys nothing. Gated by a cheap
+   * one-time origin cache count so sites the user never translated stay inert.
+   */
+  hydrate: boolean;
   /** Optional per-request target-language override (drag-select etc.). */
   targetLang?: string;
   /** Generate a request id; defaulted to `crypto.randomUUID()`. */
@@ -143,6 +153,14 @@ export interface ViewportQueueOptions {
 
 /** Priority for "translate all" enqueues — the prefetch/all tier (§7.5). */
 export const TRANSLATE_ALL_PRIORITY = 2;
+
+/**
+ * Max concurrent hydrate probes in flight (Phase 7.6). WHY bounded: blob-sourced
+ * candidates (MangaDex) ship their bytes with the probe via `acquireBytes`, and a
+ * 200-page chapter acquiring 200 buffers at once is the exact memory bomb the 7.2
+ * lazy-acquisition note forbids. Three keeps hydration brisk without the spike.
+ */
+export const HYDRATE_CONCURRENCY = 3;
 
 /** A live viewport queue. */
 export interface ViewportQueue {
@@ -201,6 +219,7 @@ interface Tracked {
 export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
   const overlay = opts.overlay;
   const autoEnqueue = opts.autoEnqueue;
+  const hydrate = opts.hydrate;
   const makeRequestId = opts.makeRequestId ?? (() => crypto.randomUUID());
   const acquireBytes = opts.acquireBytes ?? acquireBlobBytes;
   const requestTimeoutMs = opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
@@ -369,6 +388,13 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
         live.requested = false;
         safe(() => overlay.clear(candidate));
         reobserve(live.candidate.el);
+      } else if (result.errorKind === "not-cached") {
+        // Unreachable here: a real (non-cacheOnly) request never gets not-cached
+        // (only the hydrate probe sets cacheOnly). Guard it so `errorKind` narrows
+        // to ProviderErrorKind for setError; treat like aborted — silent, retryable.
+        live.requested = false;
+        safe(() => overlay.clear(candidate));
+        reobserve(live.candidate.el);
       } else {
         safe(() => overlay.setError(candidate, result.errorKind));
         // Actionable failures (auth/rate-limit) also raise a once-per-activation
@@ -402,6 +428,116 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
     );
   };
 
+  // --- Phase 7.6 cache-only hydrate -----------------------------------------
+  // On a non-auto site, probe each registered candidate for an existing cached
+  // translation and render it with ZERO provider spend, so a reload re-shows a
+  // chapter the user already translated without a click. A probe is INVISIBLE
+  // when it fails: no skeleton, no badge, no toast — it only ever renders a hit.
+
+  /**
+   * Origin gate, memoized for the queue's lifetime: how many cache entries this
+   * origin has. `0` (or a failed message) makes every probe a no-op, so a site
+   * the user never translated on pays one indexed count and nothing more.
+   */
+  let originCacheCount: Promise<number> | undefined;
+  const originHasCache = (): Promise<boolean> => {
+    if (!originCacheCount) {
+      originCacheCount = sendToBackground("countCachedForSite")
+        .then((r) => r.count)
+        .catch((err) => {
+          log.warn("countCachedForSite failed", err);
+          return 0; // fail soft → not hydrated
+        });
+    }
+    return originCacheCount.then((count) => count > 0);
+  };
+
+  /** Bounded-concurrency probe scheduler (blob candidates ship bytes — item forbids a burst). */
+  const probeQueue: Candidate[] = [];
+  let activeProbes = 0;
+  const pumpProbes = (): void => {
+    while (activeProbes < HYDRATE_CONCURRENCY && probeQueue.length > 0) {
+      const candidate = probeQueue.shift()!;
+      activeProbes++;
+      void probe(candidate).finally(() => {
+        activeProbes--;
+        pumpProbes();
+      });
+    }
+  };
+
+  /**
+   * Gate a candidate through the origin check, then schedule one bounded probe.
+   * Fire-and-forget from `register`; on a zero-count / failed gate nothing is
+   * scheduled.
+   */
+  const maybeProbe = async (candidate: Candidate): Promise<void> => {
+    if (!(await originHasCache())) return;
+    probeQueue.push(candidate);
+    pumpProbes();
+  };
+
+  /**
+   * One cache-only probe. Never `setPending` (no skeleton flash on every page);
+   * stamps `requestId` so unregister/stop cancel it, but leaves `requested` false
+   * while in flight. On a hit → render + `requested = true` (a later Translate all
+   * skips it). On not-cached / abort / error / timeout → leave the record
+   * untouched and render NOTHING. Ignores `paused` (a probe spends no provider
+   * budget) and skips candidates already `requested`.
+   */
+  async function probe(candidate: Candidate): Promise<void> {
+    const rec = tracked.get(candidate.el);
+    if (!rec || rec.candidate.id !== candidate.id || rec.requested) return;
+
+    // Blob-sourced candidates must ship their bytes (the background can't fetch a
+    // document-scoped blob URL); the concurrency gate bounds simultaneous reads.
+    let acquired: AcquiredBytes | undefined;
+    if (classifyImageUrl(candidate.url) === "accept-bytes") {
+      try {
+        acquired = await acquireBytes(candidate.url);
+      } catch (err) {
+        log.debug("hydrate byte acquisition failed", err); // silent
+        return;
+      }
+      const still = tracked.get(candidate.el);
+      if (!still || still.candidate.id !== candidate.id || still.requested) return;
+    }
+
+    const requestId = makeRequestId();
+    rec.requestId = requestId; // cancellable on teardown; `requested` stays false
+    try {
+      const result = await withTimeout(
+        sendToBackground("translatePage", {
+          imageUrl: candidate.url,
+          // priority is irrelevant — a cacheOnly probe never enters the queue.
+          priority: TRANSLATE_ALL_PRIORITY,
+          requestId,
+          cacheOnly: true,
+          targetLang: opts.targetLang,
+          ...acquired,
+        }),
+        requestTimeoutMs,
+      );
+      const live = tracked.get(candidate.el);
+      if (!live || live.candidate.id !== candidate.id) return;
+      // Only clear our own id — a concurrent real send may have re-stamped it
+      // (accepted race: Translate all vs an in-flight probe).
+      if (live.requestId === requestId) live.requestId = undefined;
+      if (result.ok) {
+        live.requested = true; // done — a later Translate all won't re-send it
+        safe(() => overlay.render(candidate, result.page));
+      }
+      // not-cached / any error arm → leave the record untouched, render nothing.
+    } catch (err) {
+      // Timeout / channel close: silent, leave the record retryable by a real send.
+      log.debug("hydrate probe failed", err);
+      const live = tracked.get(candidate.el);
+      if (live && live.candidate.id === candidate.id && live.requestId === requestId) {
+        live.requestId = undefined;
+      }
+    }
+  }
+
   return {
     register(candidate: Candidate): void {
       if (tracked.has(candidate.el)) return; // de-duped by the scanner already
@@ -417,6 +553,11 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
         safe(() => visibleObserver.observe(candidate.el));
         safe(() => nearObserver.observe(candidate.el));
       }
+      // Hydrate probe (Phase 7.6): non-auto sites only (autoEnqueue and hydrate are
+      // complementary). Probing on register — not one batch at activation — covers
+      // lazily-added images for free. Fire-and-forget; the origin gate + concurrency
+      // gate inside keep it cheap and bounded.
+      if (hydrate) void maybeProbe(candidate);
     },
 
     unregister(candidate: Candidate): void {
@@ -484,6 +625,7 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
     },
 
     stop(): void {
+      probeQueue.length = 0; // drop not-yet-started hydrate probes (item: teardown)
       for (const rec of tracked.values()) cancel(rec);
       tracked.clear();
       order.length = 0;

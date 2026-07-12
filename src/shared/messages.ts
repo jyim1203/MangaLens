@@ -64,6 +64,15 @@ export interface TranslatePageRequest {
    * (Phase 5 real cancellation). Optional — omit for fire-and-forget callers.
    */
   requestId?: string;
+  /**
+   * Cache-only probe (Phase 7.6 hydrate): "answer from cache or say not-cached;
+   * NEVER enqueue, coalesce, or call the provider." The content-side hydrate pass
+   * sets this so a previously-translated page's overlays reappear on reload with
+   * guaranteed-zero provider spend. A miss/expired lookup returns the
+   * {@link TranslatePageResult} `not-cached` arm; it is unreachable for a normal
+   * (non-`cacheOnly`) request.
+   */
+  cacheOnly?: boolean;
 }
 
 /**
@@ -77,7 +86,14 @@ export interface TranslatePageRequest {
  */
 export type TranslatePageResult =
   | { ok: true; page: PageTranslation }
-  | { ok: false; errorKind: ProviderErrorKind; message: string };
+  | { ok: false; errorKind: ProviderErrorKind; message: string }
+  // Phase 7.6 hydrate: a `cacheOnly` probe found no live cache entry. The literal
+  // lives ONLY in this union, NOT in {@link ProviderErrorKind} — "not cached" is
+  // not a provider error (it drives no negative-cache policy, no error badge). It
+  // is unreachable for a non-`cacheOnly` request; the hydrate sender handles it
+  // explicitly before the generic error branch, so `setError`/`errorKindToMessage`
+  // never see it.
+  | { ok: false; errorKind: "not-cached" };
 
 /**
  * Content-script request to translate a user-drawn crop of an image (F10
@@ -235,6 +251,17 @@ export interface MessageMap {
   /** Popup → content: read the current pause state to reflect it on open
    *  (Phase 7.4). `{ paused: false }` while inert. */
   getTranslationsPaused: { request: void; response: { paused: boolean } };
+
+  /**
+   * Content → background: how many cache entries exist for this tab's origin
+   * (Phase 7.6 hydrate gate). The origin is derived from `sender.url` background-
+   * side; the background counts on the `origin` index (`IDBIndex.count`, O(log n),
+   * no getAll). Fail-soft to `{ count: 0 }`. The content hydrate pass calls this
+   * ONCE per queue lifetime before probing: a count of 0 short-circuits all
+   * probes, so sites the user never translated on stay inert (no per-image
+   * fetch+hash on every pageload).
+   */
+  countCachedForSite: { request: void; response: { count: number } };
 }
 
 /** Every valid message `type`. */

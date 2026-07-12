@@ -570,6 +570,26 @@ export async function getCacheStats(): Promise<CacheStats> {
   }
 }
 
+/**
+ * Count how many cache entries are recorded against a hostname, via the `origin`
+ * index (Phase 7.6 hydrate gate). O(log n) — `IDBIndex.count`, no `getAll`, no
+ * deserialization. Fail-soft to 0 (a cache fault must degrade to "not hydrated",
+ * never break the page). Counts positive + negative entries alike; a non-zero
+ * count is only a "worth probing" signal, not an exact translated-page tally.
+ *
+ * @param hostname bare hostname to count.
+ * @returns the number of entries (0 on error / no entries).
+ */
+export async function countCacheForOrigin(hostname: string): Promise<number> {
+  try {
+    const db = await getDb();
+    return await db.countFromIndex(CACHE_STORE, "origin", hostname);
+  } catch (err) {
+    log.warn("countCacheForOrigin failed", err);
+    return 0;
+  }
+}
+
 /** Wipe the entire translation cache (options page "clear cache"). Fail-soft. */
 export async function clearAllCache(): Promise<void> {
   try {

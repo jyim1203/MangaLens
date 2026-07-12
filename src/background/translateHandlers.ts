@@ -42,6 +42,7 @@ import {
   cacheLookup,
   cacheStoreNegative,
   cacheStorePage,
+  countCacheForOrigin,
   shouldNegativeCache,
 } from "./cache";
 import { snapPageRegions } from "./bubbleSnap";
@@ -58,6 +59,20 @@ import { createProvider, resolveEffectiveModel } from "./providers/factory";
 import { createRateGate, type RateGate } from "./rateGate";
 
 const log = createLogger("translate");
+
+/**
+ * Sentinel thrown by {@link translateImage} when a `cacheOnly` probe (Phase 7.6
+ * hydrate) finds no live cache entry. Module-local: {@link errorToTranslateResult}
+ * maps it to the `not-cached` {@link TranslatePageResult} arm — it is NOT a
+ * {@link ProviderError} and never reaches negative-cache policy or an error badge.
+ * Unreachable for a non-`cacheOnly` request.
+ */
+class NotCachedError extends Error {
+  constructor() {
+    super("not cached");
+    this.name = "NotCachedError";
+  }
+}
 
 /**
  * The one process-wide translation queue. Lazily created (an event page may be
@@ -368,6 +383,11 @@ async function translatePrepared(
  *   leaves the queue's wait list — the precise "started" boundary. Only the
  *   coalesce LEADER reaches it; a follower never runs the miss body, so it stays
  *   "not started" and is abortable by pause (accepted caveat).
+ * @param cacheOnly Phase 7.6 hydrate probe: on a cache MISS/EXPIRED, throw
+ *   {@link NotCachedError} WITHOUT touching the coalesce map, SharedAbort
+ *   registry, or queue — never enqueue or call the provider. A hit still returns
+ *   the page and a live negative still throws its cached error (both are genuine
+ *   cached results). `onStarted` is never reached for a probe (it never queues).
  */
 export async function translateImage(
   imageUrl: string,
@@ -378,6 +398,7 @@ export async function translateImage(
   origin?: string,
   providedBlob?: Blob,
   onStarted?: () => void,
+  cacheOnly = false,
 ): Promise<PageTranslation> {
   // A blob-sourced page (MangaDex etc.) ships its bytes content-side because the
   // background can't fetch a document-scoped blob URL (§7.3); otherwise fetch
@@ -415,7 +436,18 @@ export async function translateImage(
   if (lookup.status === "negative") {
     // A recent deterministic failure is cached (PROMPTS §6.5); don't re-hit the
     // provider. Throw the same typed error so it maps to the UI ⚠ the same way.
+    // WHY this is right even for a cacheOnly probe: a live negative IS a cached
+    // result — within its 10-min TTL the honest answer is the same error badge a
+    // real request would show.
     throw new ProviderError(lookup.errorKind, lookup.message);
+  }
+
+  // miss / expired. A cacheOnly probe (Phase 7.6 hydrate) stops HERE — it must
+  // never enqueue, coalesce, or call the provider. Signalled with a sentinel that
+  // maps to the `not-cached` result arm; the coalesce map, SharedAbort registry,
+  // and queue below are left completely untouched.
+  if (cacheOnly) {
+    throw new NotCachedError();
   }
 
   // Coalesce concurrent misses for the same key onto one provider run (item 7)
@@ -549,6 +581,11 @@ function originFromSender(
  * directly.
  */
 export function errorToTranslateResult(err: unknown): TranslatePageResult {
+  if (err instanceof NotCachedError) {
+    // Phase 7.6 hydrate: a cacheOnly probe missed. NOT a provider error — its own
+    // result arm, so `errorKind` never enters ProviderErrorKind (no badge/toast).
+    return { ok: false, errorKind: "not-cached" };
+  }
   if (err instanceof ProviderError) {
     return { ok: false, errorKind: err.kind, message: err.message };
   }
@@ -608,7 +645,10 @@ export function createTranslateHandlers(): MessageHandlers {
           providedBlob,
           // Mark this id "started" the moment its provider call leaves the queue
           // wait list, so pause can tell running jobs from queued ones (item 4).
+          // A cacheOnly probe never reaches the queue, so this is never invoked
+          // for it — pause correctly treats a probe as not-started.
           req.requestId ? () => startedRequests.add(req.requestId!) : undefined,
+          req.cacheOnly ?? false,
         );
         return { ok: true, page };
       } catch (err) {
@@ -621,8 +661,14 @@ export function createTranslateHandlers(): MessageHandlers {
         // whose .name is NOT "AbortError"), or a ProviderError('aborted'), and
         // errorToTranslateResult already collapses all three to `aborted`.
         const result = errorToTranslateResult(err);
-        if (!result.ok && result.errorKind === "aborted") {
-          log.debug(`translatePage aborted for ${req.imageUrl}`, err);
+        // Aborts (control flow) and not-cached (a hydrate probe's normal negative
+        // answer) are non-events — debug, not warn, so a probed chapter doesn't
+        // spam one warn per uncached page.
+        if (
+          !result.ok &&
+          (result.errorKind === "aborted" || result.errorKind === "not-cached")
+        ) {
+          log.debug(`translatePage ${result.errorKind} for ${req.imageUrl}`, err);
         } else {
           log.warn(`translatePage failed for ${req.imageUrl}`, err);
         }
@@ -644,6 +690,15 @@ export function createTranslateHandlers(): MessageHandlers {
         controller.abort(new DOMException("Translation cancelled", "AbortError"));
         requestControllers.delete(req.requestId);
       }
+    },
+
+    countCachedForSite: async (_req, sender) => {
+      // Phase 7.6 hydrate gate: how many cache entries this tab's origin has, so
+      // the content side skips probing entirely on sites the user never
+      // translated. Fail-soft to 0 (no origin → nothing to hydrate).
+      const origin = originFromSender(sender);
+      if (!origin) return { count: 0 };
+      return { count: await countCacheForOrigin(origin) };
     },
 
     cancelQueuedTranslations: (req) => {

@@ -80,6 +80,10 @@ function activate(settings: Settings): void {
     overlay,
     prefetchAhead: settings.prefetchAhead,
     autoEnqueue: getAutoTranslate(settings, hostname),
+    // Cache-only hydrate on NON-auto sites (Phase 7.6): an auto site self-hydrates
+    // via visibility, so this is the complement — previously-translated pages
+    // reappear on reload with zero provider spend, gated by an origin cache count.
+    hydrate: !getAutoTranslate(settings, hostname),
     onProviderError: (kind) => toast?.showError(kind),
   });
 

@@ -1658,3 +1658,142 @@ NO warn-level "translatePage failed … All waiters aborted" spam, and the popup
 a fresh about:blank tab shows no `getTranslationsPaused` error. If a specific
 bubble snaps WRONG (box jumps to the wrong blob): screenshot + note the page, and
 tune the constants before adding mechanism.
+
+## Phase 7.6 summary
+
+Two fixes driven by the fifth live pass (2026-07-11, Anthropic `claude-sonnet-5`):
+connected speech bubbles snapping into one swallowing box, and no way to re-show
+a cached chapter on reload without re-spending. No prompt-layer change
+(`PROMPT_VERSION` stays 2) and — deliberately — **no `CACHE_VERSION` bump**
+(WHY below); `shared/types.ts`/`shared/settings.ts` untouched; `shared/messages.ts`
+gained exactly three flagged entries.
+
+**Item 1 — connected bubbles (`bubbleSnap.ts` only; the two call sites at
+`translateHandlers.ts:340` / `regionHandlers.ts:131` keep their exact
+signatures).** Two speech bubbles joined by a light neck (a common manga idiom)
+are ONE connected blob, so both bubbles' seeds flood-fill it identically. The 7.5
+per-region core then either snapped BOTH to the union bounding box (the union is
+only ~1.5–2.5× the larger seed box — comfortably under the `MAX_BLOB_BOX_RATIO=4`
+leak cap, so it was *accepted*) or leaked the smaller box to null (its union fill
+> 4× ITS box); `overlapTrim`'s containment guard, built for duplicate detections,
+then deliberately left the huge box + small box stacked. "One blob claimed by
+multiple regions" was simply never a modeled case. The fix makes it one: the
+shell's region loop is now the exported, pure, tested **`snapAllRegions`
+orchestrator** (`snapPageRegions` is an even thinner decode→orchestrate→apply
+shell). Four stages: (1) independent 7.5 snaps; (2) **shared-blob group
+detection** — twin snaps (pairwise IoU ≥ `SHARED_BLOB_IOU=0.8`) OR a *swallowed
+neighbour* (`coverage(snapᵢ, boxⱼ) ≥ SWALLOW_COVERAGE=0.65` while
+`coverage(origᵢ, origⱼ) <` it, i.e. the coverage is NEW, introduced by the snap —
+this is the screenshot case, where the larger box snapped the union and the
+smaller leaked to null); (3) **slab split with windowed re-fills** — cut along the
+axis with the larger spread of member ORIGINAL-box centers (only the provider
+boxes still know which lobe is whose — the snaps are the identical union), at the
+midpoints between centers; each member re-fills confined to its slab via a new
+`SnapOptions.window` (out-of-window pixels are walls, seeds clamp in), so the
+per-lobe box hugs its actual lobe on BOTH axes even for a diagonal/wavy join;
+(4) a final **swallow guard** reverting any accepted snap that still NEWLY
+swallows a neighbour (eligible or not — catches a lobe over a caption, a group
+revert that left a twin in place, future drift). **All-or-nothing per group:** if
+ANY member's windowed fill fails (dark slab, min-area, degenerate window) the
+WHOLE group reverts to provider boxes — cutting a real bubble in half on bad
+evidence is exactly the "a wrong snap is worse than a loose box" trap, so the
+worst case is precisely the pre-7.5 loose provider boxes (rule 4). A single
+isolated bubble is byte-identical to 7.5 (regression-tested). Note the observed
+degradation edge: if a joined lobe's provider box is much smaller than its own
+lobe (fill > 4× that box), its windowed re-fill leaks and the group reverts to
+provider boxes — the safe fallback, not a swallow. `shouldSnapKind`,
+`computeSnapSize`, `clampBoxToRect`, and `overlapTrim.ts` are all untouched;
+constants are exported and tunable via `SnapOptions` so tests (and live tuning)
+adjust thresholds before adding mechanism. Kept in `bubbleSnap.ts` (no
+`bubbleSnapGroups.ts` split — the group/slab/guard helpers read cleanly inline).
+
+**Item 2 — cache-only hydrate (zero-spend reload).** A cache hit only ever
+surfaced when some translate request ran (the key is a content hash — the
+background must fetch+hash bytes to even look up), so on a non-auto site the user
+re-clicked Translate all after every reload, paying real provider calls for any
+gaps. Contract (`shared/messages.ts`, flagged): `TranslatePageRequest.cacheOnly?:
+boolean` ("answer from cache or say not-cached; NEVER enqueue/coalesce/call the
+provider"); a third `TranslatePageResult` arm `{ ok:false; errorKind:"not-cached" }`
+— **the literal lives ONLY in this union, NOT in `ProviderErrorKind`** (not-cached
+is not a provider error; it drives no negative-cache policy and no error badge),
+and it's unreachable for a non-`cacheOnly` request, so the hydrate probe handles
+it before the generic branch while `setError`/`errorKindToMessage` never see it
+(the two other call sites, `viewportQueue` and `regionSelect`, carry a defensive
+narrowing branch); and `countCachedForSite: void → { count }` (origin from
+`sender.url`, counted on cache.ts's existing `origin` index via the new
+fail-soft-to-0 `countCacheForOrigin` = `IDBIndex.count`, O(log n), no getAll).
+Background: `translateImage` gains a `cacheOnly` flag — after the cache lookup a
+hit returns the page and a live negative throws its cached error exactly as today
+(both are genuine cached results), but a miss/expired throws a module-local
+`NotCachedError` sentinel (mapped by `errorToTranslateResult` to the new arm)
+BEFORE touching the coalesce map, SharedAbort registry, or queue; the
+fetch→hash→`buildCacheKey` block stays single-source. Probes register a
+controller (cancellable on teardown) but never reach `onStarted` (pause correctly
+treats them as not-started). Content (`viewportQueue.ts` + one line in
+`index.ts`): `createViewportQueue` gains `hydrate: boolean`, wired to
+`!getAutoTranslate(...)` — an auto site already self-hydrates via visibility, so
+this is its complement. When hydrating: a **once-per-lifetime origin gate**
+(memoized `countCachedForSite`; count 0 or a failed message → every probe
+no-ops, so sites the user never translated stay inert — one indexed count per
+activation), then **probe-on-register** through a **bounded concurrency gate**
+(`HYDRATE_CONCURRENCY=3` — blob candidates ship their bytes via `acquireBytes`,
+and a 200-page chapter acquiring 200 buffers at once is the exact memory bomb the
+7.2 lazy-acquisition note forbids; probing on register, not one activation batch,
+covers lazily-added images for free). A probe never `setPending` (no skeleton
+flash), stamps `requestId` but leaves `requested === false` in flight; a hit →
+render + `requested = true` (a later Translate all skips it); not-cached / abort /
+error / timeout → record untouched, render NOTHING (invisible on failure). Probes
+ignore `paused` (they spend no provider budget) and skip already-requested
+candidates. `requestAll`, drag-select, and the popup are untouched — automatic
+hydrate supersedes the "Show cached" button idea. **Accepted races (in-source):**
+Translate-all clicked during in-flight probes can double-send an image (the real
+request just hits the cache the probe read — worst case one redundant
+fetch+hash); an in-flight probe aborted by pause is a silent non-event.
+
+**WHY no `CACHE_VERSION` bump** even though 7.5 cached the wrong union-snap
+geometry: a bump retires the WHOLE store and re-pays provider $ for every
+previously-translated page (the user is cost-sensitive); the damage is limited to
+pages with connected bubbles, the fix applies to all NEW translations
+immediately, and the affected reader can be per-site cleared (F15, options page).
+
+**Tests — 549 total green** (was 524; +25). `bubbleSnap.test.ts` (+11): a
+"peanut" fixture (two ellipses + a light neck) — vertically-joined pair (twin
+trigger) → each result hugs its lobe, neither covers the other; the same rotated
+(horizontal join); the screenshot case (large snaps the union, small leaks →
+swallow trigger) → both get lobes; a 3-lobe chain → 3 boxes; a member whose slab
+is all-dark → WHOLE group reverts (box-area tuned so the full fill clears min-area
+but each half doesn't); stage-4 guard reverts a snap newly covering a caption's
+box while pre-existing provider overlap does NOT; windowed fill can't cross the
+cut (seed clamps in); single isolated bubble byte-identical to the 7.5 snap;
+determinism + inputs never mutated. `viewportQueue.test.ts` (+9): zero-count gate
+sends no probes; a hit renders + flips requested + NO skeleton; not-cached leaves
+it unrequested + badge-free and a later requestAll still sends the real request; a
+probe timeout renders nothing and stays retryable; concurrency ≤ 3; a blob
+candidate ships bytes with `cacheOnly:true`; unregister cancels an in-flight
+probe; `hydrate:false` sends zero probes and never counts; probes ignore pause.
+New `translateHandlersCacheOnly.test.ts` (5, mocks `./cache`): cacheOnly+miss →
+the not-cached arm and the SharedAbort registry stays empty (never
+coalesced/enqueued); cacheOnly+hit → the page; cacheOnly+live-negative → the
+mapped provider error; `countCachedForSite` → the mocked count, and 0 without an
+origin. Typecheck + eslint clean; `vite build` clean (background ~38.4 kB →
+~41.3 kB, content ~32 kB → ~33.2 kB); `web-ext lint` 0 errors / 0 warnings (the
+lone `data_collection_permissions` notice stays Phase-8-deferred).
+
+**Manual verification — STATUS: NOT executed in this implementation session** (no
+live Firefox + real Anthropic key + the Eminence-in-Shadow reader from the coding
+environment). Recorded honestly rather than faked — the outstanding human/live DoD
+item, as every prior phase's was. The handoff's steps are ready against the built
+`dist/` with `claude-sonnet-5`, after FIRST clearing the test site's cache (F15 —
+7.5 union-snap entries would mask the item-1 fix): (2) the joined-bubble
+Eminence page → each connected bubble gets its OWN lobe box (or, at worst, the
+loose provider boxes — never one box swallowing the pair with stacked text);
+(3) ordinary separated bubbles on the same chapter → still snap tight (no guard
+regression); (4) drag-select across the joined pair → same per-lobe result,
+clamped to the selection; (5) non-auto http site: Translate all a chapter, reload
+→ overlays reappear with NO click and ZERO `v1/messages` in the network panel, the
+popup cost line unmoved; (6) MangaDex blob site → same (bytes-path probes);
+(7) a never-translated news site with large images → background console shows the
+count-0 short-circuit, no probe traffic; (8) an opted-in auto reader → unregressed,
+no double renders. If a joined pair still splits WRONG (cut through a bubble,
+wrong lobe): screenshot + note the page and tune `SHARED_BLOB_IOU` /
+`SWALLOW_COVERAGE` before adding mechanism.
