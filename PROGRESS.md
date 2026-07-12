@@ -1242,3 +1242,419 @@ ignores-non-rate-limit), **451 total green**; the existing 420 stay green
 untouched; typecheck + eslint + `vite build` clean; `web-ext lint` 0 errors /
 0 warnings (the lone `data_collection_permissions` notice stays Phase-8-deferred).
 Content bundle unchanged at ~28 kB; background grew ~1 kB (rateGate).
+
+## Phase 7.3 summary (live-site fixes round 2: object-fit-aware overlay geometry)
+
+The SECOND live-browser verification (2026-07-10, Firefox release build, real
+Gemini key, a keyoapp-style reader in "Fit Both" mode) root-caused ONE finding:
+**overlay bubbles landed far off the artwork and spilled past the drawn page's
+right edge into the black letterbox bars.** Region bboxes are clamped to [0,1] by
+`sanitizePage`, so under a correct mapping a bubble physically can't escape the
+bitmap — the mapping itself was wrong. Every overlay geometry consumer treated
+the `<img>` **element box** (`getBoundingClientRect`) as the drawn bitmap, an
+equality that holds only under the default `object-fit: fill`. "Fit Both" is
+`object-fit: contain`: the element spans the whole reader column while the bitmap
+is letterboxed inside it, so every normalized bbox was stretched across the
+element box. **This REVERSES the Phase 7.1 "object-fit: contain/cover divergence —
+accepted" note** — a mainstream reader mode triggers it, so accepted no longer.
+This is a content-script-only point-phase (precedent 4.1/5.1/7.1/7.2): **NO
+`shared/types.ts` / `shared/messages.ts` / `shared/settings.ts` change,
+cache-key composition and `PROMPT_VERSION` untouched**; the pure-core / thin-shell
+split holds.
+
+**New module — `content/overlay/contentBox.ts` (object-fit math + one DOM
+shell).** The PURE, exhaustively-tested core is `computeContentBox(boxW, boxH,
+naturalW, naturalH, fit, posX, posY)` — the CSS spec's replaced-element draw rect:
+`fill` → the content box; `contain`/`cover` → `min`/`max(boxW/naturalW,
+boxH/naturalH)` scale; `none` → 1; `scale-down` → `min(1, containScale)`; then the
+`object-position` offset per axis is `fraction × free` (free = boxSize − drawnSize,
+NEGATIVE under cover/none-overflow — the formula handles it, no special-case) or a
+verbatim `px`. `parseObjectPosition` parses a COMPUTED `object-position` (`"50%
+50%"` / `"0px 12px"` / mixed; missing 2nd → 50%; `calc()`/exotic → center — WHY
+parse the computed value: getComputedStyle already resolved `left`/`top` keywords
+to %, so keyword handling would be dead code). `insetContentBox` turns the
+border-box rect into the content box (a 1 px border shifting every bubble is
+exactly the off-by-a-little this phase kills). **Degenerate inputs (natural/box
+≤ 0, non-finite) return the fill result** = the pre-7.3 element-box behavior, so a
+broken/undecoded image can never render WORSE than the status quo (rule 4). The
+thin, untested shell `readContentBox(el)` is the ONE DOM read: `<img>`
+(`naturalWidth/Height`, 0-while-undecoded falls through to the fill fallback) and
+`<canvas>` (`width/height` — object-fit applies to canvas too, and drag-select
+accepts canvas) get `getBoundingClientRect` + ONE `getComputedStyle` (objectFit,
+objectPosition, border + padding) → inset → `computeContentBox` → the bitmap's
+CLIENT rect; every other element (background-image hosts have no readable
+intrinsic size) returns the plain element rect; the whole body is try/catch →
+element rect on any throw (**the fail-soft path IS the status quo**).
+
+**OverlayManager — host covers the DRAWN-BITMAP rect (items 1–3; DESIGN CHOICE
+(a)).** The host is sized/positioned to the content-box rect, NOT the element box
+with bubbles offset inside (option (b), rejected). WHY (a): it keeps `regionToPx`
+the untouched ONE bbox→px conversion (handoff rule), makes the skeleton + error
+badge sit on the artwork for free, and keeps peek hit-testing a simple host-local
+containment test. `positionEntry` now targets `readContentBox(el)` and **RETURNS
+that content rect** so `paint`/`syncEntry` reuse it (the content-box read's one
+extra `getComputedStyle` per entry per rAF flush REPLACES, not stacks on, today's
+second rect read — the one-read-per-frame budget holds); the Phase 5.1 residual-
+error correction below it is byte-identical (it just compares against the content
+rect now). `paint` feeds the content size to `regionToPx` + textFit and stores it
+as `lastPaintedSize`; `syncEntry`'s `displayedSizeChanged` keys on the content
+size (a Fit Both → Fit Width flip changes the DRAWN size even when the element box
+is stable — the repaint must key on what we painted with); `processPeek`
+bounds-checks against the content rect so hovering a letterbox bar no longer
+hit-tests as inside the image. **Accepted caveat (WHY-noted, not engineered
+around):** a pure-CSS fit-mode flip that keeps the element box byte-identical AND
+fires zero scroll/resize/ResizeObserver activity won't re-sync until the next sync
+trigger — real reader mode switches always reflow the element, so no
+style-attribute observer.
+
+**regionSelect — drag-select crops normalize against the drawn bitmap (item 4;
+the silent WRONG-CROP fix).** `defaultCollectTargets` builds `RegionTarget.rect`
+from `readContentBox(el)` for `<img>`/`<canvas>` (background hosts keep the
+element rect — `readContentBox` returns it unchanged for them). This fixes BOTH
+downstream consumers with ZERO pure-math change: `pickTargetImage` ranks by
+intersection with actual artwork, and `selectionToImageBbox` normalizes the crop
+against the bitmap, so on a letterboxed reader the background's `planRegionCrop`
+cuts the pixels the user actually selected (before 7.3 the crop was off by the
+letterbox offset — the provider translated a different area than was selected).
+The `MIN_RENDERED_PX` floor deliberately stays on the ELEMENT rect (WHY-noted: the
+floor is about click-target size — a letterboxed-but-large image must stay
+selectable — not bitmap size).
+
+**Test-page fixtures (item 5).** `tests/fixtures/testpage.html` gains two
+below-the-fold variants of the manga-page SVG placeholder (existing ids/fixtures
+untouched): (f) a portrait bitmap in a WIDE `object-fit: contain` box (the "Fit
+Both" case — bubbles must letterbox-align, centered) and (g) the same with
+`object-position: left top` (pins the position math), each on a dark background so
+the letterbox bars are visible. Makes the fix manually verifiable without the live
+site.
+
+**Tests — item-3 seam choice flagged:** I took the house-style route (pure item-1
+coverage + WHY comments), NOT a contrived `readContentBox` seam injected into the
+OverlayManager — consistent with OverlayManager being an untested thin shell (no
+`OverlayManager.test.ts` exists; every *decision* it makes already lives in a
+tested pure helper). 24 new `contentBox` tests carry the math (fill identity;
+contain wide-box-portrait — THE reader case, asserting the horizontal letterbox
+offsets AND that the bitmap can't reach the element's right edge; contain
+tall-box-landscape; cover negative-offsets both axes; none larger/smaller than
+box; scale-down both branches; object-position 0/50/100%/px/mixed/negative-free-
+space-cover; parse matrix incl. single-component + garbage→50% + negative px;
+degenerate natural-0/box-0/NaN fallbacks; border/padding inset), and 2 new
+`regionSelect` cases pin the item-4 end-to-end contract (a selection over the
+letterbox bar → `pickTargetImage`/`selectionToImageBbox` null → no request; a
+selection over the bitmap → bbox normalized to the BITMAP rect, not the element
+box). **477 total green**; the existing 451 stay green untouched; typecheck +
+eslint + `vite build` clean; `web-ext lint` 0 errors / 0 warnings (the lone
+`data_collection_permissions` notice stays Phase-8-deferred). Content bundle
+~28 kB → ~30.6 kB (the contentBox module); background unchanged.
+
+**Manual verification — STATUS: NOT executed in this implementation session (no
+live Firefox + real Gemini key + a letterboxed reader from the coding
+environment). Recorded honestly rather than faked** — the one outstanding DoD item,
+a human/live step by nature as every prior phase's manual pass was. The handoff's
+8 steps are ready against the built `dist/` + the new fixtures (f)/(g): (2) the
+2026-07-10 letterboxed reader → bubbles on the balloons, nothing past the drawn
+edges, the skeleton on the artwork not the bars; (3) switch Fit Both → Fit Width →
+Long Strip → overlays re-align after each reflow; (4) drag-select a single bubble
+while letterboxed → the translation matches the selected balloon (the wrong-crop
+regression test); (5) peek → hovering a bubble shows the original, the letterbox
+bar does nothing; (6) fixtures (f)/(g) overlay correctly + the `fill` fixtures are
+unregressed; (7) MangaDex spot-check unregressed. **Step 8 is evidence-only** — if
+bubbles still look sloppy relative to balloons AFTER all the above, that residual
+is provider bbox quality (capture one raw Gemini response and file it), NOT overlay
+geometry; do NOT start prompt tuning here (`PROMPT_VERSION` is frozen).
+
+## Phase 7.4 summary (live-site fixes round 3: corner-format bboxes, joint edge clamp, overlap trim, pause queue)
+
+Driven by the THIRD live-browser verification (2026-07-11, Anthropic
+`claude-haiku-4-5`) and a full network capture of one chapter's run (22
+`v1/messages` calls). The raw `tool_use` inputs settled the "sloppy boxes"
+question: **the model returns CORNER-format boxes.** The schema asked for
+`bbox: [x, y, width, height]`, but roughly half the returned regions are
+unmistakably `[x_min, y_min, x_max, y_max]` (call 0's top-right bubble column:
+`[0.550,0.320,0.950,0.420]` is a plausible bubble read as corners but 95%-of-page
+wide read as w/h; calls 5/10/13–15 are entirely corner-format, 3/11/16 entirely
+w/h, 17 mixes them row by row). Read as w/h a corner box renders ~twice as
+wide/tall, spilling right+down over its neighbours — exactly the overlapping,
+edge-spilling boxes in the screenshots, on BOTH the auto page path and
+drag-select.
+
+**Item 1 — canonical format REVERSED to corners, `PROMPT_VERSION` → 2.** Rather
+than fight the model's training with w/h, the canonical schema's `bbox` now asks
+for `[x_min, y_min, x_max, y_max]` (fractions 0–1, x-first) — schema-follows-model,
+not model-follows-schema; asking for corners turns Haiku's failure mode into
+compliance. `CANONICAL_SCHEMA`'s bbox description and `SYSTEM_PROMPT_TEMPLATE`'s
+BOUNDING BOX RULES were rewritten to match (plus one new line, "Boxes for
+different regions should not overlap." — cheap, targets the duplicate-detection
+damage). `type`/`minimum`/`maximum`/`minItems`/`maxItems` are unchanged, so all
+three dialect converters (Gemini strip-additionalProperties, OpenAI strict
+strip-ranges, Anthropic as-is) carry the new description through untouched.
+`PROMPT_VERSION` bumped 1 → 2 (it lives inside each cache KEY, so old-format-era
+entries go stale naturally); `docs/PROMPTS.md` §2/§3/§6 updated to stay a
+byte-mirror of the module. WHY x-first fractions and not Gemini's native y-first
+0–1000 `box_2d`: the live provider is Anthropic and the HAR shows x-first
+fractions are Haiku's natural emission; a Gemini-specific dialect needs its own
+live evidence (out of scope).
+
+**Item 2 — `parseBbox` is now corners-first with a JOINT edge clamp
+(`ProviderBase.ts`).** An array `[a,b,c,d]` is read as corners (`w=c−a, h=d−b`);
+if EITHER extent is non-positive the row can't be corners, so it falls back to the
+legacy w/h reading (`w=c, h=d`) for any third-party endpoint still emitting w/h.
+The `{x,y,w,h}` object form is unchanged. Then, on ALL paths, a joint clamp: `x,y`
+into [0,1], then `w = min(w, 1−x)`, `h = min(h, 1−y)`; a box degenerate after
+clamping (`w≤0` or `h≤0`) is dropped. **This corrects a FALSE claim carried in the
+7.3 handoff and PROGRESS.md** — that "bboxes are clamped to [0,1] so a bubble
+physically cannot escape the bitmap." The old clamp pinned each component
+INDEPENDENTLY, so `x + w` could reach 2.0 and a box could legally render past the
+drawn bitmap's right/bottom edge. Only now, with the joint clamp, is that claim
+TRUE. Everything downstream is untouched: conversion happens in `parseBbox` BEFORE
+`remapBboxFromTile`, so tiles and drag-select crops inherit the fix for free, and
+`sanitizePage`'s area/dedupe rules and the cached `BBox` shape are unchanged.
+
+**Item 3 — render-time overlap trim (`overlay/overlapTrim.ts`, new pure module).**
+Even under the corner reading, adjacent boxes overlap — the model estimates
+coordinates on a coarse ~0.05 grid, and call 12 held true duplicate detections at
+different positions (identical-dedupe can't catch them; IoU < 0.85). `trimOverlaps`
+is a deterministic, PURE post-step: for each intersecting reading-order pair it
+shrinks BOTH boxes along the axis with the SMALLER overlap extent, each giving up
+half the overlap so their shared edge meets in the middle. It caps each box's
+cumulative shrink at 30% of its original per-axis size, and leaves a pair alone if
+the cap would be exceeded or if one box CONTAINS the other (a contained duplicate
+is a detection error trimming would mangle; draw order already stacks them
+readably). Same principle as `filterRegions` — a VIEW fix on copies; the cache
+keeps the provider's honest boxes. `OverlayManager.paint` chains it after
+`filterRegions` (regions → filter → trim → `regionToPx`); `paintedRects`/peek
+indexing needs no change (both functions are pure, so paint re-derives the same
+order). WHY trim, not merge: merging two different-text regions would invent a
+bubble that doesn't exist.
+
+**Item 4 — pause the translate queue (user feature: "stop translating more pages
+than already started").** Semantics: pausing lets every already-STARTED provider
+call finish and render, aborts every queued-but-not-started page job, and stops
+new sends (visibility, prefetch, translate-all) until resumed. Pause is per-tab
+RUNTIME state — it dies with the content script on navigation (a persisted pause
+that silently disabled translation across sessions would be a support trap).
+Background: a `startedRequests` Set parallel to `requestControllers`, fed by an
+`onStarted` callback threaded from the `translatePage` handler → `translateImage` →
+`runTranslateMiss`, invoked as the FIRST statement inside the queue task closure —
+the precise moment `PriorityQueue` pulls a job off the wait list. A new
+`cancelQueuedTranslations` message aborts each id that is registered AND not
+started, and counts them; started/unknown ids are silently skipped — that IS the
+feature. **Coalesced-follower caveat (accepted):** a follower never reaches
+`queue.add`, so it is never marked started; pausing aborts the follower's waiter
+while the leader's run completes and caches, and the paused page then renders from
+cache on resume — correct and free. Content: `ViewportQueue` gained `setPaused`
+(collect tracked requestIds, send ONE `cancelQueuedTranslations`, resolve with the
+cancelled count; on resume, reobserve unrequested candidates so auto sites re-plan)
+and `isPaused`; `sendTranslate` gates before flipping `requested`/`setPending` and
+re-checks after the `acquireBytes` gap; `requestAll` no-ops to 0 while paused. The
+aborted page jobs flow through viewportQueue's EXISTING aborted branch (reset +
+clear + reobserve), exactly as its comment anticipated. Messages/router/popup:
+`setTranslationsPaused`/`getTranslationsPaused` (popup → content), inert tabs reply
+with defaults; a "Pause queue" ↔ "Resume queue" toggle next to Translate all,
+hidden while inert, disabling Translate all while paused, reflecting state on open;
+the label/disabled decisions live in a pure, tested `queueControls`.
+`shared/types.ts` and `shared/settings.ts` untouched; `shared/messages.ts` gained
+exactly three entries.
+
+**Tests — 504 total green** (was 477; +27). New: `overlapTrim.test.ts` (8 —
+disjoint/x-split/y-split/axis-choice/cap/containment/no-mutation/deterministic);
+`translateHandlersPause.test.ts` (2 — `cancelQueuedTranslations` aborts a
+registered-not-started id + skips unknown/counts, and skips an already-started id,
+driving `onStarted` through the real pipeline with a hanging mocked `prepareImage`
+and polling a `startedRequestsHasForTest` seam). Extended: `providerPipeline`
+parseBbox suite rewritten for corners-first + joint clamp (HAR literals as
+fixtures; the `out_of_range_bbox` golden now asserts the joint-clamp behaviour —
+row 1 clamps to zero width and drops, row 2's width is capped at 1−x); `prompt`
+(corner description carried through all three dialects, the new no-overlap line);
+`constants` (pins `PROMPT_VERSION === 2`); `contentRouter` (both new inert-safe
+handlers); `popupLogic` (`queueControls`/`pauseButtonLabel`); `viewportQueue` (6
+pause cases: blocks a visibility send, requestAll→0, an in-flight request rendering
+during pause, a pause-aborted request reset+clear+reobserve, resume reobserves
+unrequested candidates, the acquireBytes-gap re-check). The existing golden
+fixtures are w/h-format and now double as w/h-fallback coverage (most rows have a
+degenerate corners reading, so they exercise the fallback path — semantics
+unchanged). Typecheck + eslint clean; `vite build` clean; `web-ext lint` 0 errors /
+0 warnings (the lone `data_collection_permissions` notice stays Phase-8-deferred).
+Content bundle ~30.6 kB → ~32 kB; background ~35.6 kB.
+
+**`npm run eval:live` — NOT re-run this session** (needs a real key; not available
+from the coding environment). Outstanding DoD item, recorded honestly per the 7.3
+precedent — re-run it before accepting the prompt wording change, and if bbox
+quality is still poor AFTER the format fix, capture one raw response and compare
+against the corner reading (garbage in BOTH readings ⇒ model quality; try
+`claude-sonnet-5`/Gemini before any further prompt surgery).
+
+**Manual verification — STATUS: NOT executed in this implementation session** (no
+live Firefox + real Anthropic key + the Eminence-in-Shadow reader from the coding
+environment). Recorded honestly rather than faked — the outstanding human/live DoD
+item, as every prior phase's manual pass was. The handoff's steps are ready against
+the built `dist/`: (2) the 2026-07-11 auto page → boxes sit ON their bubbles, the
+top-right column no longer spans half the page, nothing past the drawn edges, no
+gross overlap; (3) drag-select the two right-side bubbles → boxes land on their own
+bubbles; (4) letterboxed "Fit Both"/"Fit Width" re-align + peek over a bar does
+nothing (doubles as the never-fully-run 7.3 manual pass); (5) MangaDex blob
+spot-check unregressed; (6) Translate all on a 10+ page chapter → Pause → in-flight
+pages finish and render, other skeletons clear, network shows no new `v1/messages`;
+Resume → auto site re-queues scrolled-to pages, manual site re-clicks Translate all;
+(7) cost counter increments only for calls that actually ran.
+
+## Phase 7.5 summary (bubble snap: pixel-refined bboxes + pause-log cleanup)
+
+Driven by the FOURTH live verification (2026-07-11, Firefox release, **Anthropic
+`claude-sonnet-5`** — the user moved off `claude-haiku-4-5` mid-session; Haiku
+4.5 confirmed unusable for manga: its returned boxes are a formulaic column-grid
+guess — call 1 nearly every box `x 0.05–0.45`/`0.55–0.95` width 0.40, call 3 all
+width 0.36, call 8 all width 0.30 — and its vertical-CJK transcription scrambles,
+so this is model capability, not geometry/prompt). Two HAR captures settled it:
+Sonnet 5's boxes land on the RIGHT bubbles (user-confirmed) at ≈$0.017/page but
+still sit on a coarse grid — correct-but-loose. The wasted 400 in capture 2
+(`"temperature is deprecated for this model"`) is the **Phase 3.1 learn-on-400
+sampling-param downgrade firing exactly as designed** (call 1 retried without
+`temperature` and succeeded; one wasted 400 per model per event-page lifetime,
+no code change). This phase fixes the residual looseness deterministically and
+for free — **no prompt-layer changes; `PROMPT_VERSION` stays 2**, this is
+geometry via local pixels, not prompt surgery. A point-phase (precedent 4.1/5.1/
+7.1–7.4).
+
+**New module — `background/bubbleSnap.ts` (pure core + thin decode shell).**
+"Bubble snap" treats the provider's box as a *seed* and snaps it to the actual
+speech-bubble blob via flood fill on the decoded bitmap; every failure path falls
+back to the provider's box, so the worst case is exactly the pre-7.5 behaviour
+(rule 4). **WHY background, not content:** a content script can't read pixels of
+a cross-origin `<img>` (canvas taint, §7.3); the background already holds the
+clean bytes on both paths. **WHY snapped boxes are CACHED** (unlike the
+render-time `trimOverlaps`, which stays a view-fix on copies): snap is a
+deterministic function of (image bytes, provider box) — same inputs → same
+output — so caching it is memoization, not a lie about what the provider said;
+no `CACHE_VERSION` bump (pre-7.5 entries render with unsnapped geometry until
+they age out). **Full local ML detection (onnxruntime-web etc.) was REJECTED**
+for now (tens of MB of weights, WASM seconds/page, AMO weight) — revisit only if
+VLM boxes stay bad across providers.
+
+The PURE, exhaustively-tested core: `snapRegionToBubble(img, bbox, opts?) → BBox
+| null` on a minimal `SnapBitmap = {data, width, height}` (RGBA, as `getImageData`
+returns, so tests build fixtures with typed arrays and no DOM). Algorithm — try
+the box **center then 8 quarter-point seeds** (center first); a seed must be
+LIGHT (luminance `0.299R+0.587G+0.114B` ≥ `LIGHT_FLOOR` 160; a dark seed on a
+stroke/art skips); **flood fill** (iterative, 4-connected, `visited` bitmap — no
+recursion) over pixels with luminance ≥ `max(LIGHT_FLOOR, seedLum −
+SEED_TOLERANCE 24)` (relative tolerance so off-white paper / mild screentone
+still fills); then the two guards that make snap safe — **min-area reject** (blob
+< `MIN_BLOB_FRACTION` 0.25 × seed-box area ⇒ the fill found a glyph counter
+(口/O) or a speck → try the next seed) and **leak reject** (blob > `MAX_BLOB_BOX_
+RATIO` 4 × seed-box area OR > `MAX_BLOB_IMAGE_FRACTION` 0.35 of the bitmap ⇒ the
+fill escaped through an outline gap / open tail into the page background →
+**abandon ALL seeds and return null**, because a leak from one seed leaks from
+every seed in that blob); on acceptance the blob's bounding box, padded 1 snap-px,
+back in fractional space. The 4× ratio also bounds how far snap may **GROW** a
+too-small seed box — snap is bidirectional (shrinks an oversized box, grows a
+small one, up to 4× area). `shouldSnapKind(kind)` snaps **only `bubble` and
+`thought`** (white-interior shapes); `caption`/`sfx`/`sign`/`other`/undefined sit
+on art where a fill leaks or lands dark and keep the provider box (**WHY
+conservative:** a wrong snap is worse than a loose box). `computeSnapSize` and
+`clampBoxToRect` are pure too (below). Constants exported for the tests to tune.
+
+The thin, untested `snapPageRegions(blob, page, clampRect?)` shell (same env
+reason `prepareImage`/`cacheStorePage` are untested — no `createImageBitmap`/
+`OffscreenCanvas` in Node): early-returns the page UNCHANGED when no region is
+snap-eligible (a caption/SFX-only page pays ZERO snap cost, no decode), else
+`createImageBitmap` → draw onto an OffscreenCanvas at **`computeSnapSize`** with a
+white underlay (a transparent PNG would decode black = all-dark = every seed
+fails) → `getImageData` → run the core per eligible region → return a NEW page
+(never mutates the input; unchanged regions reused by reference in a fresh array).
+Closes the bitmap in `finally`; the whole body is try/catch → **returns `page`
+unchanged on any throw** (rule 4). **`SNAP_MAX_EDGE` = 512** because downsampling
+is load-bearing, not just cheap: at ≤512 px a 1–2 px outline gap closes by itself
+and glyph strokes blur toward gray (fewer false-light seeds) while bubbles stay
+hundreds of px². **Long strips (flagged implementer's call):** `computeSnapSize`
+**raises the cap so the SHORT edge holds a `SNAP_MIN_SHORT_EDGE` = 256 floor**
+(512-on-a-20000-px long edge would crush an 800-wide strip to ~20 px and destroy
+every blob) — chosen over per-tile snapping as simpler; a 256×N bitmap is cheap
+enough to fill whole.
+
+**Wiring (both provider paths; snap composes AFTER parseBbox-normalize →
+merge/remap, BEFORE cache/paint).** Page path — `translateHandlers.translate-
+Prepared`: after `mergeTilePages`, `merged = await snapPageRegions(blob, merged)`
+using the ORIGINAL full-image `blob` already in scope, INSIDE the queue slot
+(decode+fill at ≤512 px is ms-scale next to a provider round trip) and BEFORE
+`cacheStorePage`, so hits replay the tight geometry for free. Region path —
+`regionHandlers.translateRegionImage`: the provider's boxes are already in
+full-image space (crop-as-tile remap), so snap against the FULL image, then pass
+the selection `crop` as `clampRect` — a snapped box that GROWS past the user's
+selection is clamped back to it (a drag-select must never paint outside what was
+selected); a snapped box that clamps to nothing keeps the provider box. Content
+paint order is unchanged (`filterRegions → trimOverlaps → regionToPx`); snapped
+boxes rarely overlap, and `trimOverlaps` still guards true duplicate detections.
+**No `shared/*` change; cache-key composition and `PROMPT_VERSION` untouched.**
+
+**Item 2 — pause/console-noise cleanup (user's 2026-07-11 console export).** (a)
+`translateHandlers`' `translatePage` catch logged `log.warn("translatePage failed
+…")` for EVERY aborted job — a 15-page pause flooded the console with "All waiters
+aborted" warnings that read as failures. Now gated to `log.debug` for aborts,
+`log.warn` for real failures. **Gate on the MAPPED `errorKind`, not bare
+`isAbortError`** (a deliberate improvement over the handoff's literal suggestion):
+an abort surfaces variously as a raw `AbortError` (queue / SharedAbort's "All
+waiters aborted"), an `ImageFetchError('aborted')` (mid-fetch — whose `.name` is
+NOT "AbortError", so `isAbortError` misses it, and pause aborts plenty of
+still-fetching jobs), or a `ProviderError('aborted')`; `errorToTranslateResult`
+already collapses all three to `aborted`, so gating on it silences every abort
+variant. The returned result mapping is unchanged. (b) Popup: the on-open
+`getTranslationsPaused` query (and the defensive `setTranslationsPaused` write)
+rejected with "Could not establish connection" on inert tabs (about:, addons.
+mozilla.org, never-injected) and logged at warn; both now log at `debug` and
+default to not-paused (the toggle is hidden while inactive anyway), mirroring how
+translateAll's dry-run treats inert tabs. Popup stays a thin shell — no pure
+helper fell out, so WHY comments are the house-style bar (per the handoff).
+
+**Design choices flagged (recap):** background-not-content (canvas taint);
+snapped boxes cached as deterministic memoization vs. the render-time trim's
+view-fix-on-copies; the two safety guards (min-area glyph-counter reject,
+open-outline leak cap → null) and their conservative kind gating (bubble/thought
+only); the short-edge-floor strip handling (raise-the-cap over per-tile); the
+abort-log gate keyed on the mapped kind. **Out of scope (not built, per the
+handoff):** local ML text detection/OCR; non-rectangular overlays (the snap
+core's blob is the natural later input — noted, not built); any prompt/schema
+change; a Gemini `box_2d` dialect; prompt caching for the static prefix (the real
+input-cost saver — its own phase with cache-hit verification); snapping caption/
+sfx/sign kinds.
+
+**Tests — 524 total green** (was 504; +20). New `bubbleSnap.test.ts` (19,
+synthetic-`SnapBitmap` fixtures — a small helper fills rects/ellipses into typed
+arrays): loose box over a white ellipse on gray → tightens to the ellipse bounds;
+oversized box → SHRINKS to the bubble; too-small box → GROWS to the bubble;
+large connected white region → leak cap → null; glyph-counter center seed →
+min-area reject, offset seed recovers the real bubble; all-dark → null; off-white
+(lum ~230) interior still fills under the relative tolerance; degenerate bbox
+(w/h ≤ 0, NaN) → null; input bbox not mutated; deterministic; zero-size bitmap
+guard; `shouldSnapKind` matrix; `computeSnapSize` (unscaled-within-cap, long-edge
+cap, strip short-edge floor, no-upscale + degenerate); `clampBoxToRect`
+(contained / clipped-to-intersection / disjoint → null). Extended
+`translateHandlersPause.test.ts` (+1: an aborted job produces no warn-level
+"translatePage failed" log — spies `console.warn`, drives the real abort
+pipeline). The existing 504 stay green untouched (the wiring is inert in Node:
+`snapPageRegions` early-returns for kind-less mocked regions, and the one test
+that reaches it with a valid image throws at `prepareImage` before the snap).
+Typecheck + eslint clean; `vite build` clean; `web-ext lint` 0 errors / 0
+warnings (the lone `data_collection_permissions` notice stays Phase-8-deferred).
+Background bundle ~35.6 kB → ~38.4 kB (bubbleSnap); content unchanged at ~32 kB
+(snap is background-only).
+
+**Manual verification — STATUS: NOT executed in this implementation session** (no
+live Firefox + real Anthropic key + the Eminence-in-Shadow reader from the coding
+environment). Recorded honestly rather than faked — the outstanding human/live DoD
+item, as every prior phase's manual pass was, and **steps 2–6 double as the
+outstanding 7.4 manual items** (corner boxes + pause were already user-verified
+live on 2026-07-11; the Haiku grid-guess finding, the Sonnet-5 switch, and the
+temperature-400 downgrade firing as designed are the recorded evidence). The
+handoff's steps are ready against the built `dist/` with `claude-sonnet-5` and a
+site opted in: (2) auto-translate the chapter → boxes hug the bubble outlines
+(visibly tighter than capture 2), text size varies less across bubbles, nothing
+paints over adjacent art; (3) drag-select the two right-side bubbles → boxes land
+ON the bubbles AND inside the selection; (4) a captions/SFX page → those render at
+the provider box (unsnapped, unregressed); (5) MangaDex blob page → snap runs on
+content-shipped bytes too; (6) reload the chapter → instant render with the SAME
+tight boxes (snap was cached, no re-decode); (7) pause mid-chapter → console shows
+NO warn-level "translatePage failed … All waiters aborted" spam, and the popup on
+a fresh about:blank tab shows no `getTranslationsPaused` error. If a specific
+bubble snaps WRONG (box jumps to the wrong blob): screenshot + note the page, and
+tune the constants before adding mechanism.

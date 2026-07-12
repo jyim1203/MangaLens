@@ -27,6 +27,7 @@ import {
   hostnameFromUrl,
   needsApiKey,
   planTranslateAll,
+  queueControls,
   regionSelectEnabled,
   siteChoice,
   siteChoicePatch,
@@ -57,6 +58,7 @@ const els = {
   provider: must<HTMLSelectElement>("provider"),
   model: must<HTMLInputElement>("model"),
   translateAll: must<HTMLButtonElement>("translate-all"),
+  pauseQueue: must<HTMLButtonElement>("pause-queue"),
   selectRegion: must<HTMLButtonElement>("select-region"),
   actionStatus: must<HTMLParagraphElement>("action-status"),
   cost: must<HTMLSpanElement>("cost"),
@@ -70,6 +72,8 @@ let tabId: number | undefined;
 let tabHost: string | undefined;
 /** Set while the translate-all button is in its "click again to confirm" step. */
 let pendingConfirmCount: number | undefined;
+/** Current pause state of this tab's queue (Phase 7.4), reflected on open. */
+let paused = false;
 /** Banners the user ✕-ed away. Popup-instance-scoped (not persisted): the
  *  banners are state-driven and would otherwise reappear on the next render. */
 const dismissed = { key: false, perm: false };
@@ -135,10 +139,15 @@ function render(settings: Settings): void {
   els.bannerKey.hidden = dismissed.key || !needsApiKey(settings);
 
   const active = tabHost ? getEffectiveEnabled(settings, tabHost) : false;
-  els.translateAll.disabled = !active;
+  const controls = queueControls(active, paused);
+  els.translateAll.disabled = controls.translateAllDisabled;
   els.translateAll.title = active
     ? "Queue every detected image on this page"
     : "Enable MangaLens on this page first";
+
+  // Pause toggle (Phase 7.4): hidden unless the page is active; label reflects state.
+  els.pauseQueue.hidden = controls.pauseHidden;
+  els.pauseQueue.textContent = controls.pauseLabel;
 
   els.selectRegion.disabled = !regionSelectEnabled(settings, tabHost);
   els.selectRegion.title = active
@@ -231,6 +240,34 @@ async function onSelectRegionClick(): Promise<void> {
   }
 }
 
+/**
+ * Toggle the tab's translate queue between paused and running (Phase 7.4).
+ * Pausing lets started pages finish and aborts the rest; resuming re-plans
+ * still-visible pages on auto sites. Reflects the resulting state in the button
+ * and status line.
+ */
+async function onPauseClick(): Promise<void> {
+  if (tabId === undefined || !current) return;
+  const next = !paused;
+  try {
+    const res = await sendToTab(tabId, "setTranslationsPaused", { paused: next });
+    paused = res.paused;
+    render(current);
+    els.actionStatus.textContent = paused
+      ? res.cancelledQueued > 0
+        ? `Paused — stopped ${res.cancelledQueued} queued page${res.cancelledQueued === 1 ? "" : "s"} (in-progress pages finish).`
+        : "Paused — in-progress pages finish, no new pages start."
+      : "Resumed.";
+  } catch (err) {
+    // Debug, not warn (Phase 7.5 item 2): an inert tab rejecting with "Could not
+    // establish connection" is expected, not a failure worth a warn — the user
+    // still gets the actionable message below. (The button is hidden on inactive
+    // pages, so this path is defensive.)
+    log.debug("setTranslationsPaused unavailable (inert tab)", err);
+    els.actionStatus.textContent = "Couldn't reach this page — reload it and try again.";
+  }
+}
+
 function wireEvents(): void {
   els.enabled.addEventListener("change", () => {
     void sendToBackground("toggleEnabled")
@@ -270,6 +307,8 @@ function wireEvents(): void {
   });
 
   els.translateAll.addEventListener("click", () => void onTranslateAllClick());
+
+  els.pauseQueue.addEventListener("click", () => void onPauseClick());
 
   els.selectRegion.addEventListener("click", () => void onSelectRegionClick());
 
@@ -322,7 +361,31 @@ async function main(): Promise<void> {
 
   wireEvents();
   render(settings);
-  await Promise.all([renderPermissionBanner(), renderCost()]);
+  await Promise.all([renderPermissionBanner(), renderCost(), reflectPauseState()]);
+}
+
+/**
+ * Reflect the tab's current pause state on open (Phase 7.4). Fails quiet — an
+ * inert/unreachable tab just leaves the toggle in its default "not paused" state
+ * (which render() also hides when the page is inactive).
+ */
+async function reflectPauseState(): Promise<void> {
+  if (tabId === undefined || !current) return;
+  try {
+    const { paused: p } = await sendToTab(tabId, "getTranslationsPaused");
+    if (p !== paused) {
+      paused = p;
+      render(current);
+    }
+  } catch (err) {
+    // WHY debug, not warn (Phase 7.5 item 2): the popup queries pause state on
+    // open, and a tab with no content script (about:, addons.mozilla.org, a
+    // never-injected page) rejects with "Could not establish connection" — a
+    // normal inert-tab outcome, not a failure. Default stays "not paused" (the
+    // toggle is hidden anyway while the page is inactive), mirroring how
+    // translateAll's dry-run treats inert tabs.
+    log.debug("getTranslationsPaused unavailable (inert tab)", err);
+  }
 }
 
 void main().catch((err) => {

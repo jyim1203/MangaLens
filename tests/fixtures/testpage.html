@@ -140,6 +140,50 @@
           (Alt+Shift+S) over it to exercise the bytes path
         </figcaption>
       </figure>
+
+      <!-- (f) Phase 7.3: a PORTRAIT page in a WIDE fixed-size box with
+           object-fit: contain — the "Fit Both" reader case. The <img> element
+           spans 820×480 but the bitmap letterboxes to the center, so overlays
+           must land on the CENTERED artwork, NOT stretched across the whole box
+           or into the dark letterbox bars. -->
+      <figure>
+        <img
+          id="letterbox-contain"
+          alt="letterboxed (object-fit: contain) page"
+          style="
+            width: 820px;
+            max-width: 100%;
+            height: 480px;
+            object-fit: contain;
+            background: #222;
+          "
+        />
+        <figcaption>
+          (f) object-fit: contain in a WIDE box — overlays must letterbox-align
+          (bitmap centered; nothing in the dark bars)
+        </figcaption>
+      </figure>
+
+      <!-- (g) Same, but object-position: left top pins the bitmap to the top-left
+           corner instead of centering — pins the position math. -->
+      <figure>
+        <img
+          id="letterbox-topleft"
+          alt="letterboxed page pinned top-left"
+          style="
+            width: 820px;
+            max-width: 100%;
+            height: 480px;
+            object-fit: contain;
+            object-position: left top;
+            background: #222;
+          "
+        />
+        <figcaption>
+          (g) same, object-position: left top — bitmap pinned to the TOP-LEFT
+          corner; overlays follow it there
+        </figcaption>
+      </figure>
     </main>
 
     <footer>
@@ -171,6 +215,11 @@
       document.getElementById("strip").src = svgDataUri(800, 4200, "strip", 140);
       document.getElementById("page-bg").style.backgroundImage =
         `url("${svgDataUri(800, 1130, "BG", 30)}")`;
+
+      // (f)/(g) Phase 7.3: portrait bitmaps drawn with object-fit: contain in a
+      // wide box, so the drawn bitmap is letterboxed inside the <img> element box.
+      document.getElementById("letterbox-contain").src = svgDataUri(800, 1130, "fit", 190);
+      document.getElementById("letterbox-topleft").src = svgDataUri(800, 1130, "fitTL", 260);
 
       // Icons/avatar: natural size < 400 on both sides → must be ignored.
       document.getElementById("sidebar-thumb").src = svgDataUri(90, 130, "s", 0);

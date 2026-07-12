@@ -144,6 +144,19 @@ export interface MessageMap {
    */
   cancelTranslation: { request: { requestId: string }; response: void };
 
+  /**
+   * Cancel every QUEUED-but-not-yet-started {@link translatePage} in a batch, by
+   * their `requestId`s (Phase 7.4 pause). The background aborts each id that has
+   * a registered controller AND has not started its provider call, and replies
+   * with how many it actually cancelled; already-started and unknown ids are
+   * silently skipped — that's the feature ("let started calls finish, stop the
+   * rest"). Composes with {@link cancelTranslation}'s controller registry.
+   */
+  cancelQueuedTranslations: {
+    request: { requestIds: string[] };
+    response: { cancelled: number };
+  };
+
   /** Validate an API key with a cheap ping (options "test key" button, §7.6).
    *  `customEndpoint` is required in practice when `provider: "custom"` (Phase 6
    *  contract addition — the custom endpoint has no fixed URL to ping). */
@@ -205,6 +218,23 @@ export interface MessageMap {
    * `runtime.openOptionsPage()` — only an extension page can.
    */
   openOptionsPage: { request: void; response: void };
+
+  /**
+   * Popup → content: pause/resume this tab's translate queue (Phase 7.4). Pausing
+   * lets every already-STARTED provider call finish and render, aborts every
+   * queued-but-not-started page job, and stops new sends until resumed. Replies
+   * with the resulting state and, on pause, how many queued jobs were cancelled.
+   * Per-tab RUNTIME state — it dies with the content script on navigation. No-op
+   * (`{ paused: false, cancelledQueued: 0 }`) while inert on this tab.
+   */
+  setTranslationsPaused: {
+    request: { paused: boolean };
+    response: { paused: boolean; cancelledQueued: number };
+  };
+
+  /** Popup → content: read the current pause state to reflect it on open
+   *  (Phase 7.4). `{ paused: false }` while inert. */
+  getTranslationsPaused: { request: void; response: { paused: boolean } };
 }
 
 /** Every valid message `type`. */

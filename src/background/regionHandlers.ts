@@ -30,6 +30,7 @@ import { createLogger } from "../shared/log";
 import type { MessageHandlers, TranslateRegionRequest } from "../shared/messages";
 import { deriveProviderSettings, loadSettings, type Settings } from "../shared/settings";
 import type { PageTranslation, ProviderSettings, TranslateJob } from "../shared/types";
+import { snapPageRegions } from "./bubbleSnap";
 import { fetchImageBytes } from "./imageFetcher";
 import { sha256Hex } from "./hash";
 import { prepareRegionCrop } from "./imagePrep";
@@ -123,9 +124,15 @@ async function translateRegionImage(
     signal,
   );
 
+  // Bubble snap (Phase 7.5): the provider's boxes are already in FULL-image space
+  // (crop-as-tile remap), so snap against the FULL image, then clamp each snapped
+  // box back to the user's selection rect — a drag-select must never paint outside
+  // what was selected. Fail-soft: returns `page` unchanged on any decode fault.
+  const snapped = await snapPageRegions(blob, page, crop);
+
   // F17 must count region calls (one provider image request per crop).
-  void recordUsage(usageFromPage(page, 1));
-  return page;
+  void recordUsage(usageFromPage(snapped, 1));
+  return snapped;
 }
 
 /** The region-translate slice of the background message router (Phase 7). */

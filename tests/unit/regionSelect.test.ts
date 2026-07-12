@@ -85,6 +85,34 @@ describe("regionSelect — selectionToImageBbox", () => {
   });
 });
 
+describe("regionSelect — letterboxed crop normalizes against the DRAWN bitmap (Phase 7.3 item 4)", () => {
+  // A portrait bitmap (400×900) drawn with object-fit: contain in a WIDE 800×450
+  // element box letterboxes to a centered 200×450 rect at x∈[300,500]. Phase 7.3
+  // makes defaultCollectTargets feed THIS drawn-bitmap rect (not the element box)
+  // as the target.rect, so the pure crop/pick math below sees the bitmap.
+  const bitmap = rect(300, 0, 200, 450);
+
+  it("returns null for a selection over the letterbox bar only (no request fires)", () => {
+    const overLeftBar = rect(50, 50, 100, 100); // x∈[50,150], left of the bitmap
+    expect(pickTargetImage(overLeftBar, [bitmap])).toBeNull();
+    expect(selectionToImageBbox(overLeftBar, bitmap)).toBeNull();
+  });
+
+  it("normalizes a selection over the bitmap to the BITMAP rect, not the element box", () => {
+    // Center quarter of the bitmap. Normalized against the 200×450 bitmap this is
+    // the clean center quarter; against the wider 800×450 element box it would be a
+    // DIFFERENT (wrong) region — the silent wrong-crop bug this phase fixes.
+    const overBitmap = rect(350, 112.5, 100, 225);
+    expect(pickTargetImage(overBitmap, [bitmap])).toBe(0);
+    expect(selectionToImageBbox(overBitmap, bitmap)).toEqual({
+      x: 0.25,
+      y: 0.25,
+      w: 0.5,
+      h: 0.5,
+    });
+  });
+});
+
 describe("regionSelect — pickTargetImage", () => {
   const a = rect(0, 0, 100, 100);
   const b = rect(120, 0, 100, 100);

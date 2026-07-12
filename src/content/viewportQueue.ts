@@ -161,6 +161,21 @@ export interface ViewportQueue {
    * @returns how many candidates were (or would be) requested.
    */
   requestAll(dryRun?: boolean): number;
+  /**
+   * Pause or resume this tab's translate queue (Phase 7.4). Pausing lets every
+   * already-STARTED provider call finish and render, aborts every
+   * queued-but-not-started page job (one batched `cancelQueuedTranslations`), and
+   * blocks new sends (visibility, prefetch, translate-all) until resumed.
+   * Resuming re-observes still-visible unrequested candidates so auto sites
+   * re-plan; on a non-auto site the user re-clicks Translate all.
+   *
+   * @param paused the desired state.
+   * @returns how many queued jobs the background reported cancelling (0 on
+   *   resume, or when nothing was queued / the message failed — fail soft).
+   */
+  setPaused(paused: boolean): Promise<number>;
+  /** Whether the queue is currently paused (Phase 7.4). */
+  isPaused(): boolean;
   /** Tear everything down: cancel all in-flight requests and disconnect observers. */
   stop(): void;
 }
@@ -197,6 +212,9 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
   const order: Candidate[] = [];
   /** element → tracking record, so an IntersectionObserver entry maps back. */
   const tracked = new Map<Element, Tracked>();
+  /** Pause state (Phase 7.4): while true, no new sends leave this queue. Per-tab
+   *  RUNTIME state — it dies with the content script on navigation. */
+  let paused = false;
 
   const indexOf = (candidate: Candidate): number =>
     order.findIndex((c) => c.id === candidate.id);
@@ -278,6 +296,9 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
     // WHY re-check identity: a rescan may have unregistered/replaced this element
     // between the plan and this async send.
     if (!rec || rec.candidate.id !== candidate.id || rec.requested) return;
+    // Pause gate (item 4): stop BEFORE flipping `requested`/showing a skeleton so
+    // a paused queue leaves no trace to unwind. Resume reobserves this candidate.
+    if (paused) return;
 
     rec.requested = true;
     const requestId = makeRequestId();
@@ -308,6 +329,14 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
       // Torn down while acquiring? Don't send for a candidate that's gone.
       const still = tracked.get(candidate.el);
       if (!still || still.candidate.id !== candidate.id) return;
+      // Paused during the acquireBytes gap (item 4): abandon the send and reset to
+      // unrequested + clear the skeleton so resume can re-plan it (same pattern as
+      // the teardown re-check above).
+      if (paused) {
+        still.requested = false;
+        safe(() => overlay.clear(candidate));
+        return;
+      }
     }
 
     // Stamp the id only now that we're actually about to send, so a teardown
@@ -403,6 +432,9 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
     },
 
     requestAll(dryRun = false): number {
+      // Paused (item 4): translate-all is a no-op both ways — the popup disables
+      // the button anyway, and a dry-run count of 0 keeps the confirm flow honest.
+      if (paused) return 0;
       // WHY filter on `requested` and not in-flight state: sendTranslate flips
       // `requested` synchronously before its first await, so double-clicking
       // "translate all" (or clicking during a visibility burst) can't double-send.
@@ -411,6 +443,44 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
         for (const c of pending) void sendTranslate(c, TRANSLATE_ALL_PRIORITY);
       }
       return pending.length;
+    },
+
+    isPaused(): boolean {
+      return paused;
+    },
+
+    async setPaused(next: boolean): Promise<number> {
+      if (next === paused) return 0;
+      paused = next;
+      if (next) {
+        // Collect every tracked job's live requestId and cancel the queued ones in
+        // ONE message; already-STARTED calls finish + render (background skips
+        // them). An id present here but not yet started is aborted; its
+        // translatePage resolves { errorKind: "aborted" }, which sendTranslate's
+        // existing aborted branch turns into reset + clear + reobserve.
+        const requestIds: string[] = [];
+        for (const rec of tracked.values()) {
+          if (rec.requestId) requestIds.push(rec.requestId);
+        }
+        if (requestIds.length === 0) return 0;
+        try {
+          const { cancelled } = await sendToBackground("cancelQueuedTranslations", {
+            requestIds,
+          });
+          return cancelled;
+        } catch (err) {
+          log.warn("cancelQueuedTranslations failed", err);
+          return 0; // fail soft — "nothing paused"
+        }
+      }
+      // Resume: reobserve still-visible unrequested candidates so auto sites
+      // re-plan (IntersectionObserver fires on transitions only — same reasoning
+      // as the timeout retry path). On a non-auto site reobserve is a no-op and
+      // the user re-clicks Translate all.
+      for (const rec of tracked.values()) {
+        if (!rec.requested) reobserve(rec.candidate.el);
+      }
+      return 0;
     },
 
     stop(): void {

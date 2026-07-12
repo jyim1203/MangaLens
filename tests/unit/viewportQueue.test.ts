@@ -407,6 +407,157 @@ describe("viewportQueue — blob bytes dispatch (item 1)", () => {
   });
 });
 
+describe("viewportQueue — pause/resume (Phase 7.4 item 4)", () => {
+  beforeEach(() => {
+    FakeIO.instances = [];
+    mockSend.mockReset();
+    vi.stubGlobal("Node", { DOCUMENT_POSITION_FOLLOWING: 4 });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const fakeEl = (): Element =>
+    ({ compareDocumentPosition: () => 2 }) as unknown as Element;
+  const candA: Candidate = { id: "a", el: fakeEl(), url: "https://x/a.jpg" };
+  const BLOB: Candidate = { id: "b", el: fakeEl(), url: "blob:https://x/9f8c" };
+
+  function makeQueue(
+    overlay: OverlaySink,
+    acquireBytes?: (url: string) => Promise<{ imageBytes: ArrayBuffer; imageMime: string }>,
+  ) {
+    return createViewportQueue({
+      overlay,
+      prefetchAhead: 0,
+      autoEnqueue: true,
+      makeRequestId: () => "rq",
+      acquireBytes,
+      createObserver: (cb, options) =>
+        new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+  }
+
+  it("blocks a visibility send while paused (no send, no skeleton)", async () => {
+    mockSend.mockResolvedValue({ cancelled: 0 });
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay);
+    expect(await queue.setPaused(true)).toBe(0); // nothing queued yet
+    expect(queue.isPaused()).toBe(true);
+
+    queue.register(candA);
+    FakeIO.instances[0]!.fire(candA.el, true);
+
+    expect(mockSend).not.toHaveBeenCalled();
+    expect(overlay.setPending).not.toHaveBeenCalled();
+    queue.stop();
+  });
+
+  it("makes requestAll a no-op returning 0 while paused (both dry-run and real)", async () => {
+    mockSend.mockResolvedValue({ cancelled: 0 });
+    const queue = makeQueue(fakeOverlay());
+    queue.register(candA);
+    await queue.setPaused(true);
+
+    expect(queue.requestAll(true)).toBe(0);
+    expect(queue.requestAll()).toBe(0);
+    expect(mockSend).not.toHaveBeenCalledWith("translatePage", expect.anything());
+    queue.stop();
+  });
+
+  it("still renders an in-flight request that resolves during pause", async () => {
+    let resolveTranslate: (v: unknown) => void = () => {};
+    mockSend.mockImplementation((type: string) => {
+      if (type === "translatePage") {
+        return new Promise((r) => {
+          resolveTranslate = r as (v: unknown) => void;
+        });
+      }
+      return Promise.resolve({ cancelled: 0 }); // background: already started
+    });
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay);
+    queue.register(candA);
+    FakeIO.instances[0]!.fire(candA.el, true); // sends translatePage (in-flight)
+    await tick();
+
+    expect(await queue.setPaused(true)).toBe(0); // sent cancelQueued, none cancelled
+    const page = { imageHash: "h", regions: [] } as unknown;
+    resolveTranslate({ ok: true, page });
+    await tick();
+
+    expect(overlay.render).toHaveBeenCalledWith(candA, page);
+    queue.stop();
+  });
+
+  it("resets + clears + reobserves a request aborted by pause", async () => {
+    let resolveTranslate: (v: unknown) => void = () => {};
+    mockSend.mockImplementation((type: string) => {
+      if (type === "translatePage") {
+        return new Promise((r) => {
+          resolveTranslate = r as (v: unknown) => void;
+        });
+      }
+      return Promise.resolve({ cancelled: 1 });
+    });
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay);
+    queue.register(candA);
+    const [visible] = FakeIO.instances;
+    visible!.fire(candA.el, true);
+    await tick();
+
+    expect(await queue.setPaused(true)).toBe(1); // background aborted the queued job
+    // The aborted translatePage result flows through the existing aborted branch.
+    resolveTranslate({ ok: false, errorKind: "aborted" });
+    await tick();
+
+    expect(overlay.clear).toHaveBeenCalledWith(candA);
+    expect(visible!.unobserveLog.includes(candA.el)).toBe(true); // reobserved for retry
+    queue.stop();
+  });
+
+  it("reobserves still-visible unrequested candidates on resume", async () => {
+    mockSend.mockResolvedValue({ cancelled: 0 });
+    const queue = makeQueue(fakeOverlay());
+    queue.register(candA); // observed once (autoEnqueue)
+    const [visible, near] = FakeIO.instances;
+
+    await queue.setPaused(true);
+    await queue.setPaused(false);
+
+    // Resume re-observes the unrequested candidate on both observers.
+    expect(visible!.unobserveLog.includes(candA.el)).toBe(true);
+    expect(near!.unobserveLog.includes(candA.el)).toBe(true);
+    expect(visible!.observeLog.filter((e) => e === candA.el)).toHaveLength(2);
+    queue.stop();
+  });
+
+  it("re-checks the pause flag after the acquireBytes gap (no send)", async () => {
+    let releaseAcquire: () => void = () => {};
+    const bytes = new Uint8Array([1]).buffer;
+    const acquireBytes = vi.fn(
+      () =>
+        new Promise<{ imageBytes: ArrayBuffer; imageMime: string }>((r) => {
+          releaseAcquire = () => r({ imageBytes: bytes, imageMime: "image/webp" });
+        }),
+    );
+    mockSend.mockResolvedValue({ cancelled: 0 });
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay, acquireBytes);
+    queue.register(BLOB);
+    FakeIO.instances[0]!.fire(BLOB.el, true); // sets requested, setPending, awaits acquire
+    await tick();
+    expect(acquireBytes).toHaveBeenCalled();
+
+    await queue.setPaused(true); // pause DURING the acquireBytes gap
+    releaseAcquire();
+    await tick();
+
+    // The post-gap re-check abandons the send and clears the skeleton.
+    expect(mockSend).not.toHaveBeenCalledWith("translatePage", expect.anything());
+    expect(overlay.clear).toHaveBeenCalledWith(BLOB);
+    queue.stop();
+  });
+});
+
 describe("viewportQueue — autoEnqueue=false (per-site opt-in, item 3)", () => {
   beforeEach(() => {
     FakeIO.instances = [];

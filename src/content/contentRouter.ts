@@ -17,8 +17,10 @@ import type { OverlayManager } from "./overlay/OverlayManager";
 
 /** Live-subsystem accessors; each returns `undefined` while the gate is inert. */
 export interface ContentRouterDeps {
-  /** The viewport queue (F8 translate-all), or undefined while inert. */
-  getQueue: () => Pick<ViewportQueue, "requestAll"> | undefined;
+  /** The viewport queue (F8 translate-all + Phase 7.4 pause), or undefined while inert. */
+  getQueue: () =>
+    | Pick<ViewportQueue, "requestAll" | "setPaused" | "isPaused">
+    | undefined;
   /** The drag-select controller (F10), or undefined while inert. */
   getRegionSelector: () => Pick<RegionSelector, "start"> | undefined;
   /** The overlay manager (F14 peek-all), or undefined while inert. */
@@ -52,5 +54,17 @@ export function buildContentRouterHandlers(deps: ContentRouterDeps): MessageHand
     togglePeekOriginal: () => {
       deps.getOverlay()?.togglePeekAll();
     },
+    // Pause/resume (item 4). Inert tab: report "nothing paused" without touching
+    // anything (same inert-safety as translateAll). Resume/pause both resolve to
+    // the resulting state so the popup can reflect it.
+    setTranslationsPaused: async (req) => {
+      const queue = deps.getQueue();
+      if (!queue) return { paused: false, cancelledQueued: 0 };
+      const cancelledQueued = await queue.setPaused(req.paused);
+      return { paused: req.paused, cancelledQueued };
+    },
+    getTranslationsPaused: () => ({
+      paused: deps.getQueue()?.isPaused() ?? false,
+    }),
   };
 }

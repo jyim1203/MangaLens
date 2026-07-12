@@ -258,17 +258,40 @@ export function normalizeKind(kind: unknown): RegionKind | undefined {
   return SPEC_KINDS.has(k) ? (k as RegionKind) : "other";
 }
 
-/** Clamp a number into [0, 1]; NaN/±Inf → null (caller drops the region). */
-function clamp01(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+/** A finite number, or null (caller drops the region). No clamping here — the
+ *  joint clamp in {@link parseBbox} needs the raw values to resolve corners. */
+function finite(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** Clamp a number into [0, 1]. */
+function clamp01(value: number): number {
   return Math.min(1, Math.max(0, value));
 }
 
 /**
- * Parse and clamp a bbox from either the canonical `[x, y, w, h]` array or a
- * `{x, y, w, h}` object (some models emit the latter). Every component is
- * clamped to [0, 1] (PROMPTS.md §6.3). Returns null if any component is
- * missing/non-finite so the region is dropped.
+ * Parse a bbox into the internal `{x, y, w, h}` shape (PROMPTS.md §2/§6.3),
+ * format-defensive so a model that ignores the schema still degrades to a
+ * dropped region rather than garbage:
+ *
+ *  - **Array `[a, b, c, d]`** — the canonical schema path — is read as CORNERS
+ *    `[x_min, y_min, x_max, y_max]`: `x=a, y=b, w=c−a, h=d−b`. // WHY corners-first
+ *    (Phase 7.4): the schema now ASKS for corners, and the live HAR showed Haiku
+ *    already emits corners about half the time even when asked for w/h — so
+ *    corners is the compliant reading and the ambiguous case must trust the
+ *    schema. If the corners reading is degenerate (`w ≤ 0` or `h ≤ 0`) the row
+ *    can't be corners, so fall back to the legacy `[x, y, width, height]` reading
+ *    (`w=c, h=d`) for any third-party endpoint still emitting w/h.
+ *  - **Object `{x, y, w, h}`** — unchanged back-compat for models emitting the
+ *    object form.
+ *
+ * Then a JOINT edge clamp (the Phase 7.4 Finding-2 fix): `x,y` into [0,1], then
+ * `w = min(w, 1−x)`, `h = min(h, 1−y)`. Clamping each component independently
+ * (the old behavior) let `x + w` reach 2.0 — a box could render past the drawn
+ * bitmap's right/bottom edge. With the joint clamp a box physically cannot
+ * escape the image. Returns null if any component is missing/non-finite, or if
+ * the box is degenerate after clamping (`w ≤ 0` or `h ≤ 0`), so the region is
+ * dropped.
  */
 export function parseBbox(raw: unknown): BBox | null {
   let x: number | null;
@@ -276,19 +299,42 @@ export function parseBbox(raw: unknown): BBox | null {
   let w: number | null;
   let h: number | null;
   if (Array.isArray(raw) && raw.length >= 4) {
-    x = clamp01(raw[0]);
-    y = clamp01(raw[1]);
-    w = clamp01(raw[2]);
-    h = clamp01(raw[3]);
+    const a = finite(raw[0]);
+    const b = finite(raw[1]);
+    const c = finite(raw[2]);
+    const d = finite(raw[3]);
+    if (a === null || b === null || c === null || d === null) return null;
+    x = a;
+    y = b;
+    // Corners first: w = x_max − x_min, h = y_max − y_min. If EITHER extent is
+    // non-positive the row can't be corners, so fall back to reading the whole
+    // row as legacy [x, y, width, height].
+    const cw = c - a;
+    const ch = d - b;
+    if (cw > 0 && ch > 0) {
+      w = cw;
+      h = ch;
+    } else {
+      w = c;
+      h = d;
+    }
   } else if (isPlainObject(raw)) {
-    x = clamp01(raw.x);
-    y = clamp01(raw.y);
-    w = clamp01(raw.w);
-    h = clamp01(raw.h);
+    x = finite(raw.x);
+    y = finite(raw.y);
+    w = finite(raw.w);
+    h = finite(raw.h);
   } else {
     return null;
   }
   if (x === null || y === null || w === null || h === null) return null;
+
+  // Joint clamp: pin the top-left into the image, then cap the extent so the
+  // box's right/bottom edge can never cross the image boundary.
+  x = clamp01(x);
+  y = clamp01(y);
+  w = Math.min(w, 1 - x);
+  h = Math.min(h, 1 - y);
+  if (w <= 0 || h <= 0) return null;
   return { x, y, w, h };
 }
 

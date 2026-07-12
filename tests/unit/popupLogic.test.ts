@@ -14,7 +14,9 @@ import {
   costSummary,
   hostnameFromUrl,
   needsApiKey,
+  pauseButtonLabel,
   planTranslateAll,
+  queueControls,
   regionSelectEnabled,
   siteChoice,
   siteChoicePatch,
@@ -128,6 +130,31 @@ describe("popupLogic — cost summary (F17)", () => {
 
   it("formats the one-line summary", () => {
     expect(costSummary(stats)).toBe("≈ $0.0050 · 9 images");
+  });
+});
+
+describe("popupLogic — queueControls (Phase 7.4 pause)", () => {
+  it("labels the pause toggle by state", () => {
+    expect(pauseButtonLabel(false)).toBe("Pause queue");
+    expect(pauseButtonLabel(true)).toBe("Resume queue");
+  });
+
+  it("hides the pause toggle on an inactive page and enables translate-all", () => {
+    const c = queueControls(false, false);
+    expect(c.pauseHidden).toBe(true);
+    expect(c.translateAllDisabled).toBe(true); // inactive → disabled regardless
+  });
+
+  it("shows the toggle when active and disables translate-all while paused", () => {
+    const running = queueControls(true, false);
+    expect(running.pauseHidden).toBe(false);
+    expect(running.translateAllDisabled).toBe(false);
+    expect(running.pauseLabel).toBe("Pause queue");
+
+    const paused = queueControls(true, true);
+    expect(paused.pauseHidden).toBe(false);
+    expect(paused.translateAllDisabled).toBe(true);
+    expect(paused.pauseLabel).toBe("Resume queue");
   });
 });
 

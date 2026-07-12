@@ -40,7 +40,7 @@ This is the single source of truth. Store as a typed constant; derive each provi
             "items": { "type": "number", "minimum": 0, "maximum": 1 },
             "minItems": 4,
             "maxItems": 4,
-            "description": "[x, y, width, height] as fractions of image dimensions. (x,y) is the TOP-LEFT corner of the text region."
+            "description": "[x_min, y_min, x_max, y_max]: the box's top-left and bottom-right corners, as fractions 0-1 of the image dimensions. x is horizontal (0 = left edge), y is vertical (0 = top edge). x_max must be greater than x_min, y_max greater than y_min."
           },
           "original": { "type": "string", "description": "Transcribed source text, exactly as written (keep original script)." },
           "translated": { "type": "string", "description": "Translation into the target language." },
@@ -77,10 +77,11 @@ You are a professional manga and comic translation engine. You receive one or mo
 
 BOUNDING BOX RULES:
 - Coordinates are FRACTIONS of the image dimensions, between 0 and 1.
-- Format: [x, y, width, height] where (x, y) is the top-left corner.
+- Format: [x_min, y_min, x_max, y_max] — the top-left and bottom-right corners. x_max must be greater than x_min, and y_max greater than y_min.
 - The box must tightly enclose the TEXT itself, not the entire bubble outline. If unsure, err slightly larger, never smaller.
 - Never let boxes extend past the image edges.
 - Two different bubbles must never share one box. One bubble split across two lines is still ONE region.
+- Boxes for different regions should not overlap.
 
 TRANSCRIPTION RULES:
 - Preserve the original script exactly (kanji/kana/hangul/etc.). Do not romanize.
@@ -203,7 +204,7 @@ parse → schema-validate → sanitize → accept | repair → retry-once | fail
 1. **Parse.** If the provider returned a string: strip markdown fences, trim to outermost `{...}` (first `{` to last `}`), `JSON.parse`.
 2. **Schema-validate** against the canonical schema (lightweight hand-rolled validator; don't ship ajv).
 3. **Sanitize** (always, even on valid responses):
-   - Clamp each bbox to [0,1]; drop regions with `w*h < 0.0001` (degenerate) or `w*h > 0.9` (model boxed the whole page — almost always an error).
+   - Parse each bbox as corners `[x_min, y_min, x_max, y_max]` → `{x, y, w, h}` (falling back to a legacy `[x, y, w, h]` reading only when the corners reading is degenerate, i.e. `x_max ≤ x_min` or `y_max ≤ y_min`); then JOINTLY clamp so the box can't escape the image — `x,y` into [0,1], then `w = min(w, 1−x)`, `h = min(h, 1−y)`. Drop regions with `w*h < 0.0001` (degenerate) or `w*h > 0.9` (model boxed the whole page — almost always an error).
    - Drop regions where `original` is empty/whitespace.
    - Dedupe: if two regions have IoU > 0.85 and identical `original`, keep the first.
    - If `translated` is empty but `original` isn't → mark region `needsRetry`; if >30% of regions need retry, treat as malformed.

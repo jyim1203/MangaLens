@@ -57,6 +57,15 @@ describe("prompt — buildSystemPrompt", () => {
     expect(sys).toContain("Convert honorifics"); // localize
     expect(sys).toContain("left-to-right, top-to-bottom.");
   });
+
+  it("uses the Phase 7.4 corner-format bbox rule + no-overlap line", () => {
+    const sys = buildSystemPrompt(buildPromptContext(settings()));
+    expect(sys).toContain("[x_min, y_min, x_max, y_max]");
+    expect(sys).toContain("x_max must be greater than x_min");
+    expect(sys).toContain("Boxes for different regions should not overlap.");
+    // The old w/h wording is gone.
+    expect(sys).not.toContain("[x, y, width, height]");
+  });
 });
 
 describe("prompt — buildUserText", () => {
@@ -112,5 +121,13 @@ describe("prompt — schema dialects", () => {
     const region = schema.properties?.regions?.items;
     expect(region?.required).not.toContain("kind");
     expect(JSON.stringify(schema)).toContain("additionalProperties");
+  });
+
+  it("all three dialects carry the corner-format bbox description through (Phase 7.4)", () => {
+    for (const schema of [toGeminiSchema(), toOpenAiStrictSchema(), toAnthropicToolSchema()]) {
+      const desc = schema.properties?.regions?.items?.properties?.bbox?.description ?? "";
+      expect(desc).toContain("[x_min, y_min, x_max, y_max]");
+      expect(desc).not.toContain("width, height");
+    }
   });
 });

@@ -94,13 +94,19 @@ describe("providers/ProviderBase — sanitizePage (golden fixtures)", () => {
     expect(regions.find((r) => r.kind === "sign")?.translated).toBe("EXIT");
   });
 
-  it("clamps out-of-range bbox values into [0,1] (out_of_range_bbox)", () => {
+  it("jointly clamps out-of-range boxes so they stay inside the image (out_of_range_bbox)", () => {
+    // Phase 7.4: the joint edge clamp replaced the old per-component clamp.
+    // Row 1 [1.05,-0.02,0.20,0.10] reads as legacy w/h (corners degenerate); its
+    // x clamps to 1, leaving zero width → dropped. Row 2 [0.30,0.40,1.20,0.10]
+    // also reads as w/h (y_max<y_min); width is capped at 1−x = 0.70 so it can't
+    // spill past the right edge.
     const { regions } = pipeline(goldenJson("out_of_range_bbox.json"));
-    const first = regions[0]?.bbox;
-    expect(first?.x).toBe(1);
-    expect(first?.y).toBe(0);
-    // The over-wide box's width clamps to 1 (area 0.1, still valid).
-    expect(regions[1]?.bbox.w).toBe(1);
+    expect(regions).toHaveLength(1);
+    expect(regions[0]?.translated).toBe("Too wide");
+    expect(regions[0]?.bbox.x).toBeCloseTo(0.3, 6);
+    expect(regions[0]?.bbox.w).toBeCloseTo(0.7, 6);
+    // The clamped box's right edge never crosses the image boundary.
+    expect(regions[0]!.bbox.x + regions[0]!.bbox.w).toBeLessThanOrEqual(1);
   });
 
   it("drops a whole-page region but keeps the normal one (whole_page_bbox)", () => {
@@ -161,13 +167,62 @@ describe("providers/ProviderBase — sanitizePage (golden fixtures)", () => {
   });
 });
 
-describe("providers/ProviderBase — parseBbox", () => {
-  it("parses the canonical [x,y,w,h] array", () => {
-    expect(parseBbox([0.1, 0.2, 0.3, 0.4])).toEqual({ x: 0.1, y: 0.2, w: 0.3, h: 0.4 });
+describe("providers/ProviderBase — parseBbox (Phase 7.4 corners-first)", () => {
+  /** Assert a parsed bbox equals the expected components (float-tolerant). */
+  function expectBbox(
+    got: ReturnType<typeof parseBbox>,
+    exp: { x: number; y: number; w: number; h: number },
+  ): void {
+    expect(got).not.toBeNull();
+    expect(got!.x).toBeCloseTo(exp.x, 6);
+    expect(got!.y).toBeCloseTo(exp.y, 6);
+    expect(got!.w).toBeCloseTo(exp.w, 6);
+    expect(got!.h).toBeCloseTo(exp.h, 6);
+  }
+
+  it("reads the canonical array as corners [x_min,y_min,x_max,y_max] (HAR literal)", () => {
+    // The exact row from the 2026-07-11 HAR that renders wrong as w/h.
+    expectBbox(parseBbox([0.55, 0.32, 0.95, 0.42]), {
+      x: 0.55,
+      y: 0.32,
+      w: 0.4,
+      h: 0.1,
+    });
   });
 
-  it("also accepts an {x,y,w,h} object", () => {
-    expect(parseBbox({ x: 0.1, y: 0.2, w: 0.3, h: 0.4 })).toEqual({
+  it("falls back to legacy w/h when the corners reading is degenerate (y_max < y_min)", () => {
+    // [0.35, 0.18, 0.25, 0.08]: x_max<x_min AND y_max<y_min → not corners.
+    expectBbox(parseBbox([0.35, 0.18, 0.25, 0.08]), {
+      x: 0.35,
+      y: 0.18,
+      w: 0.25,
+      h: 0.08,
+    });
+  });
+
+  it("trusts the corners reading when it is valid, even if w/h would also parse", () => {
+    expectBbox(parseBbox([0.1, 0.1, 0.3, 0.4]), { x: 0.1, y: 0.1, w: 0.2, h: 0.3 });
+  });
+
+  it("jointly clamps so a box can't extend past the image edge (Finding 2)", () => {
+    // Corners overflowing the right edge: x_max 1.5 → clamped so x + w === 1.
+    expectBbox(parseBbox([0.85, 0.1, 1.5, 0.5]), {
+      x: 0.85,
+      y: 0.1,
+      w: 0.15,
+      h: 0.4,
+    });
+    // Same guarantee via the object w/h form (h fits, only w is capped).
+    expectBbox(parseBbox({ x: 0.85, y: 0.1, w: 0.5, h: 0.5 }), {
+      x: 0.85,
+      y: 0.1,
+      w: 0.15,
+      h: 0.5,
+    });
+  });
+
+  it("still accepts the {x,y,w,h} object form unchanged", () => {
+    expectBbox(parseBbox({ x: 0.1, y: 0.2, w: 0.3, h: 0.4 }), {
       x: 0.1,
       y: 0.2,
       w: 0.3,
@@ -175,8 +230,11 @@ describe("providers/ProviderBase — parseBbox", () => {
     });
   });
 
-  it("clamps components to [0,1]", () => {
-    expect(parseBbox([-1, 2, 0.5, 0.5])).toEqual({ x: 0, y: 1, w: 0.5, h: 0.5 });
+  it("drops a box that is degenerate after clamping (w or h ≤ 0)", () => {
+    // x clamps to 1 → no width left → dropped.
+    expect(parseBbox({ x: 1, y: 0.5, w: 0.2, h: 0.2 })).toBeNull();
+    // Legacy-fallback row whose top-left clamps to the bottom edge.
+    expect(parseBbox([-1, 2, 0.5, 0.5])).toBeNull();
   });
 
   it("returns null for non-finite or malformed input", () => {

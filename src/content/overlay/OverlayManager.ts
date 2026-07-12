@@ -19,7 +19,9 @@ import type { Settings } from "../../shared/settings";
 import type { PageTranslation } from "../../shared/types";
 import type { Candidate } from "../scanner";
 import { displayedSizeChanged, regionToPx, type PxRect, type Size } from "./geometry";
+import { readContentBox } from "./contentBox";
 import { filterRegions } from "./regionFilter";
+import { trimOverlaps } from "./overlapTrim";
 import { errorKindToMessage } from "./errorMessages";
 import { createShadowMeasurer, renderBubbleBox } from "./BubbleBox";
 import { hitTestRegion, peekRepaintTargets, type PeekHover } from "./peek";
@@ -261,7 +263,11 @@ export class OverlayManager {
     let hover: PeekHover | null = null;
     for (const entry of this.entries.values()) {
       if (entry.state !== "done" || !entry.paintedRects?.length) continue;
-      const rect = entry.candidate.el.getBoundingClientRect();
+      // Hit-test against the DRAWN-BITMAP rect (Phase 7.3), not the element box:
+      // paintedRects are overlay-local coords relative to the content box top-left,
+      // and hovering the letterbox bar next to the bitmap must NOT count as inside.
+      const rect = readContentBox(entry.candidate.el);
+      if (!rect) continue;
       const local = { x: pt.x - rect.left, y: pt.y - rect.top };
       if (local.x < 0 || local.y < 0 || local.x > rect.width || local.y > rect.height) {
         continue;
@@ -307,10 +313,17 @@ export class OverlayManager {
    * {@link displayedSizeChanged}.
    */
   private syncEntry(entry: OverlayEntry): void {
-    this.positionEntry(entry);
-    if (entry.state !== "done" || !entry.page) return;
-    const rect = entry.candidate.el.getBoundingClientRect();
-    if (displayedSizeChanged(entry.lastPaintedSize, { w: rect.width, h: rect.height })) {
+    const contentRect = this.positionEntry(entry);
+    if (entry.state !== "done" || !entry.page || !contentRect) return;
+    // Key the repaint on the DRAWN-BITMAP size (Phase 7.3): a reader switching Fit
+    // Both → Fit Width changes the drawn size even when the element box is stable,
+    // and we must re-fit against what we painted with.
+    if (
+      displayedSizeChanged(entry.lastPaintedSize, {
+        w: contentRect.width,
+        h: contentRect.height,
+      })
+    ) {
       this.paint(entry);
     }
   }
@@ -432,17 +445,29 @@ export class OverlayManager {
     const page = entry.page;
     if (!page) return;
     this.clearContent(entry);
-    this.positionEntry(entry);
+    // positionEntry returns the DRAWN-BITMAP content rect (Phase 7.3) it just
+    // positioned the host to — reuse it as the displayed size so bubbles map onto
+    // the bitmap, not the letterboxed element box. Null (unreadable/disconnected)
+    // ⇒ nothing to paint against.
+    const contentRect = this.positionEntry(entry);
+    if (!contentRect) return;
 
-    const regions = filterRegions(page.regions, {
-      hostname: this.hostname,
-      translateSfx: this.settings.translateSfx,
-    });
-    const rect = entry.candidate.el.getBoundingClientRect();
-    const displayedW = rect.width;
-    const displayedH = rect.height;
-    // Record the size we're painting against so a later resize re-paints only
-    // when it actually changed (item 1, via displayedSizeChanged in syncEntry).
+    // filter (view drops) → trim (nudge overlapping neighbours apart, item 3) →
+    // paint. Both are pure and deterministic, so paintedRects (indexed by the
+    // painted array below) and a later peek hit-test stay aligned — paint()
+    // re-derives the same order every time.
+    const regions = trimOverlaps(
+      filterRegions(page.regions, {
+        hostname: this.hostname,
+        translateSfx: this.settings.translateSfx,
+      }),
+    );
+    const displayedW = contentRect.width;
+    const displayedH = contentRect.height;
+    // Record the CONTENT size we're painting against so a later resize re-paints
+    // only when the DRAWN bitmap actually changed (item 1, via displayedSizeChanged
+    // in syncEntry — a Fit-Both→Fit-Width flip changes the bitmap size even if the
+    // element box is stable).
     entry.lastPaintedSize = { w: displayedW, h: displayedH };
     const makeMeasure = createShadowMeasurer(entry.measureEl, this.settings.font);
 
@@ -468,10 +493,23 @@ export class OverlayManager {
     entry.paintedRects = paintedRects;
   }
 
-  /** Position an entry's host over its image (rect + page scroll offset, §7.2). */
-  private positionEntry(entry: OverlayEntry): void {
+  /**
+   * Position an entry's host over its image's DRAWN BITMAP (rect + page scroll
+   * offset, §7.2) and RETURN that content rect so {@link paint}/{@link syncEntry}
+   * reuse it instead of re-reading (keeps the one-read-per-entry-per-frame budget).
+   *
+   * Phase 7.3: the target is {@link readContentBox}, the object-fit-aware drawn-
+   * bitmap rect, NOT the element box — under `object-fit: contain`/`cover` the
+   * bitmap is letterboxed/overflowed inside the element, so the host must cover the
+   * bitmap for bubbles (and the skeleton / error badge) to land on the artwork.
+   * On a broken read `readContentBox` fails soft to the element rect (rule 4).
+   *
+   * @returns the content-box client rect used, or null if it couldn't be read.
+   */
+  private positionEntry(entry: OverlayEntry): PxRect | null {
     try {
-      const rect = entry.candidate.el.getBoundingClientRect();
+      const rect = readContentBox(entry.candidate.el);
+      if (!rect) return null;
       // WHY rect + scroll: this assumes the host's containing block is the initial
       // one, anchored at the document origin. That holds while the host is a plain
       // body child, but breaks whenever `<body>`/`<html>` establishes a containing
@@ -487,10 +525,11 @@ export class OverlayManager {
         height: `${rect.height}px`,
       } satisfies Partial<CSSStyleDeclaration>);
 
-      // Item 2: measure the residual error and correct it — robust to every
-      // containing-block cause at once, and idempotent (a correct position yields
-      // a zero delta, so re-running does nothing). With the rAF batching above the
-      // extra rect read is once per frame, not per scroll event.
+      // Item 2 (Phase 5.1): measure the residual error and correct it — robust to
+      // every containing-block cause at once, and idempotent (a correct position
+      // yields a zero delta, so re-running does nothing). Compares the host's actual
+      // rect to the TARGET content rect; with the rAF batching above the extra rect
+      // read is once per frame, not per scroll event.
       const hostRect = entry.host.getBoundingClientRect();
       const dx = hostRect.left - rect.left;
       const dy = hostRect.top - rect.top;
@@ -500,8 +539,10 @@ export class OverlayManager {
         entry.host.style.left = `${left}px`;
         entry.host.style.top = `${top}px`;
       }
+      return rect;
     } catch (err) {
       log.warn("failed to position overlay", err);
+      return null;
     }
   }
 

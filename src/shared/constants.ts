@@ -33,7 +33,7 @@ export const DEFAULT_MODELS: Record<ProviderId, string> = {
  * affects output. Part of the translation cache key so stale translations
  * are never served after a prompt change. (Gap resolution #4 — see docs.)
  */
-export const PROMPT_VERSION = 1;
+export const PROMPT_VERSION = 2;
 
 /**
  * Bumped whenever the {@link import("./types").PageTranslation} shape stored in

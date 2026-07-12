@@ -116,6 +116,34 @@ export function regionSelectEnabled(
   return hostname ? getEffectiveEnabled(settings, hostname) : false;
 }
 
+/** The pause toggle's label for the current queue state (Phase 7.4). */
+export function pauseButtonLabel(paused: boolean): string {
+  return paused ? "Resume queue" : "Pause queue";
+}
+
+/** The three decisions the queue-control row makes (Phase 7.4), pure + tested. */
+export interface QueueControls {
+  /** Translate-all is disabled when the page is inactive OR the queue is paused. */
+  translateAllDisabled: boolean;
+  /** The pause toggle is hidden when the page is inactive (same gate as region-select). */
+  pauseHidden: boolean;
+  /** The pause toggle's current label. */
+  pauseLabel: string;
+}
+
+/**
+ * Decide the queue-control row's states from whether MangaLens is active on the
+ * page and whether its queue is paused (Phase 7.4). Pausing disables Translate
+ * all; an inactive page hides the pause toggle entirely (nothing to pause).
+ */
+export function queueControls(active: boolean, paused: boolean): QueueControls {
+  return {
+    translateAllDisabled: !active || paused,
+    pauseHidden: !active,
+    pauseLabel: pauseButtonLabel(paused),
+  };
+}
+
 /**
  * Above this many pages, "translate all" asks for confirmation first
  * (Architecture §10 Risks: cost surprises).

@@ -44,6 +44,7 @@ import {
   cacheStorePage,
   shouldNegativeCache,
 } from "./cache";
+import { snapPageRegions } from "./bubbleSnap";
 import { coalesce } from "./coalesce";
 import { createSharedAbort, type SharedAbort } from "./sharedAbort";
 import { isAbortError } from "../shared/guards";
@@ -180,9 +181,24 @@ export function sharedAbortsSizeForTest(): number {
  */
 const requestControllers = new Map<string, AbortController>();
 
+/**
+ * requestIds whose provider call has actually STARTED (left the priority queue's
+ * wait list), parallel to {@link requestControllers} (Phase 7.4 pause). The pause
+ * feature only cancels queued-but-not-started jobs; an id in here is past the
+ * "started" boundary and {@link MessageHandlers.cancelQueuedTranslations} skips
+ * it. Cleared in the same `finally` that clears its controller.
+ */
+const startedRequests = new Set<string>();
+
 /** Reset the request-controller registry — test seam only; no production caller. */
 export function resetRequestControllersForTest(): void {
   requestControllers.clear();
+  startedRequests.clear();
+}
+
+/** Whether a requestId has reached the "started" boundary — test seam only. */
+export function startedRequestsHasForTest(requestId: string): boolean {
+  return startedRequests.has(requestId);
 }
 
 /**
@@ -314,10 +330,18 @@ async function translatePrepared(
   );
 
   const merged = mergeTilePages(tilePages, pageHash);
+  // Bubble snap (Phase 7.5): refine bubble/thought boxes against the ORIGINAL
+  // full-image bytes BEFORE caching, so hits replay the tight geometry for free.
+  // Fail-soft (never throws): a decode fault returns `merged` unchanged. Runs
+  // inside the queue slot — decode + fill at ≤512px is ms-scale next to a provider
+  // round trip. WHY cache the snapped boxes (unlike the render-time trimOverlaps):
+  // snap is a deterministic function of (bytes, provider box), so caching it is
+  // memoization, not a lie about what the provider said.
+  const snapped = await snapPageRegions(blob, merged);
   log.debug(
-    `translated: ${merged.regions.length} regions from ${prepared.tiles.length} tile(s)`,
+    `translated: ${snapped.regions.length} regions from ${prepared.tiles.length} tile(s)`,
   );
-  return { page: merged, providerCalls: prepared.tiles.length };
+  return { page: snapped, providerCalls: prepared.tiles.length };
 }
 
 /**
@@ -340,6 +364,10 @@ async function translatePrepared(
  * @param providedBlob content-acquired bytes for a blob-sourced page (Phase 7.2
  *   item 1). When present the fetch is skipped and `imageUrl` is identity/
  *   diagnostics only.
+ * @param onStarted invoked (Phase 7.4 pause) the moment this job's provider call
+ *   leaves the queue's wait list — the precise "started" boundary. Only the
+ *   coalesce LEADER reaches it; a follower never runs the miss body, so it stays
+ *   "not started" and is abortable by pause (accepted caveat).
  */
 export async function translateImage(
   imageUrl: string,
@@ -349,6 +377,7 @@ export async function translateImage(
   priority = 0,
   origin?: string,
   providedBlob?: Blob,
+  onStarted?: () => void,
 ): Promise<PageTranslation> {
   // A blob-sourced page (MangaDex etc.) ships its bytes content-side because the
   // background can't fetch a document-scoped blob URL (§7.3); otherwise fetch
@@ -415,6 +444,7 @@ export async function translateImage(
       shared.signal,
       priority,
       origin,
+      onStarted,
     ),
   );
 
@@ -463,13 +493,19 @@ async function runTranslateMiss(
   signal: AbortSignal,
   priority: number,
   origin?: string,
+  onStarted?: () => void,
 ): Promise<PageTranslation> {
   const queue = getTranslationQueue(settings.concurrency);
   let result: { page: PageTranslation; providerCalls: number };
   try {
     result = await queue.add(
-      (qSignal) =>
-        translatePrepared(blob, pageHash, settings, providerSettings, qSignal),
+      (qSignal) => {
+        // First statement in the task closure: the PriorityQueue invokes this
+        // exactly when the job leaves the wait list — the precise "started"
+        // boundary the pause feature keys on (Phase 7.4).
+        onStarted?.();
+        return translatePrepared(blob, pageHash, settings, providerSettings, qSignal);
+      },
       priority,
       signal,
     );
@@ -570,13 +606,32 @@ export function createTranslateHandlers(): MessageHandlers {
           req.priority,
           originFromSender(sender),
           providedBlob,
+          // Mark this id "started" the moment its provider call leaves the queue
+          // wait list, so pause can tell running jobs from queued ones (item 4).
+          req.requestId ? () => startedRequests.add(req.requestId!) : undefined,
         );
         return { ok: true, page };
       } catch (err) {
-        log.warn(`translatePage failed for ${req.imageUrl}`, err);
-        return errorToTranslateResult(err);
+        // Aborts (pause, teardown, src-swap) are normal control flow, not
+        // failures — a 15-page pause aborts every queued job, and each would
+        // otherwise log a warn-level "translatePage failed …" (e.g. "All waiters
+        // aborted") that reads as an error (Phase 7.5 item 2). Gate on the MAPPED
+        // kind, not bare isAbortError: an abort surfaces variously as a raw
+        // AbortError (queue/SharedAbort), an ImageFetchError('aborted') (mid-fetch,
+        // whose .name is NOT "AbortError"), or a ProviderError('aborted'), and
+        // errorToTranslateResult already collapses all three to `aborted`.
+        const result = errorToTranslateResult(err);
+        if (!result.ok && result.errorKind === "aborted") {
+          log.debug(`translatePage aborted for ${req.imageUrl}`, err);
+        } else {
+          log.warn(`translatePage failed for ${req.imageUrl}`, err);
+        }
+        return result;
       } finally {
-        if (req.requestId) requestControllers.delete(req.requestId);
+        if (req.requestId) {
+          requestControllers.delete(req.requestId);
+          startedRequests.delete(req.requestId);
+        }
       }
     },
 
@@ -589,6 +644,22 @@ export function createTranslateHandlers(): MessageHandlers {
         controller.abort(new DOMException("Translation cancelled", "AbortError"));
         requestControllers.delete(req.requestId);
       }
+    },
+
+    cancelQueuedTranslations: (req) => {
+      // Pause (item 4): abort each id that is registered AND not yet started —
+      // let started provider calls finish, stop the rest. Unknown/started ids are
+      // silently skipped; that IS the feature. Counts what was actually aborted.
+      let cancelled = 0;
+      for (const requestId of req.requestIds) {
+        if (startedRequests.has(requestId)) continue;
+        const controller = requestControllers.get(requestId);
+        if (!controller) continue;
+        controller.abort(new DOMException("Translation paused", "AbortError"));
+        requestControllers.delete(requestId);
+        cancelled++;
+      }
+      return { cancelled };
     },
   };
 }

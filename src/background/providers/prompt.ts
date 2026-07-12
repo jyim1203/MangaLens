@@ -68,7 +68,7 @@ export const CANONICAL_SCHEMA: JsonSchema = {
             minItems: 4,
             maxItems: 4,
             description:
-              "[x, y, width, height] as fractions of image dimensions. (x,y) is the TOP-LEFT corner of the text region.",
+              "[x_min, y_min, x_max, y_max]: the box's top-left and bottom-right corners, as fractions 0-1 of the image dimensions. x is horizontal (0 = left edge), y is vertical (0 = top edge). x_max must be greater than x_min, y_max greater than y_min.",
           },
           original: {
             type: "string",
@@ -164,10 +164,11 @@ export const SYSTEM_PROMPT_TEMPLATE = `You are a professional manga and comic tr
 
 BOUNDING BOX RULES:
 - Coordinates are FRACTIONS of the image dimensions, between 0 and 1.
-- Format: [x, y, width, height] where (x, y) is the top-left corner.
+- Format: [x_min, y_min, x_max, y_max] — the top-left and bottom-right corners. x_max must be greater than x_min, and y_max greater than y_min.
 - The box must tightly enclose the TEXT itself, not the entire bubble outline. If unsure, err slightly larger, never smaller.
 - Never let boxes extend past the image edges.
 - Two different bubbles must never share one box. One bubble split across two lines is still ONE region.
+- Boxes for different regions should not overlap.
 
 TRANSCRIPTION RULES:
 - Preserve the original script exactly (kanji/kana/hangul/etc.). Do not romanize.

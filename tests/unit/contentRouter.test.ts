@@ -58,7 +58,7 @@ describe("contentRouter — buildContentRouterHandlers (Phase 7.1 item 5)", () =
     expect(inert.translateAll!({ dryRun: true }, SENDER)).toEqual({ count: 0 });
 
     const active = buildContentRouterHandlers({
-      getQueue: () => ({ requestAll }),
+      getQueue: () => ({ requestAll, setPaused: vi.fn(), isPaused: vi.fn() }),
       getRegionSelector: () => undefined,
       getOverlay: () => undefined,
     });
@@ -66,5 +66,45 @@ describe("contentRouter — buildContentRouterHandlers (Phase 7.1 item 5)", () =
     expect(active.translateAll!({}, SENDER)).toEqual({ count: 7 });
     expect(requestAll).toHaveBeenNthCalledWith(1, true);
     expect(requestAll).toHaveBeenNthCalledWith(2, false);
+  });
+
+  it("setTranslationsPaused forwards to the queue while active, no-ops while inert", async () => {
+    const setPaused = vi.fn(async () => 4);
+    const active = buildContentRouterHandlers({
+      getQueue: () => ({ requestAll: vi.fn(), setPaused, isPaused: vi.fn() }),
+      getRegionSelector: () => undefined,
+      getOverlay: () => undefined,
+    });
+    await expect(active.setTranslationsPaused!({ paused: true }, SENDER)).resolves.toEqual({
+      paused: true,
+      cancelledQueued: 4,
+    });
+    expect(setPaused).toHaveBeenCalledWith(true);
+
+    const inert = buildContentRouterHandlers({
+      getQueue: () => undefined,
+      getRegionSelector: () => undefined,
+      getOverlay: () => undefined,
+    });
+    await expect(inert.setTranslationsPaused!({ paused: true }, SENDER)).resolves.toEqual({
+      paused: false,
+      cancelledQueued: 0,
+    });
+  });
+
+  it("getTranslationsPaused reflects the queue state and defaults to false while inert", () => {
+    const active = buildContentRouterHandlers({
+      getQueue: () => ({ requestAll: vi.fn(), setPaused: vi.fn(), isPaused: () => true }),
+      getRegionSelector: () => undefined,
+      getOverlay: () => undefined,
+    });
+    expect(active.getTranslationsPaused!(undefined, SENDER)).toEqual({ paused: true });
+
+    const inert = buildContentRouterHandlers({
+      getQueue: () => undefined,
+      getRegionSelector: () => undefined,
+      getOverlay: () => undefined,
+    });
+    expect(inert.getTranslationsPaused!(undefined, SENDER)).toEqual({ paused: false });
   });
 });

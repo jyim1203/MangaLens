@@ -13,6 +13,12 @@ describe("shared/constants", () => {
     expect(PROMPT_VERSION).toBeGreaterThan(0);
   });
 
+  it("pins PROMPT_VERSION at 2 (Phase 7.4 corner-format bbox schema)", () => {
+    // The corner-format bbox schema + no-overlap rule changed prompt output, so
+    // the version bumped from 1 → 2 to invalidate old-format-era cache entries.
+    expect(PROMPT_VERSION).toBe(2);
+  });
+
   it("command ids stay in sync with the manifest (edge: drift)", () => {
     const commands = manifest["commands"] as Record<string, unknown>;
     const ids = Object.keys(commands);

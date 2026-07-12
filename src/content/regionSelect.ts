@@ -35,6 +35,7 @@ import {
   type SourceKind,
 } from "./imageSource";
 import type { OverlaySink } from "./viewportQueue";
+import { readContentBox } from "./overlay/contentBox";
 import { withTimeout } from "./withTimeout";
 
 const log = createLogger("region-select");
@@ -483,13 +484,31 @@ function defaultCollectTargets(): RegionTarget[] {
     if (kind === "unsupported") return;
     const r = el.getBoundingClientRect();
     // Reuse the scanner's rendered-size floor; drag-select drops the natural-size
-    // check (canvas/blob may have no intrinsic size).
+    // check (canvas/blob may have no intrinsic size). WHY the floor stays on the
+    // ELEMENT rect (not the drawn-bitmap rect below): MIN_RENDERED_PX is about
+    // click-target size — a large but heavily letterboxed image must stay
+    // selectable — not about how big the bitmap is (Phase 7.3, item 4).
     if (r.width < MIN_RENDERED_PX || r.height < MIN_RENDERED_PX) return;
+    // Phase 7.3: for <img>/<canvas>, normalize the crop against the DRAWN BITMAP
+    // (object-fit-aware) so on a letterboxed reader the background crops the pixels
+    // the user actually selected — otherwise pickTargetImage ranks by the element
+    // box and selectionToImageBbox normalizes against it, translating the wrong
+    // area (a silent wrong-answer bug). Background-image hosts have no intrinsic
+    // size → keep the element rect (readContentBox returns it unchanged for them).
+    const box =
+      el instanceof HTMLImageElement || el instanceof HTMLCanvasElement
+        ? (readContentBox(el) ?? r)
+        : r;
     targets.push({
       el,
       kind,
       url,
-      rect: { left: r.left + sx, top: r.top + sy, width: r.width, height: r.height },
+      rect: {
+        left: box.left + sx,
+        top: box.top + sy,
+        width: box.width,
+        height: box.height,
+      },
     });
   };
 
