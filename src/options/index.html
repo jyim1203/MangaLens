@@ -199,7 +199,7 @@
     </style>
   </head>
   <body>
-    <h1>MangaLens settings</h1>
+    <h1 data-i18n="optionsTitle">MangaLens settings</h1>
 
     <section id="sec-provider">
       <h2>Provider &amp; API keys</h2>
@@ -348,7 +348,7 @@
         <span>Pages per request</span>
         <input type="number" id="num-pagesPerRequest" data-num="pagesPerRequest" />
       </label>
-      <p class="hint">Multi-page batching takes effect when batching ships (Phase 8).</p>
+      <p class="hint" data-i18n="optionsPagesPerRequestHint">Images per provider request. 1 = one page per request (default). 2–3 recommended for Translate all — batches pages to amortize the prompt and cut cost.</p>
       <label class="field">
         <span>Cache size cap (MB)</span>
         <input type="number" id="num-cacheCapMb" data-num="cacheCapMb" />

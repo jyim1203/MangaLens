@@ -244,3 +244,63 @@ describe("PriorityQueue — bookkeeping", () => {
     await expect(running).resolves.toBeUndefined();
   });
 });
+
+describe("PriorityQueue — addJob / setPriority (Phase 8 §2 re-prioritization)", () => {
+  it("upgrades a still-queued job ahead of same-priority earlier entries", async () => {
+    const q = new PriorityQueue({ concurrency: 1 });
+    const gate = deferred();
+    const order: number[] = [];
+    // Job 0 occupies the single slot; 1, 2, 3 queue behind it at priority 2.
+    q.add(async () => {
+      await gate.promise;
+      order.push(0);
+    }, 2);
+    q.add(async () => void order.push(1), 2);
+    const h2 = q.addJob(async () => void order.push(2), 2);
+    q.add(async () => void order.push(3), 2);
+
+    // Lift job 2 to priority 0 → it should run first among the queued ones.
+    expect(h2.setPriority(0)).toBe(true);
+    gate.resolve();
+    await tick();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(order).toEqual([0, 2, 1, 3]);
+  });
+
+  it("min() never worsens: a higher-number request leaves priority unchanged", async () => {
+    const q = new PriorityQueue({ concurrency: 1 });
+    const gate = deferred();
+    const order: number[] = [];
+    q.add(async () => {
+      await gate.promise;
+      order.push(0);
+    }, 0);
+    const h1 = q.addJob(async () => void order.push(1), 0); // already visible-tier
+    q.add(async () => void order.push(2), 0);
+
+    // A "downgrade" to 2 is ignored (min(0, 2) = 0) — still returns true (queued).
+    expect(h1.setPriority(2)).toBe(true);
+    gate.resolve();
+    await tick();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(order).toEqual([0, 1, 2]); // FIFO order preserved, not worsened
+  });
+
+  it("returns false once the job has started or settled", async () => {
+    const q = new PriorityQueue({ concurrency: 1 });
+    const gate = deferred();
+    const h = q.addJob(async () => {
+      await gate.promise;
+    }, 0);
+    // It started immediately (concurrency 1, nothing ahead).
+    expect(h.setPriority(0)).toBe(false);
+    gate.resolve();
+    await h.promise;
+    expect(h.setPriority(0)).toBe(false); // settled
+  });
+
+  it("add() is a thin wrapper that still resolves with the task result", async () => {
+    const q = new PriorityQueue({ concurrency: 2 });
+    expect(await q.add(async () => 42)).toBe(42);
+  });
+});

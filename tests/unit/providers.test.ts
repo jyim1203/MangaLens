@@ -1,9 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fakeBrowser } from "@webext-core/fake-browser";
+
+// openai.ts → endpointModes.ts (Phase 8 §4 persistence) → webextension-polyfill,
+// which throws at import outside a browser; swap it for the fake.
+vi.mock("webextension-polyfill", () => ({ default: fakeBrowser }));
+
 import { GeminiProvider } from "../../src/background/providers/gemini";
 import {
   AnthropicProvider,
   resetSamplingMemo,
 } from "../../src/background/providers/anthropic";
+import {
+  SAMPLING_REJECT_KEY,
+  loadSamplingMemo,
+} from "../../src/background/endpointModes";
 import {
   OPENAI_BASE_URL,
   createOpenAiProvider,
@@ -81,11 +91,12 @@ async function run(provider: Translator, settings = makeSettings()) {
   return provider.translatePage(makeJob(), settings, new AbortController().signal);
 }
 
-// The adapters memoize per-endpoint/per-model quirks at module level (event-page
-// lifetime); clear between tests so cases stay independent.
-beforeEach(() => {
+// The adapters memoize per-endpoint/per-model quirks in the persisted memos;
+// clear memo + backing storage between tests so cases stay independent.
+beforeEach(async () => {
   resetEndpointModes();
   resetSamplingMemo();
+  await fakeBrowser.storage.local.clear();
 });
 
 describe("GeminiProvider", () => {
@@ -288,6 +299,28 @@ describe("AnthropicProvider", () => {
     expect(requestBody(secondFetch)).not.toHaveProperty("temperature");
   });
 
+  it("honors a sampling rejection persisted by a PREVIOUS event-page lifetime", async () => {
+    // The memo is keyed by the resolved model (makeSettings → "some-model").
+    await fakeBrowser.storage.local.set({
+      [SAMPLING_REJECT_KEY]: { "some-model": true },
+    });
+    resetSamplingMemo(); // fresh event-page lifetime — memo empty, un-hydrated
+    await loadSamplingMemo(); // the background/index.ts startup hydrate
+
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        content: [{ type: "tool_use", name: "emit_translation", input: VALID_PAGE }],
+      }),
+    );
+    await run(
+      new AnthropicProvider("anthropic", { fetchFn: fetchMock }),
+      makeSettings({ provider: "anthropic" }),
+    );
+    // No re-paid 400: ONE request, temperature omitted up front.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(requestBody(fetchMock)).not.toHaveProperty("temperature");
+  });
+
   it("extracts token usage from the usage block", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse({
@@ -375,5 +408,102 @@ describe("resolveEffectiveModel", () => {
     );
     expect(fromDefault).toBe(fromExplicit);
     expect(fromDefault).toBe(DEFAULT_MODELS.gemini);
+  });
+});
+
+describe("per-adapter batch request shape (F12, §4.2)", () => {
+  /** N single-tile jobs (distinct hashes). */
+  function batchJobs(n: number): TranslateJob[] {
+    return Array.from({ length: n }, (_, i) => ({
+      imageHash: `h${i}`,
+      imageBlob: new Blob([new Uint8Array([i])], { type: "image/jpeg" }),
+      targetLang: "en",
+      priority: 2,
+    }));
+  }
+
+  /** A minimal valid batch body with `n` pages. */
+  function batchPages(n: number) {
+    return {
+      pages: Array.from({ length: n }, () => ({
+        source_lang: "ja",
+        regions: [{ bbox: [0.1, 0.1, 0.2, 0.2], original: "x", translated: "X", is_sfx: false }],
+      })),
+    };
+  }
+
+  it("Gemini batch: N inline_data image parts + the batch schema (pages array)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        candidates: [{ content: { parts: [{ text: JSON.stringify(batchPages(3)) }] } }],
+      }),
+    );
+    const provider = new GeminiProvider("gemini", { fetchFn: fetchMock });
+    const pages = await provider.translateBatch(batchJobs(3), makeSettings(), new AbortController().signal);
+
+    expect(pages).toHaveLength(3);
+    const body = requestBody(fetchMock);
+    const parts = (body.contents as { parts: { inline_data?: unknown }[] }[])[0]!.parts;
+    expect(parts.filter((p) => p.inline_data).length).toBe(3); // 3 image parts
+    const schema = JSON.stringify((body.generationConfig as Record<string, unknown>).responseSchema);
+    expect(schema).toContain('"pages"');
+  });
+
+  it("OpenAI batch: N image_url blocks + a batch json_schema response_format", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({ choices: [{ message: { content: JSON.stringify(batchPages(2)) } }] }),
+    );
+    const provider = createOpenAiProvider({ fetchFn: fetchMock });
+    const pages = await provider.translateBatch(
+      batchJobs(2),
+      makeSettings({ provider: "openai" }),
+      new AbortController().signal,
+    );
+
+    expect(pages).toHaveLength(2);
+    const body = requestBody(fetchMock);
+    const content = (body.messages as { role: string; content: { type: string }[] }[])[1]!.content;
+    expect(content.filter((b) => b.type === "image_url").length).toBe(2);
+    expect(JSON.stringify(body.response_format)).toContain('"pages"');
+  });
+
+  it("Anthropic batch: N image content blocks + the batch tool input_schema", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        content: [{ type: "tool_use", name: "emit_translation", input: batchPages(2) }],
+      }),
+    );
+    const provider = new AnthropicProvider("anthropic", { fetchFn: fetchMock });
+    const pages = await provider.translateBatch(
+      batchJobs(2),
+      makeSettings({ provider: "anthropic" }),
+      new AbortController().signal,
+    );
+
+    expect(pages).toHaveLength(2);
+    const body = requestBody(fetchMock);
+    const content = (body.messages as { content: { type: string }[] }[])[0]!.content;
+    expect(content.filter((b) => b.type === "image").length).toBe(2);
+    const tools = body.tools as { input_schema: unknown }[];
+    expect(JSON.stringify(tools[0]!.input_schema)).toContain('"pages"');
+    // The output cap scales with the page count (a batch's output is ~N pages'
+    // worth of regions — the flat single-page cap truncated dense batches).
+    expect(body).toHaveProperty("max_tokens", 8192 * 2);
+  });
+
+  it("Anthropic batch: scaled max_tokens is capped at 32000 (oldest active model limit)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        content: [{ type: "tool_use", name: "emit_translation", input: batchPages(4) }],
+      }),
+    );
+    const provider = new AnthropicProvider("anthropic", { fetchFn: fetchMock });
+    await provider.translateBatch(
+      batchJobs(4),
+      makeSettings({ provider: "anthropic" }),
+      new AbortController().signal,
+    );
+    // 4 × 8192 = 32768 would fail max_tokens validation on legacy Opus 4.1.
+    expect(requestBody(fetchMock)).toHaveProperty("max_tokens", 32000);
   });
 });

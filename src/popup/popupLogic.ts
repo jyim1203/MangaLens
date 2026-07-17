@@ -116,6 +116,20 @@ export function regionSelectEnabled(
   return hostname ? getEffectiveEnabled(settings, hostname) : false;
 }
 
+/**
+ * Whether the "Show cached translations" button (Phase 8 §0) should be enabled:
+ * only on an http/https tab where MangaLens is effectively active (there is a
+ * live queue to hydrate). Same gate as {@link regionSelectEnabled} — the button
+ * works on BOTH auto and non-auto active sites (it hydrates from cache, spending
+ * nothing), so it needs no extra auto-translate condition. Pure.
+ */
+export function canShowCached(
+  settings: Settings,
+  hostname: string | undefined,
+): boolean {
+  return hostname ? getEffectiveEnabled(settings, hostname) : false;
+}
+
 /** The pause toggle's label for the current queue state (Phase 7.4). */
 export function pauseButtonLabel(paused: boolean): string {
   return paused ? "Resume queue" : "Pause queue";

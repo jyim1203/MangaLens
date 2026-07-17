@@ -19,6 +19,7 @@ import {
 } from "../background/cache";
 import { COST_KEY, getCostStats } from "../background/costTracker";
 import { DEFAULT_MODELS, PROVIDER_LABELS } from "../shared/constants";
+import { resolveI18n } from "../shared/i18nDom";
 import { languageOptions } from "../shared/languages";
 import { createLogger } from "../shared/log";
 import { sendToBackground } from "../shared/messages";
@@ -630,7 +631,22 @@ function wireEvents(): void {
   });
 }
 
+/**
+ * Localize every `data-i18n` element (Phase 8 §8 i18n walker), keeping each
+ * element's English text as the fallback. Shared pure core: {@link resolveI18n}.
+ */
+function applyI18n(): void {
+  const els = [...document.querySelectorAll<HTMLElement>("[data-i18n]")];
+  const texts = resolveI18n(
+    els.map((el) => ({ key: el.dataset.i18n ?? "", fallback: el.textContent ?? "" })),
+  );
+  els.forEach((el, i) => {
+    el.textContent = texts[i]!;
+  });
+}
+
 async function main(): Promise<void> {
+  applyI18n(); // localize static strings first (§8)
   buildProviderRows();
   wireNumericInputs();
   wireEvents();

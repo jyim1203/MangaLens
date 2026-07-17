@@ -14,13 +14,23 @@ Read first: `docs/ARCHITECTURE.md` §7.5 (latency targets), §8 Phase 8 + its
 acceptance line, §9 (handoff rules), §10 (AMO risk row); `docs/PROMPTS.md` §4.2
 (batch prompt — implement verbatim), §5.2 (endpoint-mode persistence), §8
 (batch golden fixtures); the Phase 4/4.1, 5/5.1, 6, and 7/7.1 summaries in
-`PROGRESS.md` (they name every deferral this phase closes). Baseline state is
-verified green: **420 unit tests**, typecheck, ESLint, `vite build`, and
-`web-ext lint` (0 errors / 0 warnings; the lone `data_collection_permissions`
-notice is the one THIS phase finally clears). **Phase 7.2
-(docs/PHASE-7.2-HANDOFF.md — blob-page support, rate-limit gate, auto-translate
-opt-in) lands before this phase**: read its PROGRESS.md summary first; the test
-count and the `translatePage` message shape will have moved past this baseline.
+`PROGRESS.md` (they name every deferral this phase closes).
+
+> **BASELINE REFRESHED 2026-07-12 — read this before the rest of the doc.** This
+> handoff was drafted when the baseline was 420 tests and Phase 7.2 was still
+> pending. Since then **phases 7.2, 7.3, 7.4, 7.5, and 7.6 have ALL landed**
+> (each has a PROGRESS.md summary — read 7.2 through 7.6 first; they moved the
+> `translatePage` message shape, added blob-page support, the rate-limit gate,
+> auto-translate opt-in, object-fit overlay geometry, corner-format bboxes +
+> overlap trim + pause, the **`bubbleSnap.ts`** background pixel-refinement pass,
+> and the **Phase 7.6 cache-only hydrate**). Current baseline is verified green:
+> **549 unit tests**, typecheck, ESLint, `vite build`, and `web-ext lint`
+> (0 errors / 0 warnings; the lone `data_collection_permissions` notice is the
+> one THIS phase finally clears). Wherever this doc says "420 tests" read "549";
+> wherever it forward-references Phase 7.2 as pending, it has shipped. **NEW work
+> item added for this phase: §0 "Show cached translations" popup button** (user
+> re-request 2026-07-12) — read it first, it is the smallest item and reuses the
+> 7.6 hydrate machinery wholesale.
 
 **Already shipped — do NOT rebuild:**
 - The concurrency-limited `PriorityQueue` (priority + FIFO + abort merge) and
@@ -39,6 +49,16 @@ count and the `translatePage` message shape will have moved past this baseline.
 - `pagesPerRequest` already exists in `Settings` (default 1, clamped 1–4 by the
   options `NUMERIC_FIELDS` table) with an options hint saying "takes effect
   when batching ships (Phase 8)" — update that hint, don't re-add the field.
+- **(Phase 7.6) The cache-only hydrate machinery** — `TranslatePageRequest.
+  cacheOnly`, the `TranslatePageResult` `not-cached` arm, `countCachedForSite` +
+  `cache.ts` `countCacheForOrigin`, the `translateImage` `cacheOnly` fork, and
+  `viewportQueue`'s `probe()`/`maybeProbe()`/`HYDRATE_CONCURRENCY=3` origin-gated
+  probe scheduler. §0 below REUSES all of this; do NOT rebuild the probe path —
+  it only adds an on-demand `hydrateAll()` entry point and a popup button.
+- **(Phase 7.5/7.6) `background/bubbleSnap.ts`** — the pixel-refinement snap pass
+  (`snapAllRegions`/`snapPageRegions`, connected-bubble split, swallow guard).
+  It runs background-side before cache/paint; the e2e overlay-painted detection
+  (§6) is unaffected by it. Do not touch it this phase.
 
 ## Ground rules (Architecture §9, plus repo conventions)
 
@@ -90,18 +110,105 @@ Touched: `background/queue.ts` (priority-change handle), `background/
 translateHandlers.ts` (batch wiring + requestId→job registry + reprioritize
 handler), `background/providers/prompt.ts` (§4.2 batch text + batch schema,
 additive), `background/providers/ProviderBase.ts` + the four adapters
-(multi-image request build + batch envelope parse), `shared/messages.ts` (the
-one new message), `content/viewportQueue.ts` (upgrade planning, prefetchAhead
-setter, translate-all timeout budget), `content/index.ts` (apply prefetchAhead
-on settings change), `src/manifest.ts` (`data_collection_permissions`),
-`src/popup/*` + `src/options/*` (i18n walker + batching hint text),
+(multi-image request build + batch envelope parse), `shared/messages.ts` (**two**
+new messages — `reprioritizeTranslation` §2 + `hydrateCached` §0),
+`content/viewportQueue.ts` (§0 `hydrateAll` + upgrade planning, prefetchAhead
+setter, translate-all timeout budget), `content/contentRouter.ts` (§0
+`hydrateCached` handler), `content/index.ts` (apply prefetchAhead on settings
+change), `src/manifest.ts` (`data_collection_permissions`), `src/popup/*` +
+`src/options/*` (§0 "Show cached" button + i18n walker + batching hint text),
 `public/_locales/en/messages.json`, `package.json` (e2e deps + scripts).
 
-Suggested build order: 1 → 2 → 3 → 4 (unit-testable core), then 5 → 6 → 7
-(e2e infra proves 1–3 under realistic latency), then 8 (AMO polish last, so
-the lint/i18n pass covers final strings).
+Suggested build order: **0 (warmup — reuses shipped 7.6 hydrate)** → 1 → 2 → 3
+→ 4 (unit-testable core), then 5 → 6 → 7 (e2e infra proves 1–3 under realistic
+latency), then 8 (AMO polish last, so the lint/i18n pass covers final strings).
 
 ---
+
+## 0. "Show cached translations" popup button (NEW — user request 2026-07-12)
+
+**Context / decision reversal.** The Phase 7.6 handoff shipped an *automatic*
+cache-only hydrate (§7.6 item 2) and, at the time, declared it "supersedes the
+'Show cached' button idea" — the button was left OUT of scope. On 2026-07-12 the
+user re-requested the explicit button ("some button in the extension menu to
+reload existing translation boxes" after toggling the extension off/on). So the
+button is back IN scope for this phase. **Both coexist** — they are complementary:
+
+- The 7.6 **automatic** hydrate only runs on **non-auto sites** (`hydrate =
+  !getAutoTranslate(...)`) and only fires **on register** (page load / scanner
+  add). It already covers "reload a non-auto reader → boxes reappear, zero
+  spend."
+- The **button** is the on-demand, works-**everywhere** complement: it hydrates
+  **all currently-registered candidates** regardless of the auto/non-auto
+  setting, triggered by a user click. It closes the two gaps the auto path
+  leaves: (a) **auto sites** never auto-hydrate the whole page (they rely on
+  scroll visibility, so only visible + prefetch pages come back on re-enable);
+  (b) a user who wants an explicit "re-show what I already paid for" action —
+  e.g. right after toggling the extension back on — has one button instead of
+  hoping the scanner re-registered everything.
+
+**This is the smallest item in the phase and reuses the 7.6 hydrate path
+wholesale — build it first as a warmup.** The probe (`translatePage` with
+`cacheOnly: true`), the `not-cached` result arm, the bounded `HYDRATE_CONCURRENCY`
+scheduler, and per-candidate bookkeeping all already exist in
+`content/viewportQueue.ts`. You are adding ONE new content entry point, ONE new
+message, and ONE popup control.
+
+**Contract (`shared/messages.ts`) — flag it (rule 4).** Add one message:
+`hydrateCached: { request: void; response: { count: number } }` (popup → content
+tab, mirroring `translateAll`'s inert-safe shape). `count` = the number of
+candidates a probe was scheduled for (0 while inert / nothing registered), so the
+popup can show "Showing N cached…" / "Nothing to show" feedback. Do NOT overload
+`translateAll` with a `cacheOnly` flag — keep the spend-nothing path a distinct
+message so an inert-tab or mis-click can never accidentally start real requests.
+
+**Content (`viewportQueue.ts`):** add `hydrateAll(): number` to the `ViewportQueue`
+interface + implementation. It iterates every registered, **not-yet-`requested`**
+candidate and schedules each through the SAME `probeQueue`/`pumpProbes`/
+`HYDRATE_CONCURRENCY` gate `maybeProbe` uses — but **bypassing the per-lifetime
+origin gate** (the user's explicit click IS the intent signal; don't make the
+button silently no-op on a count-0 read, which can race a freshly-populated
+cache). Reuse the existing `probe()` verbatim (it already: never `setPending`,
+stamps `requestId`, renders only on a hit, leaves the record untouched +
+invisible on `not-cached`/error/timeout, ignores `paused`, skips
+already-`requested`). Return the count of candidates scheduled. Works whether or
+not `hydrate` was true at construction — it does not read that flag.
+
+**Content router (`contentRouter.ts`):** add a `hydrateCached` handler:
+`{ count: deps.getQueue()?.hydrateAll() ?? 0 }` (extend `ContentRouterDeps.getQueue`'s
+`Pick<...>` to include `hydrateAll`). Inert tab → `{ count: 0 }`, same inert-safety
+as `translateAll` (a passive listener that touches nothing while the gate is
+inert). Add a unit test in the contentRouter suite (inert → 0 without touching a
+queue; active → forwards to `hydrateAll`).
+
+**Popup (`popup/main.ts` + `popupLogic.ts`):** add a "Show cached translations"
+button near the Translate-all control. Shown/enabled only when the tab is
+hydratable — an http/https tab where the extension is active (reuse
+`hostnameFromUrl` + the existing active/enabled state the popup already computes;
+if a pure predicate doesn't already exist, add `canShowCached(settings, hostname)`
+to `popupLogic.ts` and unit-test it). On click: `sendToBackground`? No — this is
+popup → **content tab**, so use the same `browser.tabs.sendMessage` path
+`translateAll` uses; on the response, show transient feedback from `count`
+(`count > 0` → "Showing N cached…", `0` → "No cached translations here"). Mirror
+translateAll's inert-tab handling (the `getTranslationsPaused` "Could not
+establish connection" pattern from Phase 7.5 — treat a channel error as `{ count:
+0 }`, log at debug). The button string goes through the i18n walker you build in
+§8 (add it to `public/_locales/en/messages.json`); until then an English literal
+via `t()` is fine.
+
+**Explicitly NOT in this item:** no new setting, no auto-run-on-enable change (the
+7.6 auto path stays exactly as-is), no hydrating of drag-select regions (region
+results are uncached by design), no cache-key or `PROMPT_VERSION`/`CACHE_VERSION`
+change. A `hydrateAll` during in-flight auto-hydrate probes just re-probes the
+same keys — the `already-requested` skip + the "only clear our own requestId"
+guard already make that safe (worst case: a redundant indexed cache read).
+
+🧪 *Tests:* viewportQueue — `hydrateAll` schedules a probe per unrequested
+candidate, skips `requested` ones, returns the count, obeys `HYDRATE_CONCURRENCY`,
+and works with `hydrate: false` (auto site) where the auto path sent zero probes;
+a hit renders + flips `requested`; not-cached leaves the candidate untouched.
+contentRouter — inert → `{ count: 0 }` without a queue; active → forwards.
+popupLogic — `canShowCached` true only for active http/https tabs.
 
 ## 1. Multi-page batching (F12) — the core of this phase
 
@@ -423,7 +530,14 @@ manifest declaration shape so drift is caught.
    no unhandled-rejection noise in the event-page console.
 6. `about:addons` shows the data-collection disclosure; popup/options render
    localized (no `__MSG_…__`).
-7. **Also run the still-outstanding Phase 7 manual pass** (PHASE-7-HANDOFF.md
+7. **§0 Show-cached button:** on an **auto** reader, translate a few pages, then
+   toggle the extension off and back on (or reload). Before clicking anything,
+   only the visible/prefetched pages have come back. Click **Show cached
+   translations** in the popup → every already-translated page on the DOM
+   re-renders its overlays, the network panel shows **zero** `v1/messages`, and
+   the popup cost line does not move. On a never-translated tab the button
+   reports "No cached translations here" with no provider traffic.
+8. **Also run the still-outstanding Phase 7 manual pass** (PHASE-7-HANDOFF.md
    §Manual verification) — it has never been executed (PROGRESS 7.1 left it
    accurately outstanding); record both results honestly. The e2e suite
    covers the mock-provider path structurally; the live-key pass is a human
@@ -448,8 +562,8 @@ manifest declaration shape so drift is caught.
 
 ## Definition of done
 
-- `npm run check` green — all 420 existing tests stay green untouched (except
-  where an item explicitly extends a module's behavior).
+- `npm run check` green — all **549** existing tests stay green untouched
+  (except where an item explicitly extends a module's behavior).
 - `npm run build` clean; `npm run lint:ext` **0 errors / 0 warnings / 0
   notices** (the `data_collection_permissions` deferral is closed).
 - `npm run test:e2e` green, including the two Architecture acceptance
@@ -457,11 +571,13 @@ manifest declaration shape so drift is caught.
   2 s latency, and **no leak growth after 100 page navigations** (DOM-count
   stability as specced in item 7).
 - `PROMPT_VERSION` untouched; single-page prompt bytes pinned identical.
-- Contract changes limited to: `shared/messages.ts` `reprioritizeTranslation`,
-  the manifest `data_collection_permissions` key, package.json dev deps +
-  scripts. **NO `shared/types.ts` change.** Anything beyond: stop and flag
-  first.
-- PROGRESS.md gets the Phase 8 summary in house style, flagging: the
+- Contract changes limited to: `shared/messages.ts` `reprioritizeTranslation`
+  (§2) **and `hydrateCached` (§0)**, the manifest `data_collection_permissions`
+  key, package.json dev deps + scripts. **NO `shared/types.ts` change.** Anything
+  beyond: stop and flag first.
+- PROGRESS.md gets the Phase 8 summary in house style, flagging: the §0
+  "Show cached" button as a deliberate reversal of the 7.6 "auto-hydrate
+  supersedes the button" call (both now coexist, and why); the
   batching-is-opt-in deviation from Architecture §6's "translate-all defaults
   2–3"; batch results cached under unchanged keys; upgrade-only
   re-prioritization with scroll-away cancel/downgrade decided against;

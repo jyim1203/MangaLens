@@ -28,6 +28,7 @@ import type {
 } from "../../shared/types";
 import { iou, remapBboxFromTile } from "../imagePrep";
 import {
+  buildBatchUserText,
   buildPromptContext,
   buildSystemPrompt,
   buildUserText,
@@ -75,6 +76,24 @@ export class ProviderError extends Error {
     this.status = options.status;
     this.retryAfterMs = options.retryAfterMs;
     this.provider = options.provider;
+  }
+}
+
+/**
+ * Thrown by the batch pipeline ({@link ProviderBase.translateBatch}) when the
+ * provider returned a `pages` array whose length ≠ the number of images sent
+ * (PROMPTS §4.2 guardrail). A DISTINCT type (not a {@link ProviderError}) so the
+ * batch failure classifier routes it straight to split-retry WITHOUT spending the
+ * one whole-batch repair nudge — a length mismatch is a batching failure, not a
+ * JSON-formatting one the repair pass fixes.
+ */
+export class BatchLengthError extends Error {
+  constructor(
+    readonly expected: number,
+    readonly received: number,
+  ) {
+    super(`Batch returned ${received} pages, expected ${expected}`);
+    this.name = "BatchLengthError";
   }
 }
 
@@ -196,6 +215,45 @@ export function validatePageShape(parsed: unknown): RawPage {
   const sourceLang =
     typeof parsed.source_lang === "string" ? parsed.source_lang : "und";
   return { source_lang: sourceLang, regions: parsed.regions };
+}
+
+/**
+ * Shape-validate a batch response (PROMPTS §4.2): the top-level object must carry
+ * a `pages` array. Returns the raw pages (each still needs
+ * {@link validatePageShape}/{@link sanitizePage}); the LENGTH check is the
+ * caller's ({@link BatchLengthError}) so it can distinguish wrong-length (split,
+ * no repair) from malformed (one repair, then split).
+ *
+ * @throws {ProviderError} `malformed` if the object has no `pages` array.
+ */
+export function validateBatchShape(parsed: unknown): unknown[] {
+  if (!isPlainObject(parsed)) {
+    throw new ProviderError("malformed", "Batch response was not a JSON object");
+  }
+  if (!Array.isArray(parsed.pages)) {
+    throw new ProviderError("malformed", "Batch response has no pages array");
+  }
+  return parsed.pages;
+}
+
+/**
+ * Split an aggregate token count evenly across `n` batch members for per-member
+ * attribution (F17), with the remainder on the FIRST member so the parts sum
+ * EXACTLY back to `total` — the recorded cost must equal what the provider billed
+ * (no double count, no loss). Returns all-`undefined` when the provider reported
+ * no usage. // WHY a ballpark per-member split: the provider bills the batch as
+ * one call and doesn't break tokens down per image; F17 is an estimate surface.
+ */
+export function splitTokens(
+  total: number | undefined,
+  n: number,
+): (number | undefined)[] {
+  if (n <= 0) return [];
+  if (total === undefined) return new Array<undefined>(n).fill(undefined);
+  const base = Math.floor(total / n);
+  const out = new Array<number>(n).fill(base);
+  out[0] = total - base * (n - 1); // remainder on the first → exact sum
+  return out;
 }
 
 /** Common ISO 639-2/T (and a few 639-2/B) → 639-1 fixups for `source_lang`. */
@@ -470,14 +528,17 @@ export interface ProviderRequest {
   body: unknown;
 }
 
-/** Everything a provider needs to build one request. */
-export interface BuildContext {
+/**
+ * The request fields shared by the single-page and batch build contexts — the
+ * prompt text, model, settings, and the two delivery knobs the {@link downgrade}
+ * hook mutates. Kept generic so {@link ProviderBase.downgrade} and the HTTP
+ * machinery ({@link ProviderBase} `callWithRetry`/`callOnce`) work for both a
+ * one-image {@link BuildContext} and a multi-image {@link BatchBuildContext}
+ * without duplication.
+ */
+export interface BuildContextBase {
   systemPrompt: string;
   userText: string;
-  /** Base64 (no data-URI prefix) of the tile bytes. */
-  imageBase64: string;
-  /** MIME of the encoded tile, e.g. "image/jpeg". */
-  mime: string;
   model: string;
   settings: ProviderSettings;
   /**
@@ -493,6 +554,28 @@ export interface BuildContext {
    * (PROMPTS.md §5.2).
    */
   mode: "json_schema" | "json_object";
+}
+
+/** Everything a provider needs to build one single-image request. */
+export interface BuildContext extends BuildContextBase {
+  /** Base64 (no data-URI prefix) of the tile bytes. */
+  imageBase64: string;
+  /** MIME of the encoded tile, e.g. "image/jpeg". */
+  mime: string;
+}
+
+/** One image block for a multi-image batch request (F12, PROMPTS §4.2). */
+export interface BatchImage {
+  /** Base64 (no data-URI prefix) of the page bytes. */
+  imageBase64: string;
+  /** MIME of the encoded page, e.g. "image/jpeg". */
+  mime: string;
+}
+
+/** Everything a provider needs to build one MULTI-image batch request (F12). */
+export interface BatchBuildContext extends BuildContextBase {
+  /** The N page images, in order; `pages[i]` of the response corresponds to `images[i]`. */
+  images: BatchImage[];
 }
 
 /** Injectable seams so retry/backoff and HTTP are unit-testable without waiting or a network. */
@@ -561,6 +644,14 @@ export abstract class ProviderBase implements Translator {
   /** Build the concrete HTTP request for this provider (endpoint, headers, body). */
   protected abstract buildRequest(ctx: BuildContext): ProviderRequest;
 
+  /**
+   * Build the concrete MULTI-image batch request (F12, PROMPTS §4.2): the same
+   * envelope as {@link buildRequest} but with N image blocks in order + the batch
+   * user text + the batch schema dialect. Every adapter supports multi-image
+   * messages, so this is abstract (OpenRouter/custom inherit OpenAI's).
+   */
+  protected abstract buildBatchRequest(ctx: BatchBuildContext): ProviderRequest;
+
   /** Pull the model output (or a refusal) out of this provider's response JSON. */
   protected abstract extractOutput(responseJson: unknown): ProviderOutput;
 
@@ -569,9 +660,10 @@ export abstract class ProviderBase implements Translator {
    * return a modified context to retry once, or null to give up. Used by the
    * OpenAI family for the `json_schema` → `json_object` ladder (PROMPTS.md
    * §5.2) and by Anthropic to drop `temperature` for models that reject
-   * sampling params. Default: no recovery.
+   * sampling params. Default: no recovery. Generic over the context type so it
+   * applies to both single-page and batch requests unchanged.
    */
-  protected downgrade(_ctx: BuildContext, _bodyText: string): BuildContext | null {
+  protected downgrade<C extends BuildContextBase>(_ctx: C, _bodyText: string): C | null {
     return null;
   }
 
@@ -642,18 +734,41 @@ export abstract class ProviderBase implements Translator {
     ctx: BuildContext,
     signal: AbortSignal,
   ): Promise<ProviderOutput> {
-    const responseJson = await this.callWithRetry(ctx, signal);
+    const responseJson = await this.callWithRetry(
+      ctx,
+      (c) => this.buildRequest(c),
+      signal,
+    );
     return this.extractOutput(responseJson);
   }
 
-  /** Call the endpoint, retrying on rate-limit with the backoff ladder. */
-  private async callWithRetry(
-    ctx: BuildContext,
+  /** Batch sibling of {@link callAndExtract}: same HTTP machinery, batch request builder. */
+  private async callAndExtractBatch(
+    ctx: BatchBuildContext,
+    signal: AbortSignal,
+  ): Promise<ProviderOutput> {
+    const responseJson = await this.callWithRetry(
+      ctx,
+      (c) => this.buildBatchRequest(c),
+      signal,
+    );
+    return this.extractOutput(responseJson);
+  }
+
+  /**
+   * Call the endpoint, retrying on rate-limit with the backoff ladder. Generic
+   * over the context type + its request builder so single-page and batch share
+   * one backoff/downgrade path (the ONLY difference between them is which builder
+   * turns the context into an HTTP request).
+   */
+  private async callWithRetry<C extends BuildContextBase>(
+    ctx: C,
+    buildReq: (c: C) => ProviderRequest,
     signal: AbortSignal,
   ): Promise<unknown> {
     for (let attempt = 0; ; attempt++) {
       try {
-        return await this.callOnce(ctx, signal, true);
+        return await this.callOnce(ctx, buildReq, signal, true);
       } catch (err) {
         if (
           err instanceof ProviderError &&
@@ -674,12 +789,13 @@ export abstract class ProviderBase implements Translator {
   }
 
   /** A single HTTP round trip. `allowDowngrade` guards the one-shot 400 downgrade. */
-  private async callOnce(
-    ctx: BuildContext,
+  private async callOnce<C extends BuildContextBase>(
+    ctx: C,
+    buildReq: (c: C) => ProviderRequest,
     signal: AbortSignal,
     allowDowngrade: boolean,
   ): Promise<unknown> {
-    const req = this.buildRequest(ctx);
+    const req = buildReq(ctx);
     let response: Response;
     try {
       response = await this.fetchFn(req.url, {
@@ -707,7 +823,7 @@ export abstract class ProviderBase implements Translator {
         const downgraded = this.downgrade(ctx, bodyText);
         if (downgraded) {
           log.debug("400 recovery: retrying once with downgraded request");
-          return this.callOnce(downgraded, signal, false);
+          return this.callOnce(downgraded, buildReq, signal, false);
         }
       }
       throw mapHttpError(
@@ -765,6 +881,133 @@ export abstract class ProviderBase implements Translator {
       tokensOut: output.usage?.tokensOut,
       createdAt: Date.now(),
     };
+  }
+
+  /**
+   * Translate up to N single-tile page images in ONE provider request (F12,
+   * PROMPTS §4.2), amortizing the ~600-token system prompt. Background-local —
+   * deliberately NOT on the shared {@link Translator} interface (handoff rule 4);
+   * the background batch collector calls it, everything else uses
+   * {@link translatePage}.
+   *
+   * Mirrors {@link translatePage}'s structure: primary call → {@link finishBatch};
+   * a malformed result gets ONE whole-batch repair retry (§4.2 "never retry the
+   * whole batch more than once"). The failure ladder is split across this method
+   * and the caller's classifier:
+   *  - wrong `pages.length` → {@link BatchLengthError} (no repair — straight to split);
+   *  - malformed JSON → one repair retry here; still malformed → throw `malformed`
+   *    (caller splits);
+   *  - refusal → throw `refusal` (caller splits — one bad image must not damn its
+   *    batch-mates);
+   *  - auth/rate-limit/network/abort → propagate (caller fails all members — a
+   *    split would just repeat it N times).
+   *
+   * @param jobs single-tile member jobs (`imageBlob` = the prepped page bytes),
+   *   in order; `result[i]` corresponds to `jobs[i]`. Each result is stamped with
+   *   its job's `imageHash` and carries an even split of the batch's token usage
+   *   ({@link splitTokens}).
+   */
+  async translateBatch(
+    jobs: readonly TranslateJob[],
+    settings: ProviderSettings,
+    signal: AbortSignal,
+  ): Promise<PageTranslation[]> {
+    this.throwIfAborted(signal);
+    if (!settings.apiKey) {
+      throw new ProviderError("auth", "No API key configured", {
+        provider: this.providerId,
+      });
+    }
+    if (jobs.length === 0) return [];
+
+    const images: BatchImage[] = await Promise.all(
+      jobs.map(async (job) => ({
+        imageBase64: await blobToBase64(job.imageBlob),
+        mime: job.imageBlob.type || "image/jpeg",
+      })),
+    );
+    const model = settings.model || this.defaultModel;
+    const promptCtx = buildPromptContext(settings);
+    const systemPrompt = buildSystemPrompt(promptCtx);
+    const baseCtx: Omit<BatchBuildContext, "userText" | "temperature"> = {
+      systemPrompt,
+      images,
+      model,
+      settings,
+      mode: "json_schema",
+    };
+
+    const output = await this.callAndExtractBatch(
+      {
+        ...baseCtx,
+        userText: buildBatchUserText(promptCtx, jobs.length),
+        temperature: settings.temperature,
+      },
+      signal,
+    );
+
+    try {
+      return this.finishBatch(output, jobs, settings, model);
+    } catch (err) {
+      // ONE whole-batch repair retry, but ONLY for a malformed-JSON failure — a
+      // BatchLengthError or refusal is not a formatting problem the nudge fixes.
+      if (err instanceof ProviderError && err.kind === "malformed") {
+        log.debug("batch response malformed — running one repair retry");
+        const repaired = await this.callAndExtractBatch(
+          {
+            ...baseCtx,
+            userText: buildBatchUserText(promptCtx, jobs.length, { repair: true }),
+            temperature: 0,
+          },
+          signal,
+        );
+        return this.finishBatch(repaired, jobs, settings, model);
+      }
+      throw err;
+    }
+  }
+
+  /** Run one extracted batch output through the pipeline into per-member pages. */
+  private finishBatch(
+    output: ProviderOutput,
+    jobs: readonly TranslateJob[],
+    settings: ProviderSettings,
+    model: string,
+  ): PageTranslation[] {
+    if (output.kind === "refusal") {
+      throw new ProviderError("refusal", output.message, {
+        provider: this.providerId,
+      });
+    }
+    const parsed =
+      output.kind === "text" ? parseModelJson(output.value) : output.value;
+    const rawPages = validateBatchShape(parsed);
+    if (rawPages.length !== jobs.length) {
+      throw new BatchLengthError(jobs.length, rawPages.length);
+    }
+
+    const tokensIn = splitTokens(output.usage?.tokensIn, jobs.length);
+    const tokensOut = splitTokens(output.usage?.tokensOut, jobs.length);
+    const createdAt = Date.now();
+
+    return rawPages.map((rawPage, i) => {
+      const page = validatePageShape(rawPage);
+      const { sourceLang, regions } = sanitizePage(page);
+      const job = jobs[i] as TranslateJob;
+      // Batch members are single-tile by construction (the collector diverts any
+      // that prep multi-tile), so bboxes are already full-image space — no remap.
+      return {
+        imageHash: job.imageHash,
+        sourceLang,
+        targetLang: settings.targetLang,
+        regions,
+        model,
+        provider: this.providerId,
+        tokensIn: tokensIn[i],
+        tokensOut: tokensOut[i],
+        createdAt,
+      };
+    });
   }
 
   /** Throw a typed abort if the signal already fired (before any work). */

@@ -205,47 +205,48 @@
     <p id="status" class="status">Loading…</p>
 
     <div id="banner-key" class="banner" hidden>
-      <span>No API key for this provider.</span>
-      <button id="add-key" class="link">Add key</button>
+      <span data-i18n="popupBannerKey">No API key for this provider.</span>
+      <button id="add-key" class="link" data-i18n="popupAddKey">Add key</button>
       <button id="dismiss-key" class="dismiss" title="Dismiss" aria-label="Dismiss">✕</button>
     </div>
     <div id="banner-perm" class="banner" hidden>
-      <span>Image access not granted.</span>
-      <button id="grant-perm" class="link">Grant</button>
+      <span data-i18n="popupBannerPerm">Image access not granted.</span>
+      <button id="grant-perm" class="link" data-i18n="popupGrant">Grant</button>
       <button id="dismiss-perm" class="dismiss" title="Dismiss" aria-label="Dismiss">✕</button>
     </div>
 
     <section class="rows">
       <label class="row">
-        <span>This site</span>
+        <span data-i18n="popupSiteLabel">This site</span>
         <select id="site-choice">
-          <option value="default">Follow global</option>
-          <option value="on">Auto-translate on</option>
-          <option value="off">Always off</option>
+          <option value="default" data-i18n="popupSiteFollowGlobal">Follow global</option>
+          <option value="on" data-i18n="popupSiteAutoOn">Auto-translate on</option>
+          <option value="off" data-i18n="popupSiteAlwaysOff">Always off</option>
         </select>
       </label>
       <label class="row">
-        <span>Translate to</span>
+        <span data-i18n="popupTargetLabel">Translate to</span>
         <select id="target-lang"></select>
       </label>
       <label class="row">
-        <span>Provider</span>
+        <span data-i18n="popupProviderLabel">Provider</span>
         <select id="provider"></select>
       </label>
       <label class="row">
-        <span>Model</span>
+        <span data-i18n="popupModelLabel">Model</span>
         <input type="text" id="model" spellcheck="false" />
       </label>
     </section>
 
-    <button id="translate-all" class="primary">Translate all pages</button>
+    <button id="translate-all" class="primary" data-i18n="popupTranslateAll">Translate all pages</button>
     <button id="pause-queue" class="secondary" title="Pause translating more pages (started pages finish)" hidden>Pause queue</button>
-    <button id="select-region" class="secondary" title="Drag-select a region to translate (Alt+Shift+S)">Select region…</button>
+    <button id="show-cached" class="secondary" title="Re-show translations already in the cache (no provider calls)" data-i18n="popupShowCached">Show cached translations</button>
+    <button id="select-region" class="secondary" title="Drag-select a region to translate (Alt+Shift+S)" data-i18n="popupSelectRegion">Select region…</button>
     <p id="action-status" class="hint"></p>
 
     <footer>
       <span id="cost">≈ $0.00</span>
-      <button id="open-options" class="link">Settings</button>
+      <button id="open-options" class="link" data-i18n="popupSettings">Settings</button>
     </footer>
 
     <script type="module" src="./main.ts"></script>

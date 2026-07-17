@@ -11,11 +11,12 @@ import {
   DEFAULT_MODELS,
   ProviderBase,
   tokenCount,
+  type BatchBuildContext,
   type BuildContext,
   type ProviderOutput,
   type ProviderRequest,
 } from "./ProviderBase";
-import { toGeminiSchema } from "./prompt";
+import { toGeminiBatchSchema, toGeminiSchema } from "./prompt";
 
 /** Base for the Generative Language API. */
 export const GEMINI_BASE_URL =
@@ -60,6 +61,46 @@ export class GeminiProvider extends ProviderBase {
     return {
       // WHY the key in a header, not `?key=`: keeps it out of any URL that might
       // get logged. `generateContent` is the non-streaming endpoint.
+      url: `${GEMINI_BASE_URL}/models/${encodeURIComponent(ctx.model)}:generateContent`,
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": ctx.settings.apiKey,
+      },
+      body,
+    };
+  }
+
+  protected override buildBatchRequest(ctx: BatchBuildContext): ProviderRequest {
+    const body = {
+      systemInstruction: { parts: [{ text: ctx.systemPrompt }] },
+      contents: [
+        {
+          role: "user",
+          parts: [
+            // N image parts in order, then the batch instruction (PROMPTS §4.2).
+            ...ctx.images.map((img) => ({
+              inline_data: { mime_type: img.mime, data: img.imageBase64 },
+            })),
+            { text: ctx.userText },
+          ],
+        },
+      ],
+      generationConfig: {
+        ...(ctx.temperature !== undefined && { temperature: ctx.temperature }),
+        // WHY NOT scaled by page count (unlike the Anthropic batch cap): the
+        // default model (gemini-2.0-flash) hard-caps output at 8192, and Gemini
+        // 400s a maxOutputTokens above the model's limit — scaling would break
+        // batching on the shipped default to help only 2.5+ models. A dense
+        // batch that truncates here degrades through the malformed → repair →
+        // split ladder, which still succeeds (slowly). Revisit when the default
+        // model moves to a 2.5+ generation.
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
+        responseMimeType: "application/json",
+        responseSchema: toGeminiBatchSchema(),
+      },
+    };
+
+    return {
       url: `${GEMINI_BASE_URL}/models/${encodeURIComponent(ctx.model)}:generateContent`,
       headers: {
         "Content-Type": "application/json",

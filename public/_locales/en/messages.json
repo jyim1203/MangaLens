@@ -62,5 +62,25 @@
   "toastOpenSettings": {
     "message": "Open settings",
     "description": "Action button on the auth error toast; opens the options page."
+  },
+  "popupBannerKey": { "message": "No API key for this provider." },
+  "popupAddKey": { "message": "Add key" },
+  "popupBannerPerm": { "message": "Image access not granted." },
+  "popupGrant": { "message": "Grant" },
+  "popupSiteLabel": { "message": "This site" },
+  "popupSiteFollowGlobal": { "message": "Follow global" },
+  "popupSiteAutoOn": { "message": "Auto-translate on" },
+  "popupSiteAlwaysOff": { "message": "Always off" },
+  "popupTargetLabel": { "message": "Translate to" },
+  "popupProviderLabel": { "message": "Provider" },
+  "popupModelLabel": { "message": "Model" },
+  "popupTranslateAll": { "message": "Translate all pages" },
+  "popupShowCached": { "message": "Show cached translations" },
+  "popupSelectRegion": { "message": "Select region…" },
+  "popupSettings": { "message": "Settings" },
+  "optionsTitle": { "message": "MangaLens settings" },
+  "optionsPagesPerRequestHint": {
+    "message": "Images per provider request. 1 = one page per request (default). 2–3 recommended for Translate all — batches pages to amortize the prompt and cut cost.",
+    "description": "Options hint under the pagesPerRequest field (Phase 8 batching)."
   }
 }

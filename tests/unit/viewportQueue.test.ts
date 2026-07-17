@@ -8,9 +8,11 @@ vi.mock("webextension-polyfill", () => ({ default: fakeBrowser }));
 vi.mock("../../src/shared/messages", () => ({ sendToBackground: vi.fn() }));
 
 import {
+  TRANSLATE_ALL_MAX_TIMEOUT_MS,
   TRANSLATE_ALL_PRIORITY,
   createViewportQueue,
   planEnqueues,
+  requestAllTimeoutMs,
   type OverlaySink,
 } from "../../src/content/viewportQueue";
 import { sendToBackground } from "../../src/shared/messages";
@@ -19,9 +21,9 @@ import type { PageTranslation, ProviderErrorKind } from "../../src/shared/types"
 
 const mockSend = vi.mocked(sendToBackground);
 
-const base = { count: 5, requested: new Set<number>(), prefetchAhead: 3 };
+const base = { count: 5, sentPriority: new Map<number, number>(), prefetchAhead: 3 };
 
-describe("viewportQueue — planEnqueues (§7.5 priority planner)", () => {
+describe("viewportQueue — planEnqueues (§7.5 priority planner + §2 upgrades)", () => {
   it("visible tier enqueues the page at priority 0 plus N+1..N+3 prefetch at priority 2", () => {
     expect(planEnqueues({ ...base, changedIndex: 0, changedTier: 0 })).toEqual([
       { index: 0, priority: 0 },
@@ -37,18 +39,47 @@ describe("viewportQueue — planEnqueues (§7.5 priority planner)", () => {
     ]);
   });
 
-  it("skips already-requested indices (no re-send, no priority upgrade)", () => {
+  it("skips a requested index whose tier is equal/worse (never worsen), still sends unrequested prefetch", () => {
     expect(
       planEnqueues({
         ...base,
         changedIndex: 0,
         changedTier: 0,
-        requested: new Set([0, 2]),
+        // 0 already sent at 0 (equal → skip), 2 already sent at 2 (2<2 false → skip).
+        sentPriority: new Map([
+          [0, 0],
+          [2, 2],
+        ]),
       }),
     ).toEqual([
       { index: 1, priority: 2 },
       { index: 3, priority: 2 },
     ]);
+  });
+
+  it("emits an UPGRADE when a requested candidate's tier strictly improves (§2)", () => {
+    // Page 2 was sent at prefetch (2); it just became visible (0) → upgrade to 0.
+    expect(
+      planEnqueues({
+        ...base,
+        count: 3,
+        changedIndex: 2,
+        changedTier: 0,
+        prefetchAhead: 0,
+        sentPriority: new Map([[2, 2]]),
+      }),
+    ).toEqual([{ index: 2, priority: 0, upgrade: true }]);
+  });
+
+  it("upgrades a prefetched page to near (2 → 1) but never to a worse tier", () => {
+    // Near transition on a page sent at 2 → upgrade to 1.
+    expect(
+      planEnqueues({ ...base, changedIndex: 1, changedTier: 1, sentPriority: new Map([[1, 2]]) }),
+    ).toEqual([{ index: 1, priority: 1, upgrade: true }]);
+    // Near transition on a page already sent at 0 (visible) → 1<0 false → no-op.
+    expect(
+      planEnqueues({ ...base, changedIndex: 1, changedTier: 1, sentPriority: new Map([[1, 0]]) }),
+    ).toEqual([]);
   });
 
   it("respects prefetchAhead depth and document order", () => {
@@ -66,13 +97,13 @@ describe("viewportQueue — planEnqueues (§7.5 priority planner)", () => {
     ).toEqual([{ index: 2, priority: 0 }]);
   });
 
-  it("does not enqueue a below-range or fully-requested change", () => {
+  it("does not enqueue a below-range change", () => {
     expect(
       planEnqueues({
         ...base,
         changedIndex: 4,
         changedTier: 1,
-        requested: new Set([4]),
+        sentPriority: new Map([[4, 1]]),
       }),
     ).toEqual([]);
   });
@@ -362,7 +393,7 @@ describe("viewportQueue — blob bytes dispatch (item 1)", () => {
     FakeIO.instances[0]!.fire(BLOB.el, true);
     await tick();
 
-    expect(acquireBytes).toHaveBeenCalledWith(BLOB.url);
+    expect(acquireBytes).toHaveBeenCalledWith(BLOB.url, BLOB.el);
     const [type, payload] = mockSend.mock.calls[0]!;
     expect(type).toBe("translatePage");
     expect(payload).toMatchObject({
@@ -710,7 +741,7 @@ describe("viewportQueue — cache-only hydrate (Phase 7.6)", () => {
     queue.register(BLOB);
     await tick();
 
-    expect(acquireBytes).toHaveBeenCalledWith(BLOB.url);
+    expect(acquireBytes).toHaveBeenCalledWith(BLOB.url, BLOB.el);
     expect(probeCalls()[0]![1]).toMatchObject({
       cacheOnly: true,
       imageBytes: bytes,
@@ -762,6 +793,252 @@ describe("viewportQueue — cache-only hydrate (Phase 7.6)", () => {
 
     expect(probeCalls()).toHaveLength(1);
     expect(overlay.render).toHaveBeenCalledWith(cand, PAGE); // hit still rendered while paused
+    queue.stop();
+  });
+});
+
+describe("viewportQueue — requestAllTimeoutMs (§3 budget)", () => {
+  const BASE = 120_000;
+  it("floors at baseMs (count 0) and is monotonic in count", () => {
+    expect(requestAllTimeoutMs(0, 6, BASE)).toBe(BASE);
+    const t10 = requestAllTimeoutMs(10, 6, BASE);
+    const t50 = requestAllTimeoutMs(50, 6, BASE);
+    const t200 = requestAllTimeoutMs(200, 6, BASE);
+    expect(t10).toBeGreaterThanOrEqual(BASE);
+    expect(t50).toBeGreaterThan(t10);
+    expect(t200).toBeGreaterThan(t50);
+  });
+
+  it("adds ~30 s per wave of `concurrency` requests", () => {
+    // 12 pages at concurrency 6 → 2 waves → base + 60 s.
+    expect(requestAllTimeoutMs(12, 6, BASE)).toBe(BASE + 2 * 30_000);
+    // A smaller concurrency = more waves = bigger budget.
+    expect(requestAllTimeoutMs(12, 3, BASE)).toBe(BASE + 4 * 30_000);
+  });
+
+  it("holds the 15-minute cap for a huge backlog", () => {
+    expect(requestAllTimeoutMs(100_000, 1, BASE)).toBe(TRANSLATE_ALL_MAX_TIMEOUT_MS);
+  });
+
+  it("clamps a degenerate concurrency to at least 1 lane", () => {
+    expect(requestAllTimeoutMs(6, 0, BASE)).toBe(BASE + 6 * 30_000);
+  });
+});
+
+describe("viewportQueue — §3 shell (budget + setPrefetchAhead)", () => {
+  beforeEach(() => {
+    FakeIO.instances = [];
+    mockSend.mockReset();
+    vi.stubGlobal("Node", { DOCUMENT_POSITION_FOLLOWING: 4 });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const fakeEl = (): Element =>
+    ({ compareDocumentPosition: () => 2 }) as unknown as Element;
+  const cand = (id: string): Candidate => ({ id, el: fakeEl(), url: `https://x/${id}.jpg` });
+
+  function makeQueue(overlay: OverlaySink, prefetchAhead: number, requestTimeoutMs?: number) {
+    return createViewportQueue({
+      overlay,
+      prefetchAhead,
+      concurrency: 6,
+      autoEnqueue: true,
+      hydrate: false,
+      makeRequestId: () => "rq",
+      requestTimeoutMs,
+      createObserver: (cb, options) =>
+        new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+  }
+
+  it("requestAll uses the backlog-scaled budget, not the flat visibility timeout", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {})); // never settles
+    const queue = makeQueue(fakeOverlay(), 0, 10); // flat timeout would be 10 ms
+    queue.register(cand("a"));
+    queue.requestAll(); // budget ≈ 30 s → won't reset within the test window
+    await tick(40);
+    // Still requested (no 10 ms timeout reset) → a second requestAll is a no-op.
+    expect(queue.requestAll()).toBe(0);
+    queue.stop();
+  });
+
+  it("setPrefetchAhead changes how many neighbours the next tier change prefetches", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const a = cand("a");
+    const b = cand("b");
+    const c = cand("c");
+    const queue = makeQueue(fakeOverlay(), 0); // start with no prefetch
+    queue.register(a);
+    queue.register(b);
+    queue.register(c);
+
+    // With prefetchAhead 0, "a" visible sends only "a".
+    FakeIO.instances[0]!.fire(a.el, true);
+    await tick();
+    expect(mockSend.mock.calls.filter((cl) => cl[0] === "translatePage")).toHaveLength(1);
+
+    // Live-raise the depth, then a fresh tier change on "b" prefetches its neighbour.
+    queue.setPrefetchAhead(1);
+    FakeIO.instances[0]!.fire(b.el, true); // sends "b" (0) + prefetch "c" (2)
+    await tick();
+    expect(mockSend.mock.calls.filter((cl) => cl[0] === "translatePage")).toHaveLength(3);
+    queue.stop();
+  });
+});
+
+describe("viewportQueue — priority upgrade shell (§2)", () => {
+  beforeEach(() => {
+    FakeIO.instances = [];
+    mockSend.mockReset();
+  });
+
+  function makeQueue(overlay: OverlaySink) {
+    return createViewportQueue({
+      overlay,
+      prefetchAhead: 0,
+      autoEnqueue: true,
+      hydrate: false,
+      makeRequestId: () => "rq",
+      createObserver: (cb, options) =>
+        new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+  }
+
+  it("a near→visible transition on a requested candidate sends reprioritizeTranslation (not a re-send)", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {})); // translatePage hangs (stays in-flight)
+    const queue = makeQueue(fakeOverlay());
+    queue.register(CAND);
+    const [visible, near] = FakeIO.instances;
+
+    // First it enters at the near tier → sent at priority 1.
+    near!.fire(CAND.el, true);
+    await tick();
+    const firstCall = mockSend.mock.calls[0]!;
+    expect(firstCall[0]).toBe("translatePage");
+    expect((firstCall[1] as { priority: number }).priority).toBe(1);
+
+    // Now it becomes visible → an UPGRADE, not a second translatePage.
+    visible!.fire(CAND.el, true);
+    await tick();
+
+    const reproCall = mockSend.mock.calls.find((c) => c[0] === "reprioritizeTranslation");
+    expect(reproCall).toBeDefined();
+    expect(reproCall![1]).toEqual({ requestId: "rq", priority: 0 });
+    // No second translatePage was sent for the same candidate.
+    expect(mockSend.mock.calls.filter((c) => c[0] === "translatePage")).toHaveLength(1);
+    queue.stop();
+  });
+});
+
+describe("viewportQueue — hydrateAll (Phase 8 §0 Show cached button)", () => {
+  beforeEach(() => {
+    FakeIO.instances = [];
+    mockSend.mockReset();
+    vi.stubGlobal("Node", { DOCUMENT_POSITION_FOLLOWING: 4 });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const fakeEl = (): Element =>
+    ({ compareDocumentPosition: () => 2 }) as unknown as Element;
+  const httpCand = (id: string): Candidate => ({ id, el: fakeEl(), url: `https://x/${id}.jpg` });
+  const PAGE = { imageHash: "h", regions: [] } as unknown as PageTranslation;
+
+  /** hydrate:false + autoEnqueue reflects an AUTO site: the auto-hydrate path sent
+   *  zero probes, but the button must still work there. */
+  function makeQueue(overlay: OverlaySink, autoEnqueue: boolean, requestTimeoutMs?: number) {
+    return createViewportQueue({
+      overlay,
+      prefetchAhead: 0,
+      autoEnqueue,
+      hydrate: false, // the button ignores this flag
+      makeRequestId: () => "rq",
+      requestTimeoutMs,
+      createObserver: (cb, options) =>
+        new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+  }
+
+  const probeCalls = () =>
+    mockSend.mock.calls.filter(
+      (c) => c[0] === "translatePage" && (c[1] as { cacheOnly?: boolean }).cacheOnly,
+    );
+
+  it("schedules a cacheOnly probe per unrequested candidate and returns the count (auto site, hydrate:false)", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {})); // probes hang → stay in-flight
+    const queue = makeQueue(fakeOverlay(), true);
+    queue.register(httpCand("a"));
+    queue.register(httpCand("b"));
+
+    // No auto-hydrate probes fired (hydrate:false) and countCachedForSite is never
+    // consulted — the button bypasses the origin gate.
+    await tick();
+    expect(probeCalls()).toHaveLength(0);
+
+    expect(queue.hydrateAll()).toBe(2);
+    await tick();
+    expect(probeCalls()).toHaveLength(2);
+    expect(mockSend).not.toHaveBeenCalledWith("countCachedForSite");
+    expect(probeCalls()[0]![1]).toMatchObject({ cacheOnly: true });
+    queue.stop();
+  });
+
+  it("skips already-requested candidates", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const queue = makeQueue(fakeOverlay(), true);
+    const a = httpCand("a");
+    queue.register(a);
+    queue.register(httpCand("b"));
+    // Mark a as requested via a real (non-probe) translate-all send.
+    expect(queue.requestAll()).toBe(2); // both sent → both requested now
+
+    expect(queue.hydrateAll()).toBe(0); // nothing left unrequested
+    queue.stop();
+  });
+
+  it("a hit renders and flips requested (a later Translate all skips it)", async () => {
+    mockSend.mockImplementation((type: string) =>
+      type === "translatePage" ? Promise.resolve({ ok: true, page: PAGE }) : Promise.resolve(undefined),
+    );
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay, true);
+    const cand = httpCand("a");
+    queue.register(cand);
+
+    expect(queue.hydrateAll()).toBe(1);
+    await tick();
+    expect(overlay.render).toHaveBeenCalledWith(cand, PAGE);
+    expect(overlay.setPending).not.toHaveBeenCalled(); // no skeleton flash
+    expect(queue.requestAll()).toBe(0); // already requested
+    queue.stop();
+  });
+
+  it("a not-cached probe leaves the candidate untouched and still translatable", async () => {
+    mockSend.mockImplementation((type: string, payload?: unknown) => {
+      if (type === "translatePage" && (payload as { cacheOnly?: boolean }).cacheOnly) {
+        return Promise.resolve({ ok: false, errorKind: "not-cached" });
+      }
+      return new Promise<never>(() => {});
+    });
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay, true);
+    queue.register(httpCand("a"));
+
+    expect(queue.hydrateAll()).toBe(1);
+    await tick();
+    expect(overlay.render).not.toHaveBeenCalled();
+    expect(overlay.setError).not.toHaveBeenCalled();
+    expect(queue.requestAll()).toBe(1); // still unrequested → real send available
+    queue.stop();
+  });
+
+  it("obeys HYDRATE_CONCURRENCY (≤ 3 probes in flight)", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {})); // hang → stay in-flight
+    const queue = makeQueue(fakeOverlay(), true);
+    for (const id of ["a", "b", "c", "d", "e"]) queue.register(httpCand(id));
+
+    expect(queue.hydrateAll()).toBe(5);
+    await tick();
+    expect(probeCalls().length).toBeLessThanOrEqual(3);
     queue.stop();
   });
 });

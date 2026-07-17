@@ -1,0 +1,25 @@
+{
+  "pages": [
+    {
+      "source_lang": "ja",
+      "regions": [
+        { "bbox": [0.10, 0.05, 0.30, 0.12], "original": "おはよう", "translated": "Morning", "is_sfx": false, "kind": "bubble" },
+        { "bbox": [0.55, 0.20, 0.80, 0.30], "original": "いくよ", "translated": "Let's go", "is_sfx": false, "kind": "bubble" }
+      ]
+    },
+    {
+      "source_lang": "ja",
+      "regions": [
+        { "bbox": [0.12, 0.08, 0.34, 0.16], "original": "まって", "translated": "Wait", "is_sfx": false, "kind": "bubble" },
+        { "bbox": [0.40, 0.50, 0.60, 0.64], "original": "ゴゴゴ", "translated": "RUMBLE", "is_sfx": true, "kind": "sfx" },
+        { "bbox": [0.05, 0.80, 0.40, 0.90], "original": "その後", "translated": "Afterward", "is_sfx": false, "kind": "caption" }
+      ]
+    },
+    {
+      "source_lang": "ja",
+      "regions": [
+        { "bbox": [0.20, 0.15, 0.50, 0.28], "original": "やった！", "translated": "We did it!", "is_sfx": false, "kind": "bubble" }
+      ]
+    }
+  ]
+}

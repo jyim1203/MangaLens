@@ -45,6 +45,25 @@ export interface PriorityQueueOptions {
 /** A job's async work; receives the merged abort signal for cooperative cancel. */
 export type Task<T> = (signal: AbortSignal) => Promise<T>;
 
+/**
+ * A handle to an enqueued job (Phase 8 §2 re-prioritization). {@link setPriority}
+ * lifts a STILL-QUEUED job to a better (lower-number) priority so a prefetched
+ * page that scrolls into view jumps the queue instead of waiting behind the whole
+ * chapter. It is UPGRADE-ONLY (`min(current, requested)` — a request can never
+ * WORSEN a job's priority) and a no-op returning `false` once the job has started
+ * or settled.
+ */
+export interface QueueHandle<T> {
+  /** Settles with the task's result (or rejects on failure/abort). */
+  promise: Promise<T>;
+  /**
+   * Raise this job's priority to `min(current, requested)` and re-insert it (fresh
+   * seq — fair "back of the new class"). Returns `true` while the job is still
+   * queued, `false` once it has started or settled (nothing to reorder).
+   */
+  setPriority(priority: number): boolean;
+}
+
 interface QueueEntry {
   priority: number;
   /** Monotonic insertion index — the FIFO tiebreaker within a priority. */
@@ -164,14 +183,25 @@ export class PriorityQueue {
 
   /**
    * Enqueue `task` at `priority`. The returned promise settles with the task's
-   * result, or rejects if the task (after any retries) fails or is aborted.
+   * result, or rejects if the task (after any retries) fails or is aborted. Thin
+   * wrapper over {@link addJob} for callers that don't need a re-prioritize handle.
    *
    * @param task async work; receives a merged abort signal.
    * @param priority lower runs first; ties are FIFO (default 0).
    * @param jobSignal optional per-job abort that cancels only this job.
    */
   add<T>(task: Task<T>, priority = 0, jobSignal?: AbortSignal): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
+    return this.addJob(task, priority, jobSignal).promise;
+  }
+
+  /**
+   * Enqueue `task` and return a {@link QueueHandle} whose {@link QueueHandle.setPriority}
+   * can lift the job to a better priority while it is still queued (Phase 8 §2).
+   * Same scheduling/abort semantics as {@link add}.
+   */
+  addJob<T>(task: Task<T>, priority = 0, jobSignal?: AbortSignal): QueueHandle<T> {
+    let entry: QueueEntry | undefined;
+    const promise = new Promise<T>((resolve, reject) => {
       // Already-aborted fast paths: never enqueue a dead job.
       if (this.queueSignal?.aborted) {
         reject(abortReason(this.queueSignal));
@@ -182,13 +212,13 @@ export class PriorityQueue {
         return;
       }
 
-      const entry: QueueEntry = {
+      const created: QueueEntry = {
         priority,
         seq: this.seqCounter++,
         jobSignal,
         reject,
         start: async () => {
-          this.detachJobAbort(entry);
+          this.detachJobAbort(created);
           const parents: AbortSignal[] = [];
           if (this.queueSignal) parents.push(this.queueSignal);
           if (jobSignal) parents.push(jobSignal);
@@ -205,21 +235,40 @@ export class PriorityQueue {
           }
         },
       };
+      entry = created;
 
       // A per-job abort while still queued rejects and removes it before it runs.
       if (jobSignal) {
-        entry.onJobAbort = () => {
-          if (this.remove(entry)) {
-            this.detachJobAbort(entry);
+        created.onJobAbort = () => {
+          if (this.remove(created)) {
+            this.detachJobAbort(created);
             reject(abortReason(jobSignal));
           }
         };
-        jobSignal.addEventListener("abort", entry.onJobAbort, { once: true });
+        jobSignal.addEventListener("abort", created.onJobAbort, { once: true });
       }
 
-      this.insert(entry);
+      this.insert(created);
       this.pump();
     });
+
+    // Upgrade-only re-prioritization: a job not in `pending` (started/settled/
+    // aborted) can't reorder. `min` guarantees a request never worsens priority.
+    const setPriority = (requested: number): boolean => {
+      if (!entry) return false;
+      const i = this.pending.indexOf(entry);
+      if (i === -1) return false;
+      const effective = Math.min(entry.priority, requested);
+      if (effective !== entry.priority) {
+        this.pending.splice(i, 1);
+        entry.priority = effective;
+        entry.seq = this.seqCounter++; // fresh seq → fair back of the new class
+        this.insert(entry);
+      }
+      return true;
+    };
+
+    return { promise, setPriority };
   }
 
   /**

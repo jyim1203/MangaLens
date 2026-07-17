@@ -11,6 +11,7 @@ import {
 } from "../../src/shared/settings";
 import {
   TRANSLATE_ALL_CONFIRM_THRESHOLD,
+  canShowCached,
   costSummary,
   hostnameFromUrl,
   needsApiKey,
@@ -101,6 +102,29 @@ describe("popupLogic — regionSelectEnabled (Phase 7)", () => {
 
   it("is disabled on non-web pages (no hostname)", () => {
     expect(regionSelectEnabled(settings({ enabled: true }), undefined)).toBe(false);
+  });
+});
+
+describe("popupLogic — canShowCached (Phase 8 §0)", () => {
+  it("is enabled on any active http(s) page, auto or not", () => {
+    // Global-on, no override → active but NOT auto: the button must still be on.
+    expect(canShowCached(settings({ enabled: true }), "a.com")).toBe(true);
+    // Per-site auto opt-in → also on.
+    expect(
+      canShowCached(settings({ enabled: true, perSiteOverrides: { "a.com": true } }), "a.com"),
+    ).toBe(true);
+    // An override wins over a global-off flag.
+    expect(
+      canShowCached(settings({ enabled: false, perSiteOverrides: { "a.com": true } }), "a.com"),
+    ).toBe(true);
+  });
+
+  it("is disabled when inactive or off a web page", () => {
+    expect(canShowCached(settings({ enabled: false }), "a.com")).toBe(false);
+    expect(
+      canShowCached(settings({ enabled: true, perSiteOverrides: { "a.com": false } }), "a.com"),
+    ).toBe(false);
+    expect(canShowCached(settings({ enabled: true }), undefined)).toBe(false);
   });
 });
 

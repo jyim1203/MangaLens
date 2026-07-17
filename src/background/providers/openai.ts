@@ -12,12 +12,19 @@ import {
   DEFAULT_MODELS,
   ProviderBase,
   tokenCount,
+  type BatchBuildContext,
   type BuildContext,
+  type BuildContextBase,
   type ProviderBaseOptions,
   type ProviderOutput,
   type ProviderRequest,
 } from "./ProviderBase";
-import { toOpenAiStrictSchema } from "./prompt";
+import { toOpenAiBatchSchema, toOpenAiStrictSchema } from "./prompt";
+import {
+  getEndpointMode,
+  learnEndpointMode,
+  resetEndpointModes,
+} from "../endpointModes";
 import type { ProviderId } from "../../shared/types";
 
 /** Canonical OpenAI API base. */
@@ -26,20 +33,10 @@ export const OPENAI_BASE_URL = "https://api.openai.com/v1";
 /** JSON name the schema is registered under (OpenAI requires one). */
 const SCHEMA_NAME = "manga_translation";
 
-/**
- * Remembered structured-output mode per endpoint base URL, so an endpoint that
- * 400s on `json_schema` pays the downgrade round trip once per event-page
- * lifetime instead of once per request (PROMPTS.md §5.2 "remember the working
- * mode per endpoint"). NOTE: §5.2 asks for persistence in settings; that needs
- * the background settings write path + an options-page surface and is deferred
- * to Phase 6 — this in-memory memo covers the burst-of-pages common case.
- */
-const endpointModes = new Map<string, "json_schema" | "json_object">();
-
-/** Test seam: forget every remembered endpoint mode. */
-export function resetEndpointModes(): void {
-  endpointModes.clear();
-}
+// The per-endpoint structured-output mode memo now PERSISTS across event-page
+// lifetimes (Phase 8 §4) — its storage-backed home is `background/endpointModes.ts`.
+// Re-exported so the existing `resetEndpointModes` test seam keeps working.
+export { resetEndpointModes };
 
 /**
  * Provider for OpenAI and every OpenAI-compatible surface. `openrouter` and
@@ -69,7 +66,7 @@ export class OpenAiProvider extends ProviderBase {
   protected override buildRequest(ctx: BuildContext): ProviderRequest {
     const schema = toOpenAiStrictSchema();
     // A remembered downgrade for this endpoint overrides the requested mode.
-    const mode = endpointModes.get(this.baseUrl) ?? ctx.mode;
+    const mode = getEndpointMode(this.baseUrl) ?? ctx.mode;
     // json_object downgrade: no native schema enforcement, so paste it into the
     // system prompt as a best-effort instruction (§5.2).
     const system =
@@ -90,6 +87,52 @@ export class OpenAiProvider extends ProviderBase {
               type: "image_url",
               image_url: { url: `data:${ctx.mime};base64,${ctx.imageBase64}` },
             },
+          ],
+        },
+      ],
+      response_format:
+        mode === "json_object"
+          ? { type: "json_object" }
+          : {
+              type: "json_schema",
+              json_schema: { name: SCHEMA_NAME, strict: true, schema },
+            },
+    };
+
+    return {
+      url: `${this.baseUrl}/chat/completions`,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${ctx.settings.apiKey}`,
+        ...this.extraHeaders,
+      },
+      body,
+    };
+  }
+
+  protected override buildBatchRequest(ctx: BatchBuildContext): ProviderRequest {
+    const schema = toOpenAiBatchSchema();
+    // Same per-endpoint downgrade memo as the single-page path (§5.2).
+    const mode = getEndpointMode(this.baseUrl) ?? ctx.mode;
+    const system =
+      mode === "json_object"
+        ? `${ctx.systemPrompt}\n\nReturn a JSON object matching this schema exactly:\n${JSON.stringify(schema)}`
+        : ctx.systemPrompt;
+
+    const body: Record<string, unknown> = {
+      model: ctx.model,
+      ...(ctx.temperature !== undefined && { temperature: ctx.temperature }),
+      messages: [
+        { role: "system", content: system },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: ctx.userText },
+            // N image_url blocks in order (PROMPTS §4.2).
+            ...ctx.images.map((img) => ({
+              type: "image_url",
+              image_url: { url: `data:${img.mime};base64,${img.imageBase64}` },
+            })),
           ],
         },
       ],
@@ -143,17 +186,18 @@ export class OpenAiProvider extends ProviderBase {
     };
   }
 
-  protected override downgrade(
-    ctx: BuildContext,
+  protected override downgrade<C extends BuildContextBase>(
+    ctx: C,
     bodyText: string,
-  ): BuildContext | null {
+  ): C | null {
     // Only worth retrying if we haven't already downgraded and the server is
-    // complaining about the structured-output request specifically.
-    if (ctx.mode !== "json_schema" || endpointModes.get(this.baseUrl) === "json_object") {
+    // complaining about the structured-output request specifically. Generic over
+    // the context so the single-page AND batch requests share this downgrade.
+    if (ctx.mode !== "json_schema" || getEndpointMode(this.baseUrl) === "json_object") {
       return null;
     }
     if (!/response_format|json_schema/i.test(bodyText)) return null;
-    endpointModes.set(this.baseUrl, "json_object");
+    learnEndpointMode(this.baseUrl, "json_object");
     return { ...ctx, mode: "json_object" };
   }
 }

@@ -10,6 +10,7 @@ import {
   callWithRateGate,
   createTranslateHandlers,
   errorToTranslateResult,
+  getTranslationQueue,
   mergeTilePages,
   resetInflightForTest,
   resetRequestControllersForTest,
@@ -313,5 +314,24 @@ describe("translateHandlers — coalesce leader cleanup on a failed run (item 3)
     } finally {
       process.off("unhandledRejection", onRejection);
     }
+  });
+});
+
+describe("translateHandlers — getTranslationQueue (§3 live concurrency)", () => {
+  beforeEach(() => resetTranslationQueueForTest());
+
+  it("returns the SAME queue instance and re-tunes its concurrency each call", () => {
+    const q1 = getTranslationQueue(6);
+    const q2 = getTranslationQueue(2);
+    expect(q2).toBe(q1); // one process-wide queue, not rebuilt
+    // The cap is now 2: 3 hanging jobs → 2 running, 1 queued.
+    q2.add(() => new Promise<void>(() => {}));
+    q2.add(() => new Promise<void>(() => {}));
+    q2.add(() => new Promise<void>(() => {}));
+    expect(q2.running).toBe(2);
+    expect(q2.size).toBe(1);
+    // Raising it back to 6 starts the queued job immediately (live).
+    getTranslationQueue(6);
+    expect(q2.running).toBe(3);
   });
 });

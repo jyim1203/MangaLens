@@ -58,7 +58,7 @@ describe("contentRouter — buildContentRouterHandlers (Phase 7.1 item 5)", () =
     expect(inert.translateAll!({ dryRun: true }, SENDER)).toEqual({ count: 0 });
 
     const active = buildContentRouterHandlers({
-      getQueue: () => ({ requestAll, setPaused: vi.fn(), isPaused: vi.fn() }),
+      getQueue: () => ({ requestAll, setPaused: vi.fn(), isPaused: vi.fn(), hydrateAll: vi.fn() }),
       getRegionSelector: () => undefined,
       getOverlay: () => undefined,
     });
@@ -71,7 +71,7 @@ describe("contentRouter — buildContentRouterHandlers (Phase 7.1 item 5)", () =
   it("setTranslationsPaused forwards to the queue while active, no-ops while inert", async () => {
     const setPaused = vi.fn(async () => 4);
     const active = buildContentRouterHandlers({
-      getQueue: () => ({ requestAll: vi.fn(), setPaused, isPaused: vi.fn() }),
+      getQueue: () => ({ requestAll: vi.fn(), setPaused, isPaused: vi.fn(), hydrateAll: vi.fn() }),
       getRegionSelector: () => undefined,
       getOverlay: () => undefined,
     });
@@ -94,7 +94,7 @@ describe("contentRouter — buildContentRouterHandlers (Phase 7.1 item 5)", () =
 
   it("getTranslationsPaused reflects the queue state and defaults to false while inert", () => {
     const active = buildContentRouterHandlers({
-      getQueue: () => ({ requestAll: vi.fn(), setPaused: vi.fn(), isPaused: () => true }),
+      getQueue: () => ({ requestAll: vi.fn(), setPaused: vi.fn(), isPaused: () => true, hydrateAll: vi.fn() }),
       getRegionSelector: () => undefined,
       getOverlay: () => undefined,
     });
@@ -106,5 +106,24 @@ describe("contentRouter — buildContentRouterHandlers (Phase 7.1 item 5)", () =
       getOverlay: () => undefined,
     });
     expect(inert.getTranslationsPaused!(undefined, SENDER)).toEqual({ paused: false });
+  });
+
+  it("hydrateCached returns {count:0} while inert and forwards hydrateAll's count while active", () => {
+    const hydrateAll = vi.fn(() => 6);
+    const inert = buildContentRouterHandlers({
+      getQueue: () => undefined, // inert — never touches a queue
+      getRegionSelector: () => undefined,
+      getOverlay: () => undefined,
+    });
+    expect(inert.hydrateCached!(undefined, SENDER)).toEqual({ count: 0 });
+    expect(hydrateAll).not.toHaveBeenCalled();
+
+    const active = buildContentRouterHandlers({
+      getQueue: () => ({ requestAll: vi.fn(), setPaused: vi.fn(), isPaused: vi.fn(), hydrateAll }),
+      getRegionSelector: () => undefined,
+      getOverlay: () => undefined,
+    });
+    expect(active.hydrateCached!(undefined, SENDER)).toEqual({ count: 6 });
+    expect(hydrateAll).toHaveBeenCalledTimes(1);
   });
 });

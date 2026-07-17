@@ -148,6 +148,51 @@ export function toAnthropicToolSchema(): JsonSchema {
   return cloneSchema(CANONICAL_SCHEMA);
 }
 
+// --- Multi-page batch schema (PROMPTS.md §4.2, F12) ------------------------
+
+/**
+ * Wrap a single-page schema in the batch envelope (PROMPTS §4.2): a required
+ * top-level `pages` array whose items are the given single-page schema. WHY
+ * derive from the passed dialect rather than a second literal: each provider's
+ * batch schema then inherits its own stripping rules for free (Gemini
+ * no-`additionalProperties`, OpenAI strict, Anthropic as-is), and a single-page
+ * schema edit propagates to batch automatically.
+ *
+ * @param singlePageSchema the already-dialect-converted single-page schema.
+ * @param includeAdditionalProperties add `additionalProperties: false` on the
+ *   wrapper (OpenAI strict + Anthropic keep it; Gemini rejects it → omit).
+ */
+export function toBatchSchema(
+  singlePageSchema: JsonSchema,
+  includeAdditionalProperties: boolean,
+): JsonSchema {
+  const wrapper: JsonSchema = {
+    type: "object",
+    required: ["pages"],
+    properties: { pages: { type: "array", items: singlePageSchema } },
+  };
+  if (includeAdditionalProperties) wrapper.additionalProperties = false;
+  return wrapper;
+}
+
+/** Gemini batch `responseSchema`: wrap the Gemini single-page dialect (no
+ *  `additionalProperties` anywhere). */
+export function toGeminiBatchSchema(): JsonSchema {
+  return toBatchSchema(toGeminiSchema(), false);
+}
+
+/** OpenAI strict batch `json_schema`: wrap the strict single-page dialect and
+ *  keep `additionalProperties: false` on the wrapper (strict mode requires it;
+ *  `pages` is the only property and is already in `required`). */
+export function toOpenAiBatchSchema(): JsonSchema {
+  return toBatchSchema(toOpenAiStrictSchema(), true);
+}
+
+/** Anthropic batch tool `input_schema`: wrap the canonical single-page schema. */
+export function toAnthropicBatchSchema(): JsonSchema {
+  return toBatchSchema(toAnthropicToolSchema(), true);
+}
+
 // --- System prompt (PROMPTS.md §3) -----------------------------------------
 
 /**
@@ -281,9 +326,10 @@ export interface UserTextOptions {
  * added only when the source language is pinned; the region suffix (§4.3) is
  * added for drag-select crops; the repair suffix is added on the retry pass.
  *
- * NOTE: multi-page batch (§4.2) is deferred with F12 — the
- * {@link import("../../shared/types").Translator} interface is one-image-per-call,
- * so batching is a queue-layer concern.
+ * The multi-page batch variant is {@link buildBatchUserText} (§4.2). Batching is
+ * a background/queue concern (the shared
+ * {@link import("../../shared/types").Translator} interface stays
+ * one-image-per-call); `ProviderBase.translateBatch` is background-local.
  */
 export function buildUserText(
   ctx: PromptContext,
@@ -296,6 +342,40 @@ export function buildUserText(
   if (options.region) {
     text += `\n${REGION_SUFFIX}`;
   }
+  if (options.repair) {
+    text +=
+      "\nYour previous output was not valid JSON. Return only the JSON object.";
+  }
+  return text;
+}
+
+/**
+ * Build the multi-page batch user message (PROMPTS.md §4.2, F12) — verbatim from
+ * the spec. Attach the N images in order, then this text. WHY the single-page
+ * strings are untouched: batching is additive; `buildUserText`'s output (and thus
+ * `PROMPT_VERSION`) is unchanged, so cached single-page translations stay valid
+ * and a batch result caches under the SAME key as the single result (batch is a
+ * delivery mechanism, not a quality-affecting setting).
+ *
+ * @param ctx the resolved prompt context.
+ * @param n the number of page images attached (2–4 in practice).
+ * @param options `repair` appends the same "return only JSON" nudge as the
+ *   single-page repair retry (the ONE whole-batch retry, §4.2 guardrail).
+ */
+export function buildBatchUserText(
+  ctx: PromptContext,
+  n: number,
+  options: UserTextOptions = {},
+): string {
+  const sourceHint = ctx.sourceLangName
+    ? `The source language is ${ctx.sourceLangName}.`
+    : "";
+  const first = `Translate these ${n} pages to ${ctx.targetLangName}. ${sourceHint}`.trim();
+  let text =
+    `${first}\n` +
+    `Return one JSON object with a top-level "pages" array of length ${n}; ` +
+    `pages[i] corresponds to image i (0-indexed) and follows the single-page schema ` +
+    `(source_lang + regions). Bboxes are relative to that page's own dimensions.`;
   if (options.repair) {
     text +=
       "\nYour previous output was not valid JSON. Return only the JSON object.";

@@ -74,6 +74,17 @@ const manifest: Record<string, unknown> = {
       // WHY 128: `optional_host_permissions` was introduced in Firefox 128
       // (web-ext lint flags anything lower).
       strict_min_version: "128.0",
+      // Data-collection disclosure (Phase 8 §8, deferred since Phase 0 — clears
+      // the standing web-ext `data_collection_permissions` notice). The HONEST
+      // declaration for MangaLens: it transmits page images to the USER'S CHOSEN
+      // provider only (that's "website content"), and collects nothing else —
+      // no analytics, no telemetry, no first-party server. API keys stay in
+      // `storage.local` and are never transmitted anywhere but that provider.
+      // Older Firefox ignores this key (forward-compatible AMO metadata), so it
+      // needs NO strict_min_version bump.
+      data_collection_permissions: {
+        required: ["websiteContent"],
+      },
     },
   },
 };

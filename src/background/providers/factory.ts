@@ -4,9 +4,10 @@
  * background layer names providers — callers depend only on the
  * {@link Translator} interface.
  */
-import type { ProviderSettings, Translator } from "../../shared/types";
+import type { ProviderSettings } from "../../shared/types";
 import {
   DEFAULT_MODELS,
+  ProviderBase,
   ProviderError,
   type ProviderBaseOptions,
 } from "./ProviderBase";
@@ -22,13 +23,20 @@ import { createOpenRouterProvider } from "./openrouter";
  * Build the translator for the active provider. `options` injects the fetch /
  * sleep / backoff seams (tests only); production passes nothing.
  *
+ * Returns the concrete {@link ProviderBase} (which `implements Translator`), not
+ * the bare {@link import("../../shared/types").Translator} interface — so the
+ * background batch collector can reach the background-local
+ * {@link ProviderBase.translateBatch} (F12, handoff rule 4: batching lives here,
+ * not on the shared interface). Callers that only need single-page translation
+ * still see the `Translator` surface.
+ *
  * @throws {ProviderError} `unknown` for an unrecognized provider id, or
  *   `custom` with no endpoint configured.
  */
 export function createProvider(
   settings: ProviderSettings,
   options?: ProviderBaseOptions,
-): Translator {
+): ProviderBase {
   switch (settings.provider) {
     case "gemini":
       return new GeminiProvider("gemini", options);

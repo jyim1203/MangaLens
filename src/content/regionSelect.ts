@@ -556,7 +556,8 @@ async function defaultAcquireSource(target: RegionTarget): Promise<RegionSource>
   if (plan.send === "bytes") {
     return target.kind === "canvas"
       ? acquireCanvasBytes(target.el as HTMLCanvasElement)
-      : acquireBlobBytes(target.url as string);
+      : // The element rides along as the revoked-object-URL fallback source.
+        acquireBlobBytes(target.url as string, target.el);
   }
   throw new Error("unsupported region source");
 }

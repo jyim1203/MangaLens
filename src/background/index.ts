@@ -27,8 +27,16 @@ import { createTranslateHandlers } from "./translateHandlers";
 import { createRegionHandlers } from "./regionHandlers";
 import { createKeyTestHandlers } from "./providers/keyTest";
 import { resetCostStats } from "./costTracker";
+import { loadEndpointModes, loadSamplingMemo } from "./endpointModes";
 
 const log = createLogger("background");
+
+// Hydrate the persisted request-shape memos once per lifetime (§4), so an
+// OpenAI-compatible endpoint that already learned it needs `json_object` — or
+// an Anthropic model that already learned it rejects `temperature` — doesn't
+// re-pay the 400 after the event page restarts. Fail-soft.
+void loadEndpointModes();
+void loadSamplingMemo();
 
 // Typed message router (shared/messages.ts). Settings, translatePage, and (as
 // of Phase 6) testApiKey + resetCostStats are live. translateAll is handled by

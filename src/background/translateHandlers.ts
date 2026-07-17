@@ -52,11 +52,22 @@ import { isAbortError } from "../shared/guards";
 import { recordUsage, usageFromPage } from "./costTracker";
 import { ImageFetchError, fetchImageBytes } from "./imageFetcher";
 import { sha256Hex } from "./hash";
-import { dedupeRegions, prepareImage } from "./imagePrep";
+import { dedupeRegions, prepareImage, type PreparedImage } from "./imagePrep";
 import { PriorityQueue } from "./queue";
 import { ProviderError } from "./providers/ProviderBase";
 import { createProvider, resolveEffectiveModel } from "./providers/factory";
 import { createRateGate, type RateGate } from "./rateGate";
+import {
+  BATCH_LINGER_MS,
+  BATCH_MIN_PRIORITY,
+  batchEligible,
+  batchSignature,
+  classifyBatchFailure,
+  clampBatchSize,
+  createBatchCollector,
+  type BatchCollector,
+  type BatchJob,
+} from "./batch";
 
 const log = createLogger("translate");
 
@@ -120,6 +131,128 @@ export function getRateGate(): RateGate {
 /** Reset the shared rate gate — test seam only; no production caller. */
 export function resetRateGateForTest(): void {
   rateGate = undefined;
+}
+
+/**
+ * One batch member's payload (translateHandlers-local; {@link BatchCollector} is
+ * generic over it). Carries everything the group task needs to prep + translate +
+ * settle this member.
+ */
+interface BatchMemberPayload {
+  /** The member's composite cache key (§2 re-prioritization lookup + cache anchor). */
+  cacheKey: string;
+  pageHash: string;
+  blob: Blob;
+  settings: Settings;
+  providerSettings: ProviderSettings;
+  signal: AbortSignal;
+  onStarted?: () => void;
+}
+
+/**
+ * The one process-wide batch collector (F12). Lazily created (event-page
+ * lifetime; a partial group is dropped on unload — gap #8, content re-requests).
+ * Groups eligible priority-2 cache-miss jobs by signature and flushes each to
+ * {@link executeBatchGroup}.
+ */
+let batchCollector: BatchCollector<BatchMemberPayload, PageTranslation> | undefined;
+
+/** Get/create the shared batch collector. */
+function getBatchCollector(): BatchCollector<BatchMemberPayload, PageTranslation> {
+  if (!batchCollector) {
+    batchCollector = createBatchCollector<BatchMemberPayload, PageTranslation>({
+      lingerMs: BATCH_LINGER_MS,
+      runGroup: (jobs) => executeBatchGroup(jobs),
+    });
+  }
+  return batchCollector;
+}
+
+/** Reset the shared batch collector — test seam only; no production caller. */
+export function resetBatchCollectorForTest(): void {
+  batchCollector = undefined;
+}
+
+/**
+ * requestId → cacheKey for in-flight MISS jobs (Phase 8 §2 re-prioritization).
+ * Registered when a miss enters {@link translateImage} with a requestId, cleaned
+ * in its `finally`. Bridges a content `reprioritizeTranslation(requestId, …)` to
+ * the queued job / batch member for that image (many requestIds can share one
+ * cacheKey when coalesced — they upgrade the same job). Not persisted (gap #8).
+ */
+const requestIdToCacheKey = new Map<string, string>();
+
+/**
+ * cacheKey → the queue handle of its in-flight job, so `reprioritizeTranslation`
+ * can lift a still-queued job (Phase 8 §2). For a solo miss it is the page's own
+ * job; for a flushed batch it is the group's ONE handle, registered under EVERY
+ * member's cacheKey (lifting the whole batch when one member becomes visible is
+ * accepted). Deleted on settle.
+ */
+const queuedHandles = new Map<string, { setPriority(priority: number): boolean }>();
+
+/**
+ * requestId → the priority of a `reprioritizeTranslation` that arrived BEFORE its
+ * {@link translateImage} registered a `requestId → cacheKey` mapping (Phase 8.1
+ * §5). A prefetched page's background fetch + hash can take seconds; an upgrade
+ * landing in that window used to be a silent no-op — and because the content side
+ * already stamped the better `sentPriority` and IntersectionObserver fires only on
+ * transitions, it was never re-sent, so the page stayed at priority 2 behind the
+ * whole backlog: the exact symptom §2 exists to fix, recurring in a timing window.
+ * The miss path drains this the moment it registers its mapping. Bounded (oldest
+ * evicted, {@link MAX_PENDING_REPRIORITIZE}) because a requestId that cache-hits or
+ * is cancelled before the miss never drains; drained/settled entries are deleted.
+ */
+const pendingReprioritize = new Map<string, number>();
+
+/** Cap on buffered pre-registration upgrades (§5); the oldest is evicted past it. */
+export const MAX_PENDING_REPRIORITIZE = 500;
+
+/** Reset the §2/§5 re-prioritization registries — test seam only; no production caller. */
+export function resetReprioritizeForTest(): void {
+  requestIdToCacheKey.clear();
+  queuedHandles.clear();
+  pendingReprioritize.clear();
+}
+
+/** Buffered pre-registration upgrade count — test seam only (asserts the cap holds). */
+export function pendingReprioritizeSizeForTest(): number {
+  return pendingReprioritize.size;
+}
+
+/**
+ * Buffer an upgrade that arrived before its miss registered (§5). Keeps the more
+ * urgent priority (min — never worsen) and re-inserts so the entry counts as
+ * freshly used, then evicts the oldest while over {@link MAX_PENDING_REPRIORITIZE}
+ * (a `Map` preserves insertion order, so the first key is the oldest).
+ */
+function bufferPendingReprioritize(requestId: string, priority: number): void {
+  const existing = pendingReprioritize.get(requestId);
+  pendingReprioritize.delete(requestId);
+  pendingReprioritize.set(
+    requestId,
+    existing === undefined ? priority : Math.min(existing, priority),
+  );
+  while (pendingReprioritize.size > MAX_PENDING_REPRIORITIZE) {
+    const oldest = pendingReprioritize.keys().next().value;
+    if (oldest === undefined) break;
+    pendingReprioritize.delete(oldest);
+  }
+}
+
+/**
+ * Apply an upgrade to the in-flight job for `cacheKey` (§2/§5). A member still
+ * buffered in the batch collector is pulled out and run SOLO at `priority` (don't
+ * drag its batch-mates up); a queued solo job / flushed batch is lifted via
+ * `setPriority` (min() never worsens). A running/settled job has no handle → no-op.
+ */
+function applyReprioritize(cacheKey: string, priority: number): void {
+  const pulled = batchCollector?.remove((p) => p.cacheKey === cacheKey);
+  if (pulled) {
+    runPulledMemberSolo(pulled, priority);
+    return;
+  }
+  queuedHandles.get(cacheKey)?.setPriority(priority);
 }
 
 /**
@@ -319,7 +452,27 @@ async function translatePrepared(
     maxEdgePx: settings.maxImageEdgePx,
     jpegQuality: settings.jpegQuality,
   });
+  return translateTiles(prepared, blob, pageHash, providerSettings, signal);
+}
 
+/**
+ * Translate an ALREADY-prepped image's tiles (the provider + merge + snap portion
+ * of {@link translatePrepared}). Split out so the batch collector can reuse it for
+ * a member it has already prepped — a multi-tile page diverted out of a batch, or
+ * a single-tile member on a split-retry — without re-prepping.
+ *
+ * @param prepared the {@link prepareImage} output (1 tile for a normal page, N for
+ *   a webtoon strip).
+ * @param blob the ORIGINAL full-image bytes (for the snap pass + hash anchor).
+ * @param pageHash SHA-256 of `blob` (stamped as the merged page's `imageHash`).
+ */
+async function translateTiles(
+  prepared: PreparedImage,
+  blob: Blob,
+  pageHash: string,
+  providerSettings: ProviderSettings,
+  signal: AbortSignal,
+): Promise<{ page: PageTranslation; providerCalls: number }> {
   const provider = createProvider(providerSettings);
   const gate = getRateGate();
   // WHY parallel: tiles of one strip are independent requests, and §7.5's
@@ -357,6 +510,252 @@ async function translatePrepared(
     `translated: ${snapped.regions.length} regions from ${prepared.tiles.length} tile(s)`,
   );
   return { page: snapped, providerCalls: prepared.tiles.length };
+}
+
+// --- Multi-page batch execution (F12, PROMPTS §4.2) -------------------------
+
+/** A single-tile batch member paired with its already-prepped image. */
+interface PreppedSingle {
+  job: BatchJob<BatchMemberPayload, PageTranslation>;
+  prepared: PreparedImage;
+}
+
+/**
+ * Execute one flushed batch group (the collector's injected `runGroup`). Enqueues
+ * ONE priority-2 queue task carrying all members — so a batch = one queue slot =
+ * one provider request (§4.2). The task preps each member, diverts any that prep
+ * multi-tile to the per-tile path, and runs one `translateBatch` on the rest.
+ * Never throws: it settles every member's promise itself. The `.catch` handles
+ * only a queue-level PRE-RUN abort (the task never ran → members unsettled).
+ */
+function executeBatchGroup(jobs: BatchJob<BatchMemberPayload, PageTranslation>[]): void {
+  if (jobs.length === 0) return;
+  // Members share settings by signature construction — use the first for the
+  // group's concurrency, prep dims, and provider.
+  const settings = jobs[0]!.payload.settings;
+  const providerSettings = jobs[0]!.payload.providerSettings;
+
+  // Combined abort: the batch aborts only when EVERY member has aborted. A single
+  // member aborting stays in the batch — its result is nearly free and still
+  // cached (same semantics as a coalesce follower). SharedAbort refcounts this.
+  const shared = createSharedAbort();
+  const stops = jobs.map((j) => shared.addWaiter(j.payload.signal));
+
+  const queue = getTranslationQueue(settings.concurrency);
+  const handle = queue.addJob(
+    (qSignal) => runBatchGroupTask(jobs, settings, providerSettings, qSignal),
+    BATCH_MIN_PRIORITY,
+    shared.signal,
+  );
+  // Register the ONE batch handle under every member's cacheKey so a
+  // reprioritizeTranslation for any member lifts the whole batch (§2, accepted).
+  for (const j of jobs) queuedHandles.set(j.payload.cacheKey, handle);
+  handle.promise
+    .catch((err: unknown) => {
+      // Queue-level pre-run abort: the task never ran, so no member was settled —
+      // reject them all. (A member the task already settled is a fixed promise;
+      // this reject is then a no-op.)
+      for (const j of jobs) j.reject(err);
+    })
+    .finally(() => {
+      shared.settle();
+      for (const stop of stops) stop();
+      for (const j of jobs) {
+        if (queuedHandles.get(j.payload.cacheKey) === handle) {
+          queuedHandles.delete(j.payload.cacheKey);
+        }
+      }
+    });
+}
+
+/**
+ * Run a member PULLED out of the batch collector (§2 re-prioritization) SOLO at
+ * the new priority — don't drag its batch-mates up. Records its own usage (the
+ * batch task won't) and settles the member's original promise, so its
+ * {@link runTranslateMiss} caller caches it exactly as if it had never batched.
+ */
+function runPulledMemberSolo(
+  job: BatchJob<BatchMemberPayload, PageTranslation>,
+  priority: number,
+): void {
+  const { blob, pageHash, settings, providerSettings, signal, onStarted, cacheKey } = job.payload;
+  const queue = getTranslationQueue(settings.concurrency);
+  const handle = queue.addJob(
+    (qSignal) => {
+      onStarted?.();
+      return translatePrepared(blob, pageHash, settings, providerSettings, qSignal);
+    },
+    priority,
+    signal,
+  );
+  queuedHandles.set(cacheKey, handle); // a further reprioritize can still upgrade it
+  void handle.promise
+    .then(
+      (result) => {
+        void recordUsage(usageFromPage(result.page, result.providerCalls));
+        job.resolve(result.page);
+      },
+      (err: unknown) => job.reject(err),
+    )
+    .finally(() => {
+      if (queuedHandles.get(cacheKey) === handle) queuedHandles.delete(cacheKey);
+    });
+}
+
+/**
+ * The batch queue task body: mark every member started, prep each, partition into
+ * single-tile (one batch call) vs multi-tile (per-tile divert), and run both to
+ * completion INSIDE this one queue slot. Never throws (each member settles itself).
+ */
+async function runBatchGroupTask(
+  jobs: BatchJob<BatchMemberPayload, PageTranslation>[],
+  settings: Settings,
+  providerSettings: ProviderSettings,
+  signal: AbortSignal,
+): Promise<void> {
+  // The task just left the queue's wait list — mark every member "started" (the
+  // pause boundary; a whole group crosses it together).
+  for (const j of jobs) j.payload.onStarted?.();
+
+  const prepared = await Promise.all(
+    jobs.map((j) =>
+      prepareImage(j.payload.blob, {
+        maxEdgePx: settings.maxImageEdgePx,
+        jpegQuality: settings.jpegQuality,
+      }).then(
+        (p) => ({ ok: true as const, p }),
+        (e: unknown) => ({ ok: false as const, e }),
+      ),
+    ),
+  );
+
+  const singles: PreppedSingle[] = [];
+  const work: Promise<void>[] = [];
+  jobs.forEach((job, i) => {
+    const pr = prepared[i]!;
+    if (!pr.ok) {
+      job.reject(pr.e); // a prep failure fails just this member (same as solo)
+      return;
+    }
+    if (pr.p.tiled && pr.p.tiles.length > 1) {
+      // A webtoon strip snuck into a batch — divert to the per-tile path (its own
+      // usage; not part of the one batch HTTP call). Awaited so it stays in-slot.
+      work.push(translateSoloAndSettle(job, pr.p, providerSettings, signal));
+    } else {
+      singles.push({ job, prepared: pr.p });
+    }
+  });
+
+  // WHY a lone single-tile member goes SOLO, never through translateBatch (§4): a
+  // batch of one amortizes nothing — it swaps the proven single-page prompt for the
+  // batch envelope for zero benefit, and against a provider that returns a
+  // single-page body for one image it needlessly trips the malformed → one-repair →
+  // split ladder (two wasted extra round trips). This is the 10-page @ batch-3
+  // linger-flush of the 10th member. translateBatch itself stays able to take 1 job
+  // (unit-tested, harmless); the collector just never sends it one.
+  if (singles.length === 1) {
+    work.push(
+      translateSoloAndSettle(singles[0]!.job, singles[0]!.prepared, providerSettings, signal),
+    );
+  } else if (singles.length > 1) {
+    work.push(runBatchSingles(singles, providerSettings, signal));
+  }
+  await Promise.all(work);
+}
+
+/** Translate ONE already-prepped member solo and settle it (multi-tile divert + split-retry). */
+async function translateSoloAndSettle(
+  job: BatchJob<BatchMemberPayload, PageTranslation>,
+  prepared: PreparedImage,
+  providerSettings: ProviderSettings,
+  signal: AbortSignal,
+): Promise<void> {
+  try {
+    const { page, providerCalls } = await translateTiles(
+      prepared,
+      job.payload.blob,
+      job.payload.pageHash,
+      providerSettings,
+      signal,
+    );
+    void recordUsage(usageFromPage(page, providerCalls));
+    job.resolve(page);
+  } catch (err) {
+    job.reject(err);
+  }
+}
+
+/**
+ * Run ONE `translateBatch` over the single-tile members, then snap + settle each,
+ * and record ONE usage event for the whole call (F17). On a failure the pure
+ * {@link classifyBatchFailure} decides: `split` → retry each member solo (never
+ * re-batch); `fail-all` → reject every member with the error.
+ */
+async function runBatchSingles(
+  singles: PreppedSingle[],
+  providerSettings: ProviderSettings,
+  signal: AbortSignal,
+): Promise<void> {
+  const provider = createProvider(providerSettings);
+  const gate = getRateGate();
+  const jobs: TranslateJob[] = singles.map((s) => ({
+    // Stamp the ORIGINAL bytes' hash directly (single-tile → no merge/remap).
+    imageHash: s.job.payload.pageHash,
+    imageBlob: s.prepared.tiles[0]!.blob,
+    targetLang: providerSettings.targetLang,
+    sourceLangHint: providerSettings.sourceLangHint,
+    priority: BATCH_MIN_PRIORITY,
+  }));
+
+  let pages: PageTranslation[];
+  try {
+    pages = await callWithRateGate(gate, signal, () =>
+      provider.translateBatch(jobs, providerSettings, signal),
+    );
+  } catch (err) {
+    if (classifyBatchFailure(err) === "split") {
+      // Split-retry: translate each member SOLO (never re-batch). Each records its
+      // own usage; a member failing solo negative-caches via its runTranslateMiss.
+      await Promise.all(
+        singles.map((s) => translateSoloAndSettle(s.job, s.prepared, providerSettings, signal)),
+      );
+    } else {
+      // fail-all: a split would just repeat the same error N times.
+      for (const s of singles) s.job.reject(err);
+    }
+    return;
+  }
+
+  // Success. Snap each page against its ORIGINAL bytes (single-tile → full-image
+  // space already), then settle. finishBatch stamped each page's imageHash with
+  // the member's pageHash, so cache anchoring is correct.
+  await Promise.all(
+    pages.map(async (page, i) => {
+      const s = singles[i]!;
+      try {
+        s.job.resolve(await snapPageRegions(s.job.payload.blob, page));
+      } catch (err) {
+        s.job.reject(err);
+      }
+    }),
+  );
+  // ONE usage event for the batch call: exact aggregate (the per-page split sums
+  // to the provider total — no double count, no loss), images = member count.
+  void recordUsage({
+    provider: providerSettings.provider,
+    model: resolveEffectiveModel(providerSettings),
+    tokensIn: sumTokens(pages, "tokensIn"),
+    tokensOut: sumTokens(pages, "tokensOut"),
+    images: pages.length,
+  });
+}
+
+/** Sum a token field across batch pages (undefined → 0) for the one batch usage event. */
+function sumTokens(
+  pages: readonly PageTranslation[],
+  field: "tokensIn" | "tokensOut",
+): number {
+  return pages.reduce((sum, p) => sum + (p[field] ?? 0), 0);
 }
 
 /**
@@ -399,6 +798,7 @@ export async function translateImage(
   providedBlob?: Blob,
   onStarted?: () => void,
   cacheOnly = false,
+  requestId?: string,
 ): Promise<PageTranslation> {
   // A blob-sourced page (MangaDex etc.) ships its bytes content-side because the
   // background can't fetch a document-scoped blob URL (§7.3); otherwise fetch
@@ -450,6 +850,11 @@ export async function translateImage(
     throw new NotCachedError();
   }
 
+  // §2 re-prioritization: map this request's id → its cacheKey so a later
+  // `reprioritizeTranslation` can find the queued job / batch member. Cleaned in
+  // the finally. (Coalesced callers all register their own id → the same key.)
+  if (requestId) requestIdToCacheKey.set(requestId, cacheKey);
+
   // Coalesce concurrent misses for the same key onto one provider run (item 7)
   // and refcount the callers' abort signals (Phase 5 item 4): the run owns one
   // SharedAbort; each caller registers its own `signal`; the underlying provider
@@ -480,6 +885,20 @@ export async function translateImage(
     ),
   );
 
+  // §5: apply any upgrade that raced ahead of this miss's registration. The job is
+  // now enqueued — a solo handle is registered under `cacheKey`, or the batch
+  // member is buffered/flushed — so the buffered priority can finally land. This
+  // runs in the SAME synchronous turn as the `requestIdToCacheKey.set` above (no
+  // await between), so a reprioritize arriving LATER instead finds the mapping and
+  // applies directly; neither path drops the upgrade. Drain once, then delete.
+  if (requestId) {
+    const pending = pendingReprioritize.get(requestId);
+    if (pending !== undefined) {
+      pendingReprioritize.delete(requestId);
+      applyReprioritize(cacheKey, pending);
+    }
+  }
+
   if (leader) {
     // The leader owns the SharedAbort lifecycle. `coalesce` clears the inflight
     // entry in its own `.finally` first (it is upstream in the chain), so by the
@@ -507,6 +926,11 @@ export async function translateImage(
     // Detach this caller's abort listener (does not count as leaving — a settled
     // run must not trip the refcount).
     stopWaiting();
+    if (requestId) {
+      requestIdToCacheKey.delete(requestId);
+      // Drop any still-buffered upgrade for this settled id (§5) so it can't leak.
+      pendingReprioritize.delete(requestId);
+    }
   }
 }
 
@@ -527,20 +951,48 @@ async function runTranslateMiss(
   origin?: string,
   onStarted?: () => void,
 ): Promise<PageTranslation> {
-  const queue = getTranslationQueue(settings.concurrency);
-  let result: { page: PageTranslation; providerCalls: number };
+  let page: PageTranslation;
   try {
-    result = await queue.add(
-      (qSignal) => {
-        // First statement in the task closure: the PriorityQueue invokes this
-        // exactly when the job leaves the wait list — the precise "started"
-        // boundary the pause feature keys on (Phase 7.4).
-        onStarted?.();
-        return translatePrepared(blob, pageHash, settings, providerSettings, qSignal);
-      },
-      priority,
-      signal,
-    );
+    if (batchEligible(priority, settings.pagesPerRequest)) {
+      // Batch path (F12): group with other eligible priority-2 misses. The group
+      // task (executeBatchGroup) fires onStarted, makes ONE provider request via
+      // translateBatch, records ONE usage event for the whole call, snaps, and
+      // settles each member. We only CACHE the member's own page here (per its own
+      // cacheKey) — a batch result caches under the SAME key as the single result.
+      page = await getBatchCollector().submit(
+        batchSignature(providerSettings, {
+          maxEdgePx: settings.maxImageEdgePx,
+          jpegQuality: settings.jpegQuality,
+        }),
+        clampBatchSize(settings.pagesPerRequest),
+        { cacheKey, pageHash, blob, settings, providerSettings, signal, onStarted },
+      );
+    } else {
+      const queue = getTranslationQueue(settings.concurrency);
+      const handle = queue.addJob(
+        (qSignal) => {
+          // First statement in the task closure: the PriorityQueue invokes this
+          // exactly when the job leaves the wait list — the precise "started"
+          // boundary the pause feature keys on (Phase 7.4).
+          onStarted?.();
+          return translatePrepared(blob, pageHash, settings, providerSettings, qSignal);
+        },
+        priority,
+        signal,
+      );
+      // Register the handle so reprioritizeTranslation can lift this queued job (§2).
+      queuedHandles.set(cacheKey, handle);
+      let result: { page: PageTranslation; providerCalls: number };
+      try {
+        result = await handle.promise;
+      } finally {
+        if (queuedHandles.get(cacheKey) === handle) queuedHandles.delete(cacheKey);
+      }
+      page = result.page;
+      // Solo path records its own usage (the batch path records once per batch
+      // call). providerCalls (tile count) → accurate `images` for strips (item 2).
+      void recordUsage(usageFromPage(result.page, result.providerCalls));
+    }
   } catch (err) {
     // Only cache failures that will recur on immediate retry (malformed/refusal);
     // transient faults stay retryable. Fire-and-forget — never block the caller.
@@ -554,10 +1006,8 @@ async function runTranslateMiss(
   // clears on settle, so a request arriving in the ms-wide window between this
   // run settling and the IndexedDB commit landing re-pays one provider call.
   // Acceptable — the window is tiny and the worst case is a single duplicate.
-  void cacheStorePage(cacheKey, result.page, cacheCapBytes(settings), origin);
-  // providerCalls (tile count) → accurate `images` accounting for strips (item 2).
-  void recordUsage(usageFromPage(result.page, result.providerCalls));
-  return result.page;
+  void cacheStorePage(cacheKey, page, cacheCapBytes(settings), origin);
+  return page;
 }
 
 /** Best-effort hostname of the tab that sent a translate request (per-site cache). */
@@ -649,6 +1099,8 @@ export function createTranslateHandlers(): MessageHandlers {
           // for it — pause correctly treats a probe as not-started.
           req.requestId ? () => startedRequests.add(req.requestId!) : undefined,
           req.cacheOnly ?? false,
+          // §2: register requestId → cacheKey so reprioritizeTranslation can lift it.
+          req.requestId,
         );
         return { ok: true, page };
       } catch (err) {
@@ -690,6 +1142,25 @@ export function createTranslateHandlers(): MessageHandlers {
         controller.abort(new DOMException("Translation cancelled", "AbortError"));
         requestControllers.delete(req.requestId);
       }
+    },
+
+    reprioritizeTranslation: (req) => {
+      // §2: a prefetched/translate-all page (priority 2) scrolled into view — lift
+      // it so it renders before the sequential backlog reaches it. Fire-and-forget.
+      const cacheKey = requestIdToCacheKey.get(req.requestId);
+      if (cacheKey) {
+        // Mapping registered → apply now: (a) pull a still-buffered batch member out
+        // and run it SOLO at the new priority, or (b) setPriority a queued job /
+        // flushed batch. Running/settled → no handle → no-op.
+        applyReprioritize(cacheKey, req.priority);
+        return;
+      }
+      // §5: the mapping isn't registered yet (the miss is still fetching/hashing a
+      // prefetched page). Buffer the upgrade so the miss applies it the instant it
+      // registers — otherwise it is silently lost and the page stalls at priority 2
+      // (the §2 symptom in a timing window). Bounded; an id that never registers
+      // ages out. An unknown/settled id likewise just buffers harmlessly and ages.
+      bufferPendingReprioritize(req.requestId, req.priority);
     },
 
     countCachedForSite: async (_req, sender) => {

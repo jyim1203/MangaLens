@@ -1,6 +1,9 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
+  BatchLengthError,
   ProviderBase,
+  type BatchBuildContext,
   type BuildContext,
   type ProviderBaseOptions,
   type ProviderOutput,
@@ -8,6 +11,13 @@ import {
 } from "../../src/background/providers/ProviderBase";
 import { REGION_SUFFIX } from "../../src/background/providers/prompt";
 import type { ProviderSettings, TranslateJob } from "../../src/shared/types";
+
+/** Load a golden JSON fixture. */
+function goldenJson(name: string): unknown {
+  return JSON.parse(
+    readFileSync(new URL(`../fixtures/golden/${name}`, import.meta.url), "utf8"),
+  );
+}
 
 /**
  * A concrete provider for testing the shared engine. Its `extractOutput` simply
@@ -21,6 +31,9 @@ class TestProvider extends ProviderBase {
   readonly modes: string[] = [];
   readonly temperatures: (number | undefined)[] = [];
 
+  /** Batch requests built, recorded for the batch tests (image count + user text). */
+  readonly batchImageCounts: number[] = [];
+
   protected buildRequest(ctx: BuildContext): ProviderRequest {
     this.userTexts.push(ctx.userText);
     this.modes.push(ctx.mode);
@@ -29,6 +42,18 @@ class TestProvider extends ProviderBase {
       url: "https://test.example/api",
       headers: { Authorization: `Bearer ${ctx.settings.apiKey}` },
       body: { model: ctx.model },
+    };
+  }
+
+  protected buildBatchRequest(ctx: BatchBuildContext): ProviderRequest {
+    this.userTexts.push(ctx.userText);
+    this.modes.push(ctx.mode);
+    this.temperatures.push(ctx.temperature);
+    this.batchImageCounts.push(ctx.images.length);
+    return {
+      url: "https://test.example/api",
+      headers: { Authorization: `Bearer ${ctx.settings.apiKey}` },
+      body: { model: ctx.model, images: ctx.images.length },
     };
   }
 
@@ -371,5 +396,116 @@ describe("ProviderBase — malformed repair retry", () => {
       provider.translatePage(makeJob(), makeSettings(), new AbortController().signal),
     ).rejects.toMatchObject({ kind: "malformed" });
     expect(fetchMock).toHaveBeenCalledTimes(2); // one primary + one repair
+  });
+});
+
+describe("ProviderBase — translateBatch (F12, §4.2)", () => {
+  /** N single-tile jobs with distinct imageHashes (h0..h{n-1}). */
+  function makeBatchJobs(n: number): TranslateJob[] {
+    return Array.from({ length: n }, (_, i) =>
+      makeJob({ imageHash: `h${i}` }),
+    );
+  }
+
+  /** A ProviderOutput wrapping a batch body (TestProvider returns it verbatim). */
+  function batchOutput(pagesBody: unknown, usage?: { tokensIn: number; tokensOut: number }): ProviderOutput {
+    return { kind: "json", value: pagesBody, usage } as ProviderOutput;
+  }
+
+  it("parses a 3-page batch → 3 sanitized PageTranslations in order (golden)", async () => {
+    const body = goldenJson("batch_3_pages.json");
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(batchOutput(body)));
+    const { provider } = makeProvider(fetchMock);
+
+    const pages = await provider.translateBatch(
+      makeBatchJobs(3),
+      makeSettings(),
+      new AbortController().signal,
+    );
+
+    expect(pages).toHaveLength(3);
+    // Order preserved + stamped with each job's own imageHash.
+    expect(pages.map((p) => p.imageHash)).toEqual(["h0", "h1", "h2"]);
+    expect(pages[0]!.regions.map((r) => r.translated)).toEqual(["Morning", "Let's go"]);
+    expect(pages[1]!.regions).toHaveLength(3);
+    expect(pages[2]!.regions[0]!.translated).toBe("We did it!");
+    expect(pages.every((p) => p.sourceLang === "ja")).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // ONE HTTP request for all 3
+  });
+
+  it("sends N image blocks + the batch user text in ONE request", async () => {
+    const body = goldenJson("batch_3_pages.json");
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(batchOutput(body)));
+    const { provider } = makeProvider(fetchMock);
+
+    await provider.translateBatch(makeBatchJobs(3), makeSettings(), new AbortController().signal);
+
+    expect(provider.batchImageCounts).toEqual([3]);
+    expect(provider.userTexts[0]).toContain("Translate these 3 pages");
+  });
+
+  it("throws BatchLengthError when pages.length !== n (no repair retry)", async () => {
+    const body = goldenJson("batch_wrong_length.json"); // 2 pages
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(batchOutput(body)));
+    const { provider } = makeProvider(fetchMock);
+
+    await expect(
+      provider.translateBatch(makeBatchJobs(3), makeSettings(), new AbortController().signal),
+    ).rejects.toBeInstanceOf(BatchLengthError);
+    // Wrong length is NOT malformed → no whole-batch repair retry.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("splits the aggregate usage evenly across members, summing EXACTLY to the total", async () => {
+    const body = goldenJson("batch_3_pages.json");
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse(batchOutput(body, { tokensIn: 100, tokensOut: 10 })));
+    const { provider } = makeProvider(fetchMock);
+
+    const pages = await provider.translateBatch(
+      makeBatchJobs(3),
+      makeSettings(),
+      new AbortController().signal,
+    );
+
+    // Remainder on the first → [34,33,33] sums to 100 exactly (no loss/double count).
+    expect(pages.map((p) => p.tokensIn)).toEqual([34, 33, 33]);
+    expect(pages.reduce((s, p) => s + (p.tokensIn ?? 0), 0)).toBe(100);
+    expect(pages.map((p) => p.tokensOut)).toEqual([4, 3, 3]);
+  });
+
+  it("runs ONE whole-batch repair retry on malformed JSON, then propagates", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ kind: "text", value: "not json at all" }));
+    const { provider } = makeProvider(fetchMock);
+
+    await expect(
+      provider.translateBatch(makeBatchJobs(2), makeSettings(), new AbortController().signal),
+    ).rejects.toMatchObject({ kind: "malformed" });
+    expect(fetchMock).toHaveBeenCalledTimes(2); // primary + one repair
+    expect(provider.userTexts[1]).toContain("not valid JSON");
+  });
+
+  it("surfaces a batch refusal as a refusal ProviderError (caller splits)", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ kind: "refusal", message: "declined" }));
+    const { provider } = makeProvider(fetchMock);
+
+    await expect(
+      provider.translateBatch(makeBatchJobs(2), makeSettings(), new AbortController().signal),
+    ).rejects.toMatchObject({ kind: "refusal" });
+  });
+
+  it("fails with auth (no split) when the key is missing, and returns [] for zero jobs", async () => {
+    const fetchMock = vi.fn();
+    const { provider } = makeProvider(fetchMock);
+    await expect(
+      provider.translateBatch(makeBatchJobs(2), makeSettings({ apiKey: "" }), new AbortController().signal),
+    ).rejects.toMatchObject({ kind: "auth" });
+    expect(await provider.translateBatch([], makeSettings(), new AbortController().signal)).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

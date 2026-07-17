@@ -1,0 +1,50 @@
+<!doctype html>
+<!--
+  10-page fixture chapter for the e2e smoke suite (Phase 8 §5). Served by
+  mockProvider.mjs over HTTP at /chapter-file.html (or /chapter.html, which the
+  server generates dynamically). Page images are SEPARATE http URLs (/pages/N.png),
+  NOT data URIs, so the perf scenario exercises the real §7.3 path (optional host
+  permission → background fetch). Pages are raster PNGs — Firefox's
+  createImageBitmap rejects SVG blobs (Phase 8.1 §1). Page 3's src is swapped to a
+  blob: URL in-page so the Phase 7.2 bytes path rides along.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Mock chapter</title>
+    <style>
+      body { margin: 0; background: #111; }
+      img.page { display: block; margin: 0 auto 8px; max-width: 100%; }
+    </style>
+  </head>
+  <body>
+    <main id="reader">
+      <img class="page" src="/pages/1.png" alt="page 1" width="800" height="1200" />
+      <img class="page" src="/pages/2.png" alt="page 2" width="800" height="1200" />
+      <img class="page" data-blobsrc="/pages/3.png" alt="page 3" width="800" height="1200" />
+      <img class="page" src="/pages/4.png" alt="page 4" width="800" height="1200" />
+      <img class="page" src="/pages/5.png" alt="page 5" width="800" height="1200" />
+      <img class="page" src="/pages/6.png" alt="page 6" width="800" height="1200" />
+      <img class="page" src="/pages/7.png" alt="page 7" width="800" height="1200" />
+      <img class="page" src="/pages/8.png" alt="page 8" width="800" height="1200" />
+      <img class="page" src="/pages/9.png" alt="page 9" width="800" height="1200" />
+      <img class="page" src="/pages/10.png" alt="page 10" width="800" height="1200" />
+    </main>
+    <script>
+      // Page 3 → blob: URL (Phase 7.2 content-shipped bytes path). The URL is
+      // REVOKED as soon as the image paints — mirroring real readers (MangaDex),
+      // whose object URLs are dead by the time translate-all or drag-select
+      // reaches them. This pins the revoked-blob fallback: the extension must
+      // read the bytes back out of the live <img> element (imageSource.ts).
+      for (const img of document.querySelectorAll("img[data-blobsrc]")) {
+        fetch(img.dataset.blobsrc)
+          .then((r) => r.blob())
+          .then((b) => {
+            const url = URL.createObjectURL(b);
+            img.addEventListener("load", () => URL.revokeObjectURL(url), { once: true });
+            img.src = url;
+          });
+      }
+    </script>
+  </body>
+</html>

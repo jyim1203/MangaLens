@@ -1,4 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import { fakeBrowser } from "@webext-core/fake-browser";
+
+// keyTest → factory → openai → endpointModes (§4) → webextension-polyfill.
+vi.mock("webextension-polyfill", () => ({ default: fakeBrowser }));
+
 import {
   buildKeyTestRequest,
   classifyKeyTestResponse,

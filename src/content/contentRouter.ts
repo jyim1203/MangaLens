@@ -17,9 +17,9 @@ import type { OverlayManager } from "./overlay/OverlayManager";
 
 /** Live-subsystem accessors; each returns `undefined` while the gate is inert. */
 export interface ContentRouterDeps {
-  /** The viewport queue (F8 translate-all + Phase 7.4 pause), or undefined while inert. */
+  /** The viewport queue (F8 translate-all + Phase 7.4 pause + Phase 8 §0 hydrate), or undefined while inert. */
   getQueue: () =>
-    | Pick<ViewportQueue, "requestAll" | "setPaused" | "isPaused">
+    | Pick<ViewportQueue, "requestAll" | "setPaused" | "isPaused" | "hydrateAll">
     | undefined;
   /** The drag-select controller (F10), or undefined while inert. */
   getRegionSelector: () => Pick<RegionSelector, "start"> | undefined;
@@ -65,6 +65,12 @@ export function buildContentRouterHandlers(deps: ContentRouterDeps): MessageHand
     },
     getTranslationsPaused: () => ({
       paused: deps.getQueue()?.isPaused() ?? false,
+    }),
+    // On-demand "Show cached translations" (Phase 8 §0). Inert tab → { count: 0 }
+    // without touching a queue, same inert-safety as translateAll — a passive
+    // listener that spends nothing.
+    hydrateCached: () => ({
+      count: deps.getQueue()?.hydrateAll() ?? 0,
     }),
   };
 }

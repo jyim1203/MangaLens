@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
   REGION_SUFFIX,
+  buildBatchUserText,
   buildPromptContext,
   buildSystemPrompt,
   buildUserText,
   languageName,
+  toAnthropicBatchSchema,
   toAnthropicToolSchema,
+  toGeminiBatchSchema,
   toGeminiSchema,
+  toOpenAiBatchSchema,
   toOpenAiStrictSchema,
 } from "../../src/background/providers/prompt";
 import type { ProviderSettings } from "../../src/shared/types";
@@ -128,6 +132,64 @@ describe("prompt — schema dialects", () => {
       const desc = schema.properties?.regions?.items?.properties?.bbox?.description ?? "";
       expect(desc).toContain("[x_min, y_min, x_max, y_max]");
       expect(desc).not.toContain("width, height");
+    }
+  });
+});
+
+describe("prompt — buildBatchUserText (§4.2, F12)", () => {
+  it("uses the verbatim §4.2 text with the page count + pages-array instruction", () => {
+    const text = buildBatchUserText(buildPromptContext(settings()), 3);
+    expect(text).toContain("Translate these 3 pages to English.");
+    expect(text).toContain('top-level "pages" array of length 3');
+    expect(text).toContain("pages[i] corresponds to image i (0-indexed)");
+    expect(text).toContain("Bboxes are relative to that page's own dimensions.");
+  });
+
+  it("includes the source hint when pinned, omits it otherwise (no double space)", () => {
+    const pinned = buildBatchUserText(buildPromptContext(settings({ sourceLangHint: "ja" })), 2);
+    expect(pinned).toContain("The source language is Japanese.");
+    const auto = buildBatchUserText(buildPromptContext(settings()), 2);
+    expect(auto).toContain("Translate these 2 pages to English.\n");
+    expect(auto).not.toContain("English. \n"); // trailing space trimmed
+  });
+
+  it("appends the repair nudge on the retry pass (the one whole-batch retry)", () => {
+    const text = buildBatchUserText(buildPromptContext(settings()), 2, { repair: true });
+    expect(text).toContain("not valid JSON");
+  });
+});
+
+describe("prompt — batch schema dialects (§4.2)", () => {
+  it("wraps each single-page dialect in a required top-level pages array", () => {
+    for (const build of [toGeminiBatchSchema, toOpenAiBatchSchema, toAnthropicBatchSchema]) {
+      const schema = build();
+      expect(schema.required).toContain("pages");
+      expect(schema.properties?.pages?.type).toBe("array");
+      // The items ARE the single-page schema (has source_lang + regions).
+      const item = schema.properties?.pages?.items;
+      expect(item?.properties?.regions).toBeDefined();
+      expect(item?.properties?.source_lang).toBeDefined();
+    }
+  });
+
+  it("Gemini batch strips additionalProperties (wrapper + inner)", () => {
+    expect(JSON.stringify(toGeminiBatchSchema())).not.toContain("additionalProperties");
+  });
+
+  it("OpenAI strict batch keeps additionalProperties:false and the strict inner rules", () => {
+    const schema = toOpenAiBatchSchema();
+    expect(schema.additionalProperties).toBe(false);
+    const region = schema.properties?.pages?.items?.properties?.regions?.items;
+    expect(region?.required).toContain("kind"); // strict inner dialect preserved
+    expect(JSON.stringify(schema)).not.toContain("minItems");
+  });
+
+  it("carries the corner-format bbox description into the batch inner schema", () => {
+    for (const build of [toGeminiBatchSchema, toOpenAiBatchSchema, toAnthropicBatchSchema]) {
+      const desc =
+        build().properties?.pages?.items?.properties?.regions?.items?.properties?.bbox
+          ?.description ?? "";
+      expect(desc).toContain("[x_min, y_min, x_max, y_max]");
     }
   });
 });

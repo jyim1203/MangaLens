@@ -161,6 +161,19 @@ export interface MessageMap {
   cancelTranslation: { request: { requestId: string }; response: void };
 
   /**
+   * Content → background: raise the priority of an in-flight {@link translatePage}
+   * (Phase 8 §2). WHY: a prefetched / translate-all page (priority 2) that scrolls
+   * into view should jump the queue instead of waiting behind the whole chapter.
+   * Fire-and-forget: an unknown/settled/already-more-urgent id is a silent no-op
+   * (same contract as {@link cancelTranslation}). UPGRADE-ONLY — the background
+   * applies `min(current, priority)`, so this can never worsen a job's priority.
+   */
+  reprioritizeTranslation: {
+    request: { requestId: string; priority: number };
+    response: void;
+  };
+
+  /**
    * Cancel every QUEUED-but-not-yet-started {@link translatePage} in a batch, by
    * their `requestId`s (Phase 7.4 pause). The background aborts each id that has
    * a registered controller AND has not started its provider call, and replies
@@ -262,6 +275,22 @@ export interface MessageMap {
    * fetch+hash on every pageload).
    */
   countCachedForSite: { request: void; response: { count: number } };
+
+  /**
+   * Popup → content: on-demand "Show cached translations" (Phase 8 §0). Probes
+   * EVERY currently-registered, not-yet-requested candidate for a cached
+   * translation and renders each hit with ZERO provider spend — the explicit,
+   * works-everywhere complement to the Phase 7.6 automatic hydrate (which only
+   * runs on non-auto sites and only on register). WHY a distinct message and not
+   * a `cacheOnly` flag on {@link translateAll}: keeping the spend-nothing path its
+   * own message means an inert tab or a mis-click can never accidentally start
+   * real provider requests. `count` = how many candidates a probe was scheduled
+   * for (0 while inert / nothing registered), so the popup can show
+   * "Showing N cached…" / "Nothing to show" feedback. Bypasses the per-lifetime
+   * origin gate — the user's click IS the intent signal — so it works whether or
+   * not the queue was constructed with `hydrate: true` (auto sites included).
+   */
+  hydrateCached: { request: void; response: { count: number } };
 }
 
 /** Every valid message `type`. */

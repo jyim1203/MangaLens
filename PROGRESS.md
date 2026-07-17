@@ -1797,3 +1797,413 @@ count-0 short-circuit, no probe traffic; (8) an opted-in auto reader → unregre
 no double renders. If a joined pair still splits WRONG (cut through a bubble,
 wrong lobe): screenshot + note the page and tune `SHARED_BLOB_IOU` /
 `SWALLOW_COVERAGE` before adding mechanism.
+
+## Phase 8 summary (perf hardening + e2e infra + AMO prep — store-submittable)
+
+The last planned phase before store submission: multi-page batching, priority
+re-prioritization, queue/prefetch tuning, endpoint-mode persistence, the "Show
+cached" button, the mock-provider e2e harness with the two Architecture
+acceptance criteria, a memory audit, and AMO listing prep. It adds **no new
+translation capability** — the pipeline has been end-to-end since Phase 5; this
+makes it faster, cheaper, verified, and shippable. Every module keeps the
+pure-core / thin-shell split. **Contract changes (flagged, all as the DoD
+allows):** `shared/messages.ts` gained exactly **two** messages —
+`hydrateCached` (§0) and `reprioritizeTranslation` (§2); the manifest gained
+`data_collection_permissions` (§8); `package.json` gained e2e devDeps + scripts.
+**NO `shared/types.ts` change; `PROMPT_VERSION` stays 2** (single-page bytes
+byte-identical, pinned) and **no `CACHE_VERSION` bump** (batch results cache
+under the SAME key as single results). `factory.ts` `createProvider` now returns
+`ProviderBase` (was `Translator`) — a background-local widening so the batch
+collector can reach `translateBatch`; every `Translator` caller still compiles.
+
+**§0 — "Show cached translations" popup button (DELIBERATE REVERSAL of the 7.6
+call).** The 7.6 handoff declared automatic hydrate "supersedes the button"; the
+user re-requested the explicit button (2026-07-12), so **both now coexist** and
+are complementary: the 7.6 auto path runs only on non-auto sites and only on
+register; the button is the on-demand, works-**everywhere** complement (auto
+sites included) that hydrates ALL registered candidates on a click. Reuses the
+7.6 probe path wholesale — one new message (`hydrateCached: void → {count}`, a
+distinct spend-nothing message so an inert tab/mis-click can never start real
+requests), one new content entry point (`ViewportQueue.hydrateAll()` — iterates
+every unrequested candidate onto the SAME `HYDRATE_CONCURRENCY=3` probe gate,
+**bypassing the per-lifetime origin gate** since the click IS the intent signal),
+one content-router handler (inert → `{count:0}`), and one popup control (gated by
+the pure `canShowCached` = active http/https, auto or not). `probe()` is reused
+verbatim.
+
+**§1 — multi-page batching (F12, the core).** `pagesPerRequest ≥ 2` groups
+priority-2 (prefetch/translate-all) single-tile cache-miss jobs into ONE provider
+request, amortizing the ~600-token system prompt. **Prompt layer (additive):**
+`buildBatchUserText` (§4.2 verbatim) + `toGeminiBatchSchema`/`toOpenAiBatchSchema`/
+`toAnthropicBatchSchema` (wrap each dialect's single-page schema in a required
+top-level `pages` array via `toBatchSchema`, inheriting each dialect's stripping
+rules) — the single-page strings are untouched. **Provider layer:** `ProviderBase`
+gained `translateBatch(jobs, settings, signal): Promise<PageTranslation[]>`
+(background-local, NOT on `Translator`) reusing the existing backoff/downgrade
+HTTP machinery (refactored generic over a `BuildContextBase` + request-builder so
+single and batch share one path; `downgrade` is now generic so it applies to
+both); each adapter gained a `buildBatchRequest` (N image blocks + batch text +
+batch schema). Failure ladder is a pure classifier `classifyBatchFailure`:
+wrong-`pages.length` (`BatchLengthError`, no repair) / post-repair-malformed /
+refusal → **split** (retry each member solo, never re-batch); auth/rate-limit/
+network/abort → **fail-all**. Batch usage tokens split evenly (remainder on the
+first, so the per-member split sums EXACTLY to the provider total — no double
+count, no loss). **Collector (`background/batch.ts`):** pure `batchEligible`
+(priority ≥ 2 AND `pagesPerRequest` ≥ 2), `batchSignature` (provider + resolved
+model + endpoint + targetLang + hint + honorifics + readingDirection + maxEdgePx
++ jpegQuality — members with different signatures never mix), `planFlush`, and a
+thin timer-driven `createBatchCollector` (injected `runGroup` executor, so
+batch.ts stays free of the browser-only prep/provider path). Wiring in
+`runTranslateMiss`: eligible misses `submit()` to the collector instead of
+`queue.add`; a flushed group = ONE priority-2 queue slot = ONE `translateBatch`
+call, records ONE usage event (`images = n`), snaps + caches each member under
+its own key; a member that unexpectedly preps multi-tile is diverted to the
+per-tile path in the same slot; the batch aborts only when EVERY member's signal
+has (SharedAbort refcount). **DELIBERATE DEVIATION (flagged):** Architecture §6
+says "'translate all' defaults to 2–3", but there is one `pagesPerRequest` knob
+and no way to tell an explicit user 1 from the default — we honor the setting
+everywhere and do NOT silently override it for translate-all (batching increases
+blast radius; opt-in beats surprise). The options hint is now the recommendation
+("2–3 recommended for Translate all").
+
+**§2 — priority re-prioritization (closes the Phase 5 "no priority upgrade"
+deferral).** `queue.ts` gained `addJob(...) → { promise, setPriority(p) }` (`add`
+is now a thin wrapper); `setPriority` re-inserts a still-queued entry at a better
+priority (fresh seq, **upgrade-only via `min` — never worsens**) and returns
+false once started/settled. New `reprioritizeTranslation: { requestId, priority }`
+message (fire-and-forget; unknown/settled id is a silent no-op). Background:
+`translateImage` gained a `requestId?` param registering `requestId → cacheKey`
+(cleaned in `finally`); `runTranslateMiss` + `executeBatchGroup` register the
+queue handle under the cacheKey. The handler resolves requestId → cacheKey →
+(a) a member still buffered in the collector: **pulled out and run SOLO** at the
+new priority (don't drag batch-mates); (b) a queued job / flushed batch:
+`setPriority` (lifting a whole batch because one member is visible is accepted).
+Content: `viewportQueue` tracks the sent priority per candidate; `planEnqueues`
+now emits an `upgrade` instruction (instead of skipping) when a requested
+candidate's tier strictly improves, and the shell sends the message. **Scroll-away
+cancel/downgrade — DECIDED AGAINST** (the symmetric visible→gone thrash was why
+Phase 5 skipped scroll-away cancel; prefetched work fills the cache anyway),
+closing the Phase 5 "revisit" thread.
+
+**§3 — queue/prefetch tuning.** Pure `requestAllTimeoutMs(count, concurrency,
+baseMs)` = `min(baseMs + ceil(count/concurrency)·30 s, 15 min)`; `requestAll`
+supplies this backlog-scaled budget per send (visibility sends keep the flat
+120 s) — a 200-page translate-all no longer churns 120 s timeout resets; the
+background finishes + caches, so late pages render as instant cache hits on
+scroll. Mid-session `prefetchAhead` is now live (`ViewportQueue.setPrefetchAhead`,
+applied on every settings apply in `content/index.ts`) — closes the Phase 5
+accepted no-op. `concurrency` was already live per-request via
+`getTranslationQueue`; pinned with a test (same instance, re-tuned each call), not
+rebuilt.
+
+**§4 — endpoint-mode persistence (PROMPTS §5.2, deferred from Phase 6).** The
+OpenAI-compatible `json_schema`→`json_object` downgrade memo now PERSISTS across
+event-page lifetimes via new `background/endpointModes.ts` owning a **separate
+`storage.local` key** (NOT `Settings` — a settings write broadcasts to every tab
+and re-runs the content gate; this is background-internal state with no UI
+surface). Load-once-per-lifetime into the sync in-memory memo (hydrated at
+background startup), write-through on learn (hydrate-before-persist so a fresh
+learn never clobbers a previous lifetime's other endpoints), fail-soft on any
+storage fault (a lost memo re-pays one 400). `openai.ts` reads `getEndpointMode`/
+`learnEndpointMode` and re-exports `resetEndpointModes` so the test seam keeps
+working.
+
+**§5/§6 — e2e infrastructure + acceptance criteria.** `tests/e2e/mockProvider.mjs`
+is a dependency-free Node server: OpenAI-compatible `POST /v1/chat/completions`
+(counts image blocks — 1 → single-page JSON, N → a `pages` array of N, so
+batching is e2e-exercisable; 2 s default latency), `GET /v1/models` (the options
+Test path), `GET /stats` + `POST /reset` (the harness request log), and a static
+host for `chapter.html` + its page images served as SEPARATE http URLs (not data
+URIs, so the perf run exercises the real §7.3 background-fetch path; page 3 is a
+`blob:` URL for the 7.2 bytes path). `tests/e2e/smoke.spec.mjs` (selenium-webdriver
++ geckodriver, node's built-in `node:test`; the UUID is pinned via the
+`extensions.webextensions.uuids` pref BEFORE `installAddon(zip, temporary=true)`)
+carries Scenario A (10-page chapter < 5 s cold + warm cache hits with ZERO new
+provider requests), B (translate-all @ `pagesPerRequest=3` → 4 ceil-batched
+requests = 3+3+3+1, 10 images), and C (100 SPA swaps → overlay-host-count
+stability, the leak proxy — Firefox exposes no `performance.memory`). Assertions
+are on observable behavior only (DOM `OVERLAY_HOST_ATTR` hosts + `.mangalens-bubble`
+paint state; the mock's `/stats`). e2e is **excluded from `npm run check`** (the
+unit vitest config globs `tests/unit` only). **DRIVER: selenium-webdriver +
+geckodriver** (chosen over Playwright, whose Firefox build doesn't reliably
+support extensions — the handoff's stated fallback, and the more robust addon-
+install path). **STATUS: the mock provider is self-verified end-to-end via Node
+(single→3 regions, 3-image batch→3 pages, token scaling, /stats, chapter + SVGs);
+the full browser run (`npm run test:e2e`) was NOT executed in this implementation
+session — no geckodriver installed and no headless display in the coding
+environment. Recorded honestly, exactly as every prior phase's manual/live pass
+was. The `.mjs` (not `.spec.ts`) extension is a deliberate call: it runs under
+`node --test` with zero TS-build step for e2e (documented in `tests/e2e/README.md`).**
+
+**§7 — memory audit (findings; no fixes required).** Existing teardown verified
+sound: `OverlayManager.stop()` cancels both rAF handles, tears down every entry
+(per-image `ResizeObserver.disconnect`, `load` listener removed, host removed,
+entry + its `paintedRects` dropped with the map), and removes all three shared
+window listeners; `content/index.ts` `deactivate()` drops scanner → queue →
+region selector → overlay → toast in order; the `!el.isConnected` guard in
+`ensure()` (Phase 7.1) still covers the render-after-removal race, no sibling
+case remains. NEW Phase 8 background registries all have guaranteed removal on
+success, error, AND abort: `requestIdToCacheKey` (translateImage `finally`),
+`queuedHandles` (solo path `finally`, `executeBatchGroup`/`runPulledMemberSolo`
+`.finally()` delete-if-still-ours), the batch collector groups (flush/remove
+delete the group + cancel its linger timer), and the batch SharedAbort waiters
+(`stops` cleaned in `finally`). The leak criterion itself is Scenario C above
+(DOM-count stability).
+
+**§8 — AMO listing prep (the deferral thread closes).** Added
+`browser_specific_settings.gecko.data_collection_permissions: { required:
+["websiteContent"] }` — the honest declaration (page images → the user's chosen
+provider only; no analytics/telemetry/first-party server); older Firefox ignores
+the key so NO `strict_min_version` bump was needed. **`web-ext lint` now ends
+0 errors / 0 warnings / 0 NOTICES** — the `data_collection_permissions` notice
+every prior phase summary carried is gone. The popup/options static-string i18n
+migration landed: a pure `resolveI18n` core (`shared/i18nDom.ts`, over `t()`) +
+a `data-i18n` walker in each page's `main.ts` (the DOM walk is shell), with
+strings in `public/_locales/en/messages.json` and each element's English text as
+the fallback (a missing key keeps the English wording — never `__MSG_` soup, never
+an empty node). The `pagesPerRequest` options hint is now the batching
+recommendation. `docs/PRIVACY.md` (keys local-only, images → chosen provider
+only, local IndexedDB cache, no first-party server) and `docs/AMO-LISTING.md`
+(name/summary/description + permission-by-permission rationale + screenshots
+checklist) added. `npm run build:ext` (`web-ext build`) produces the submittable
+`mangalens-0.1.0.zip` — verified.
+
+**Design choices flagged (recap):** §0 button as a deliberate reversal of the 7.6
+"auto supersedes the button" call (both coexist); batching opt-in vs Architecture
+§6's "2–3 default"; batch results under the unchanged cache key; upgrade-only
+re-prioritization with scroll-away cancel/downgrade decided-against; endpoint
+modes in a separate storage key; `createProvider` widened to `ProviderBase`;
+selenium+geckodriver over Playwright. **Out of scope (unchanged):** screenshot
+capture fallback, canvas auto-translate, export/import (F16), reading-direction
+bubble ordering (F18), local pipeline (F20), inpainting, `npm run eval:live`,
+signing/submission automation, Chrome port.
+
+**Tests — 627 total green** (was 549; +78). New: `batch.test.ts` (eligibility ×
+signature × planFlush × classifier × collector grouping/linger/remove);
+`endpointModes.test.ts` (learn→persist, rehydrate, no-clobber merge, corrupt-heal,
+storage-reject, hydrate-once); `i18nDom.test.ts` (walker mapping + missing-key
+fallback); `manifest.test.ts` (data-collection shape pin);
+`translateHandlersBatch.test.ts` (collector wiring — members resolve/cache
+individually, usage once, split-retry solo, fail-all, priority-0/1 stay solo,
+pagesPerRequest=1 off; reprioritize pull-out solo / setPriority / no-op /
+cleanup). Extended: `providerBase` (translateBatch golden 3-page parse + order +
+wrong-length + usage split + repair + refusal + auth/empty); `providers`
+(per-adapter batch request shape); `prompt` (batch user text + batch schema
+dialects + corner-desc carry-through); `queue` (addJob/setPriority reorder,
+min-never-worsens, false-after-start, add-wrapper); `viewportQueue` (planEnqueues
+upgrades, hydrateAll, requestAllTimeoutMs, budget/setPrefetchAhead shell, upgrade
+shell); `contentRouter`/`popupLogic` (hydrateCached / canShowCached);
+`translateHandlers` (getTranslationQueue live concurrency). Two new golden
+fixtures (`batch_3_pages.json`, `batch_wrong_length.json`). Typecheck + eslint
+clean; `vite build` clean (background ~41.3 → ~50.8 kB with batch + endpointModes;
+content ~33.2 → ~34 kB); `web-ext lint` **0 errors / 0 warnings / 0 notices**.
+
+**Manual + live verification — STATUS: NOT executed in this implementation
+session** (no live Firefox + real key + a driver/display in the coding
+environment). Recorded honestly, as every prior phase's was. The handoff's manual
+steps are ready against the built `dist/` (load, grant, real key,
+`pagesPerRequest = 3`): (2) translate-all shows multi-image batched requests, all
+pages render, the cost line moves once with sane totals; (3) scroll far ahead
+during a translate-all → the under-viewport page jumps the queue; (4) change
+`prefetchAhead` mid-session → takes effect without a toggle; (5) break the key
+mid-batch → one auth toast, no unhandled-rejection noise; (6) `about:addons`
+shows the data-collection disclosure, popup/options render localized; (7) the §0
+Show-cached button on an auto reader after toggle-off/on → cached pages re-render
+with ZERO `v1/messages` and no cost movement; a never-translated tab reports "No
+cached translations here". **The still-outstanding Phase 7 manual pass** (and its
+predecessors) remains a human/live step by nature — the e2e mock harness covers
+the pipeline structurally; the live-key round trip is recorded as outstanding, not
+faked.
+
+## Phase 8.1 summary (Phase 8 review verdict: turn the e2e green + close the surfaced bugs)
+
+Phase 8 was statically green (typecheck, ESLint, unit, `web-ext lint` 0/0/0) but
+its e2e suite — run for the first time on the target Windows machine with a real
+headless Firefox — **failed 2 of 3 scenarios**, and the failure analysis surfaced
+one real product bug plus a set of §2/§5 races. Phase 8's DoD line "`npm run
+test:e2e` green" was therefore not met. Phase 8.1 closes it. **`npm run test:e2e`
+now runs all three scenarios GREEN on this machine** (verified repeatedly:
+Scenario A cold+warm, B 4-ceil-batched requests / 10 images, C non-vacuous
+leak-stability); `npm run check` **632 tests** (was 627, +5), `npm run build`
+clean, `npm run lint:ext` still **0/0/0**. No new messages, no manifest change, no
+`shared/types.ts` change, `PROMPT_VERSION` untouched.
+
+**Four e2e root causes fixed (mock/spec-side, no product decode hack).**
+- **§1 [BLOCKER] SVG pages can't be decoded.** `mockProvider.mjs` served pages as
+  **SVG**, and Firefox's `createImageBitmap` REJECTS SVG blobs, so every job died
+  at `prepareImage` before any provider call (Scenario C's prior ✔ was vacuous —
+  zero overlays ever painted). Fix: the mock now serves **hand-rolled raster PNGs**
+  (a ~40-line `node:zlib` encoder — CRC32 table + IHDR/IDAT/IEND chunks over
+  filter-0 scanlines; no image dependency). Each page's bytes differ (per-index
+  background + moving stripe) so page identity (content hash) stays distinct — else
+  all 10 would collapse to one cache entry. Did NOT teach `prepareImage` to decode
+  SVG (manga pages are never SVG; that would be product code for a test's
+  convenience). A standalone self-check (`node tests/e2e/mockProvider.mjs`) asserts
+  the fixtures are valid, distinct PNGs.
+- **§2 [BLOCKER] The grant click hit a button that never appears.** A temporary
+  install auto-grants `<all_urls>`, so the options page correctly keeps `#grant-perm`
+  hidden — the old unconditional click died `ElementNotInteractableError`. Fix
+  (spec-side): ask `browser.permissions.contains({origins:["<all_urls>"]})` and skip
+  the click when already granted; the click path is kept for non-auto-granting
+  install modes and now waits for `elementIsVisible` (the button is revealed async),
+  not mere presence. The options page was correct and untouched.
+- **§3 [BLOCKER] Scenario B destroyed the chapter tab before messaging it.**
+  `driver.get(options)` navigated the SAME tab that held `chapter.html`, so
+  `tabs.query` found no chapter tab and the async script hung to timeout. Fix
+  (spec-side): a shared `translateAllOnChapter()` helper opens the privileged
+  extension page in a SECOND tab (`switchTo().newWindow`), keeps the chapter tab
+  alive, sends `translateAll`, and switches back — with an explicit `done('NO TAB')`
+  fail-fast path so a miss fails with a message instead of hanging.
+- **§4 [PRODUCT BUG] A lone linger-flushed member went out as a batch-of-1.** 10
+  pages at `pagesPerRequest=3` size-flush three groups of 3, then the 10th
+  linger-flushes as a group of **1** — which `runBatchGroupTask` sent through
+  `translateBatch` as a one-image batch-shaped request. Against a provider that
+  returns a single-page body for one image (the mock, and the real single-page
+  contract), that response has no `pages` array → malformed → one whole-batch repair
+  retry → still single-page → split → solo retry: **6 requests / 12 images where 4/10
+  was asserted**, and in production it's strictly worse than solo (the batch envelope
+  amortizes nothing over one page and swaps the proven single-page prompt for the
+  batch one). Fix (product-side, in the collector executor only): when exactly ONE
+  single-tile member remains, route it through the existing `translateSoloAndSettle`
+  (single-page path, records its own usage) instead of `translateBatch`.
+  `translateBatch` itself stays able to take 1 job (unit-tested, harmless); the
+  collector just never sends it one. With this, Scenario B measures a true 3+3+3+1 =
+  **4 requests / 10 images**. 🧪 `translateHandlersBatch.test.ts`: a lone
+  linger-flushed member never calls `translateBatch` (solo path, one usage event);
+  10 @ batch 3 → exactly three `translateBatch(3)` + one solo = 4 provider calls.
+
+**§5 — pre-registration reprioritize race: FIXED (not accepted).** `translateImage`
+registers `requestId → cacheKey` only AFTER the image fetch + hash + cache lookup;
+for a prefetched page that fetch can take seconds, and a `reprioritizeTranslation`
+landing in that window found no mapping → silent no-op. Because the content side had
+already optimistically stamped the better `sentPriority` and IntersectionObserver
+fires on transitions only, the upgrade was never re-sent — the page stalled at
+priority 2 behind the whole backlog, i.e. the exact §2 symptom recurring in a timing
+window. Fix (background-side, smallest): a bounded `pendingReprioritize: Map<requestId,
+priority>` buffers an upgrade that arrives before registration; the miss drains it in
+the SAME synchronous turn it registers the mapping (no await between, so a later
+reprioritize instead finds the mapping and applies directly — neither path drops the
+upgrade), and the `finally` that clears `requestIdToCacheKey` also clears it. The §2
+apply logic (collector pull-out-and-run-solo, else `setPriority`) is now a shared
+`applyReprioritize`. The **content side is untouched**: the sibling blob sub-race
+(`sendUpgrade` returns early while `acquireBytes` is in flight, before `requestId` is
+stamped) is left **accepted** — `sendUpgrade` needs a stamped `requestId` to send at
+all, and a revoked blob heals via a fresh scanner candidate, not a re-send. 🧪 buffer
+before registration → applied on the miss's registration + drained (not leaked); the
+buffer is bounded (oldest evicted past 500).
+
+**§6 — Scenario A acceptance mechanics: translate-all (measured, not guessed).**
+With the decode fixed, Scenario A still timed out — and instrumentation showed only
+**4 of 10 pages were ever requested** even at 30 s budget and `prefetchAhead=10`: in
+a headless ~1366×768 viewport over 800×1200 pages, pages register progressively, so
+page 1's first tier-0 fires before pages 5–10 exist in the ordered list and prefetch
+clamps to the ones present; the below-fold pages then get no visibility event without
+scrolling. So a large `prefetchAhead` alone is insufficient (coverage, not timing).
+Chosen mechanic (the handoff's sanctioned option 3): **assert the acceptance on
+translate-all** — it enqueues all 10 at once → the intended ~two concurrency-6 waves
+at 2 s latency, which paints all 10 well under the 5 s budget (measured cold ≈ 3–4 s,
+warm cache-hit paint < 2 s with ZERO new provider requests). Scenario A stays an auto
+site; the cold and warm passes both trigger `translateAllOnChapter()`. Scenario C now
+asserts a real cycle-1 paint (>0) so its host-count stability is a genuine leak check,
+not vacuously true.
+
+**§7 — smaller findings.**
+- **endpointModes clobber window: FIXED.** `loadEndpointModes` latched on a boolean
+  that flipped synchronously before the startup `storage.get` resolved, so a
+  `learnEndpointMode` racing the hydrate persisted a memo missing the previous
+  lifetime's entries (storage stayed clobbered until the next learn). Now it latches
+  on the hydrate **PROMISE** (`let hydrating: Promise<void> | undefined`), so the
+  write-through awaits the merge and persists the union. 🧪 a learn racing an
+  in-flight (gated) startup hydrate no longer clobbers `{old}` with `{new}`.
+- **`requestAll` timeout budget uses construction-time concurrency: ACCEPTED.** A
+  mid-session concurrency change doesn't update the estimate, but it is only a
+  timeout heuristic (the background finishes + caches regardless), so wiring a live
+  setter would add surface for no correctness gain — recorded as accepted.
+- **i18n scope — Phase 8's summary OVERSTATED it (correction).** The accurate scope:
+  the **popup** HTML is fully `data-i18n`-covered (15 keys) and its title/hint
+  strings are localized; the **options** page has only two `data-i18n` attributes
+  (title + the `pagesPerRequest` hint), and the popup's TS-built feedback strings
+  (Show-cached tooltips, action-status text) remain English literals rather than
+  `t()` keys. This is harmless while `en` is the only locale — the fallback is the
+  literal English wording, never `__MSG_` soup or an empty node — so the remaining
+  options/TS sweep is deliberately deferred rather than done in this fixes phase.
+
+**Unchanged / out of scope (recap):** everything Phase 8 already excluded
+(screenshot fallback, F16/F18/F20, inpainting, `eval:live`, signing, Chrome port);
+the selenium+geckodriver driver (proven working on this machine — kept); and the
+live-key manual pass, which remains a human step (the e2e mock harness covers the
+pipeline structurally). **Tests — 632 green** (+5: the §4 batch-of-1 pair, the §5
+buffer + cap pair, the §7 latch regression). Typecheck + ESLint clean; `vite build`
+clean; `web-ext lint` 0/0/0; `npm run test:e2e` **3/3 green on this machine**.
+
+## Phase 8.2 summary (live-pass findings: recurring temperature-400 + batch output cap)
+
+The first live-key pass over the Phase 8 build (Anthropic `claude-sonnet-5`,
+2026-07-16) surfaced one recurring waste, one real batch defect, and two
+symptoms that turned out to be working-as-designed; the two code issues are
+fixed, everything stays green.
+
+**§1 — the recurring `v1/messages` 400 (fixed).** The captured HAR showed every
+fresh session opening with `POST /v1/messages → 400 "temperature is deprecated
+for this model"` before the Phase 3.1 learn-on-400 strip retried successfully.
+Root cause: the sampling-rejection memo was a module-level `Set`, so the
+event page unloading (~30 s idle) forgot it and re-paid the 400 on every wake —
+and at concurrency 6 a fresh page can fire several temperature-carrying requests
+in parallel before the first 400 lands. Fix: `endpointModes.ts` was generalized
+into a `createPersistedMemo` factory (the §4 hydrate-latch + merge semantics,
+now shared) with TWO instances — the existing per-endpoint OpenAI mode memo
+(public API unchanged) and a new persisted `mangalens:sampling-reject` memo
+that `anthropic.ts` reads/learns and `background/index.ts` hydrates at startup.
+One 400 per model EVER, not per lifetime. 🧪 sampling memo: sync learn +
+own-key persist, fresh-lifetime rehydrate, corrupt-value skip; providers: a
+rejection persisted by a previous lifetime → ONE request, temperature omitted.
+
+**§2 — batch `max_tokens` never scaled (fixed).** Phase 8's
+`buildBatchRequest` (Anthropic) kept the single-page `max_tokens: 8192` for up
+to 4 pages, so a dense batch truncates mid-tool-input → reads as malformed →
+burns the ONE whole-batch repair on a re-generation that truncates again →
+splits to solos: ~3× the latency (and token spend) before anything renders —
+a plausible contributor to the observed "30+ s and nothing paints" with
+`pagesPerRequest ≥ 2`. Fix: `max_tokens = min(8192 × pages, 32000)` (32000 =
+the lowest max-output limit among active Claude models, legacy Opus 4.1).
+Gemini's batch cap is deliberately NOT scaled — the default `gemini-2.0-flash`
+hard-caps output at 8192 and Gemini 400s an over-limit `maxOutputTokens`, so
+scaling would break batching on the shipped default; WHY-noted in-source.
+🧪 batch body: `max_tokens` 2×8192 at n=2, capped 32000 at n=4.
+
+**§3 — revoked object URLs killed every blob-sourced page (fixed).** The second
+live pass (same evening) hit it head-on: on a MangaDex chapter, translate-all
+INSTANTLY error-badged every panel and drag-select was dead, with ZERO
+background network traffic — while a plain-https image on the same site
+translated fine. Root cause: real readers call `URL.revokeObjectURL` as soon
+as the `<img>` paints, so the Phase 7.2 bytes path (`fetch(blobUrl)`
+content-side) throws for anything not acquired within ms of page load; the
+badge was `sendTranslate`'s instant fail-soft on acquisition. The Phase 8 e2e
+blob page never revoked its URL, which is why the harness stayed green. Fix
+(`imageSource.ts`): `acquireBlobBytes(url, el?)` — on a failed fetch, read the
+still-displayed decoded bitmap back out of the live `<img>`
+(`createImageBitmap(el)` → `OffscreenCanvas` → PNG; PNG not JPEG so the
+pipeline keeps a single lossy generation — prep's JPEG re-encode). The
+`acquireBytes` seam now carries the candidate element (send + hydrate-probe
+call sites in `viewportQueue.ts`, `defaultAcquireSource` in `regionSelect.ts` —
+drag-select heals via the same two lines). Fallback bytes hash under their own
+cache key (re-encode ≠ original file bytes) — accepted, deterministic per
+browser, and a revoked URL never heals so a page consistently takes one path.
+The e2e chapter's blob page now REVOKES its URL on load, turning Scenarios A/B
+into the regression test (they assert all 10 pages paint, so a broken fallback
+fails the suite). 🧪 imageSource: fallback on revoked fetch (bitmap read,
+released), original error rethrown for non-`<img>` hosts, element untouched on
+a healthy fetch; viewportQueue assertions extended to the 2-arg seam.
+
+**Diagnosed, not bugs:** (a) a page whose only detected region is SFX renders
+an empty overlay under the default `translateSfx: false` (the live test image
+was artwork with one ㋡ mark — regionFilter dropped it correctly); (b) long
+quiet stalls under skeletons are the Phase 7.2 rate gate pacing out 429s from
+a tier-1 key (8 s → 16 s → 32 s global cooldown) — lower `concurrency` (or keep
+`pagesPerRequest` at 1–2) on low-tier keys; the gate currently has no UI
+surface, noted as a possible later refinement (a "rate-limited, waiting" toast).
+
+**Tests — 640 green** (+8: 3 sampling-memo, 1 previous-lifetime provider, 1
+batch max_tokens pair, 3 revoked-blob fallback). Typecheck + ESLint clean;
+`vite build` clean; `web-ext lint` 0/0/0; `npm run test:e2e` 3/3 green on this
+machine — now including the revoked-blob regression.

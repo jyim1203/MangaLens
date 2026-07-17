@@ -12,6 +12,8 @@
 import browser from "webextension-polyfill";
 import { getCostStats, COST_KEY } from "../background/costTracker";
 import { DEFAULT_MODELS, PROVIDER_LABELS } from "../shared/constants";
+import { t } from "../shared/i18n";
+import { resolveI18n } from "../shared/i18nDom";
 import { languageOptions } from "../shared/languages";
 import { createLogger } from "../shared/log";
 import { sendToBackground, sendToTab } from "../shared/messages";
@@ -23,6 +25,7 @@ import {
 } from "../shared/settings";
 import { PROVIDER_IDS } from "../shared/types";
 import {
+  canShowCached,
   costSummary,
   hostnameFromUrl,
   needsApiKey,
@@ -59,6 +62,7 @@ const els = {
   model: must<HTMLInputElement>("model"),
   translateAll: must<HTMLButtonElement>("translate-all"),
   pauseQueue: must<HTMLButtonElement>("pause-queue"),
+  showCached: must<HTMLButtonElement>("show-cached"),
   selectRegion: must<HTMLButtonElement>("select-region"),
   actionStatus: must<HTMLParagraphElement>("action-status"),
   cost: must<HTMLSpanElement>("cost"),
@@ -98,9 +102,24 @@ function fillSelect(
   }
 }
 
+/**
+ * Localize every `data-i18n` element (Phase 8 §8 i18n walker). The DOM walk is
+ * the shell; {@link resolveI18n} makes the key→text decision, keeping each
+ * element's English text as the fallback so a missing key never blanks a node.
+ */
+function applyI18n(): void {
+  const els = [...document.querySelectorAll<HTMLElement>("[data-i18n]")];
+  const texts = resolveI18n(
+    els.map((el) => ({ key: el.dataset.i18n ?? "", fallback: el.textContent ?? "" })),
+  );
+  els.forEach((el, i) => {
+    el.textContent = texts[i]!;
+  });
+}
+
 function resetTranslateAllButton(): void {
   pendingConfirmCount = undefined;
-  els.translateAll.textContent = "Translate all pages";
+  els.translateAll.textContent = t("popupTranslateAll", undefined, "Translate all pages");
 }
 
 function render(settings: Settings): void {
@@ -148,6 +167,12 @@ function render(settings: Settings): void {
   // Pause toggle (Phase 7.4): hidden unless the page is active; label reflects state.
   els.pauseQueue.hidden = controls.pauseHidden;
   els.pauseQueue.textContent = controls.pauseLabel;
+
+  // Show-cached (Phase 8 §0): available on any active http(s) page (auto or not).
+  els.showCached.disabled = !canShowCached(settings, tabHost);
+  els.showCached.title = active
+    ? "Re-show translations already in the cache (no provider calls)"
+    : "Enable MangaLens on this page first";
 
   els.selectRegion.disabled = !regionSelectEnabled(settings, tabHost);
   els.selectRegion.title = active
@@ -241,6 +266,29 @@ async function onSelectRegionClick(): Promise<void> {
 }
 
 /**
+ * Re-show cached translations on the active tab (Phase 8 §0). Sends the
+ * spend-nothing `hydrateCached` message (popup → content, same channel as
+ * translate-all) and reports transient feedback from the count. WHY treat a
+ * channel error as `{ count: 0 }` and log at debug: an inert/unreachable tab
+ * rejecting with "Could not establish connection" is expected, not a failure —
+ * the same pattern as translateAll's dry-run and the pause queries (Phase 7.5).
+ */
+async function onShowCachedClick(): Promise<void> {
+  if (tabId === undefined) return;
+  els.actionStatus.textContent = "";
+  try {
+    const { count } = await sendToTab(tabId, "hydrateCached");
+    els.actionStatus.textContent =
+      count > 0
+        ? `Showing ${count} cached page${count === 1 ? "" : "s"}…`
+        : "No cached translations here.";
+  } catch (err) {
+    log.debug("hydrateCached unavailable (inert tab)", err);
+    els.actionStatus.textContent = "No cached translations here.";
+  }
+}
+
+/**
  * Toggle the tab's translate queue between paused and running (Phase 7.4).
  * Pausing lets started pages finish and aborts the rest; resuming re-plans
  * still-visible pages on auto sites. Reflects the resulting state in the button
@@ -310,6 +358,8 @@ function wireEvents(): void {
 
   els.pauseQueue.addEventListener("click", () => void onPauseClick());
 
+  els.showCached.addEventListener("click", () => void onShowCachedClick());
+
   els.selectRegion.addEventListener("click", () => void onSelectRegionClick());
 
   els.grantPerm.addEventListener("click", () => {
@@ -359,6 +409,7 @@ async function main(): Promise<void> {
   tabId = tab?.id;
   tabHost = hostnameFromUrl(tab?.url);
 
+  applyI18n(); // localize static strings before the first render (§8)
   wireEvents();
   render(settings);
   await Promise.all([renderPermissionBanner(), renderCost(), reflectPauseState()]);

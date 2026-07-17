@@ -79,6 +79,9 @@ function activate(settings: Settings): void {
   viewportQueue = createViewportQueue({
     overlay,
     prefetchAhead: settings.prefetchAhead,
+    // §3: for the translate-all timeout budget estimate (background enforces the
+    // real cap live via getTranslationQueue).
+    concurrency: settings.concurrency,
     autoEnqueue: getAutoTranslate(settings, hostname),
     // Cache-only hydrate on NON-auto sites (Phase 7.6): an auto site self-hydrates
     // via visibility, so this is the complement — previously-translated pages
@@ -141,6 +144,11 @@ function applySettings(settings: Settings): void {
     case "no-op":
       break;
   }
+  // §3: apply a mid-session prefetchAhead change live on EVERY settings apply
+  // (cheapest correct wiring — a prefetchAhead change classifies as `no-op`, so
+  // without this it would only take effect on the next activate). Harmless when
+  // the queue was just (re)built with the new value, a no-op when inert.
+  viewportQueue?.setPrefetchAhead(settings.prefetchAhead);
   gateState = {
     active: activeAfter(action, gateState.active),
     settings,

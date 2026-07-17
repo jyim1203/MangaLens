@@ -72,13 +72,57 @@ export interface AcquiredBytes {
 
 /**
  * Read a `blob:` object URL's bytes (the content script's own origin CAN fetch a
- * page-created blob URL, unlike the background). Throws on a revoked/unreadable
- * URL — the caller fails soft.
+ * page-created blob URL, unlike the background).
+ *
+ * WHY the element fallback: real readers (MangaDex among them) call
+ * `URL.revokeObjectURL` as soon as the `<img>` paints, so by the time a
+ * translate-all click or a drag-select reaches this URL the fetch throws —
+ * every blob page insta-failed with a ⚠ badge (2026-07-16 live pass). The
+ * PIXELS are still on screen, though: the decoded bitmap lives in the element,
+ * so on a failed fetch we draw it back out of `el` instead. Throws only when
+ * both paths fail (no element / never-decoded image) — the caller fails soft.
+ *
+ * @param el the candidate's element, used as the revoked-URL fallback source.
  */
-export async function acquireBlobBytes(url: string): Promise<AcquiredBytes> {
-  const response = await fetch(url);
-  const blob = await response.blob();
-  return { imageBytes: await blob.arrayBuffer(), imageMime: blob.type || "image/jpeg" };
+export async function acquireBlobBytes(url: string, el?: Element): Promise<AcquiredBytes> {
+  try {
+    const response = await fetch(url);
+    const blob = await response.blob();
+    return { imageBytes: await blob.arrayBuffer(), imageMime: blob.type || "image/jpeg" };
+  } catch (err) {
+    // typeof guard: content-script only in production, but keeps the module
+    // loadable in non-DOM (test) contexts without a ReferenceError.
+    if (typeof HTMLImageElement !== "undefined" && el instanceof HTMLImageElement) {
+      return acquireImgElementBytes(el);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Read an `<img>`'s decoded bitmap back out of the element (the revoked-blob
+ * fallback — see {@link acquireBlobBytes}). PNG, not JPEG: the background prep
+ * already re-encodes to JPEG once (§7.5), and a second lossy generation would
+ * soften the text edges OCR depends on. A same-origin blob source doesn't taint
+ * the canvas; a genuinely unreadable image rejects in `createImageBitmap` (never
+ * decoded) or `convertToBlob` (tainted) and the caller fails soft (rule 6).
+ * NOTE: the re-encoded bytes hash differently from the original file's, so the
+ * fallback caches under its own key — deterministic per browser, just disjoint
+ * from a fetch-acquired entry. Accepted: a revoked URL never heals, so a page
+ * consistently takes one path or the other.
+ */
+export async function acquireImgElementBytes(img: HTMLImageElement): Promise<AcquiredBytes> {
+  const bitmap = await createImageBitmap(img);
+  try {
+    const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("2d context unavailable");
+    ctx.drawImage(bitmap, 0, 0);
+    const blob = await canvas.convertToBlob({ type: "image/png" });
+    return { imageBytes: await blob.arrayBuffer(), imageMime: "image/png" };
+  } finally {
+    bitmap.close();
+  }
 }
 
 /**

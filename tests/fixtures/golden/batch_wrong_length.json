@@ -1,0 +1,16 @@
+{
+  "pages": [
+    {
+      "source_lang": "ja",
+      "regions": [
+        { "bbox": [0.10, 0.05, 0.30, 0.12], "original": "こんにちは", "translated": "Hello", "is_sfx": false, "kind": "bubble" }
+      ]
+    },
+    {
+      "source_lang": "ja",
+      "regions": [
+        { "bbox": [0.12, 0.08, 0.34, 0.16], "original": "またね", "translated": "See you", "is_sfx": false, "kind": "bubble" }
+      ]
+    }
+  ]
+}
