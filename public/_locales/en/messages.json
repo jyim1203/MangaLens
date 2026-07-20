@@ -79,6 +79,10 @@
   "popupSelectRegion": { "message": "Select region…" },
   "popupSettings": { "message": "Settings" },
   "optionsTitle": { "message": "MangaLens settings" },
+  "optionsPrefetchAheadHint": {
+    "message": "At most this many pages past your reading position are ever auto-sent to the provider — the hard budget for auto-translate. Translate all is not limited by it.",
+    "description": "Options hint under the prefetchAhead field (Phase 9 reading-window budget guarantee)."
+  },
   "optionsPagesPerRequestHint": {
     "message": "Images per provider request. 1 = one page per request (default). 2–3 recommended for Translate all — batches pages to amortize the prompt and cut cost.",
     "description": "Options hint under the pagesPerRequest field (Phase 8 batching)."

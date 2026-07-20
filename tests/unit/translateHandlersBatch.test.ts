@@ -13,6 +13,7 @@ vi.mock("../../src/background/cache", () => ({
   cacheLookup: async () => ({ status: "miss" as const }),
   cacheStorePage: (...a: unknown[]) => cacheStorePage(...a),
   cacheStoreNegative: (...a: unknown[]) => cacheStoreNegative(...a),
+  classifyResnap: () => false, // §3: only the (never-taken here) hit path uses it
   countCacheForOrigin: async () => 0,
   shouldNegativeCache: (kind: string) => kind === "malformed" || kind === "refusal",
 }));
@@ -48,6 +49,7 @@ vi.mock("../../src/background/imagePrep", async (orig) => {
 
 vi.mock("../../src/background/bubbleSnap", () => ({
   snapPageRegions: async (_blob: Blob, page: unknown) => page,
+  SNAP_VERSION: 1, // §3: threaded into cacheStorePage on the miss path
 }));
 
 const recordUsage = vi.fn(async (..._a: unknown[]) => {});

@@ -86,6 +86,23 @@ export interface TranslatedRegion {
   kind?: RegionKind;
   /** Provider-reported confidence 0–1, if available; used for overlap dedupe (§7.4). */
   confidence?: number;
+  /**
+   * The speech bubble's traced outline (Phase 9, the ONE sanctioned contract
+   * change): a closed polygon of normalized [x, y] points (fractions of the
+   * ORIGINAL full image, like {@link bbox}), captured from the bubbleSnap flood
+   * fill's accepted blob. NOT provider output — a deterministic local
+   * refinement, cached like snapped boxes (7.5 precedent). Optional and
+   * additive: absent (pre-Phase-9 cache entries, failed traces, non-snapped
+   * kinds) renders exactly the pre-Phase-9 rounded rectangle.
+   */
+  shape?: Array<[number, number]>;
+  /**
+   * Sampled mean color of the bubble's interior pixels as a `#rrggbb` hex
+   * (Phase 9 §7). When present the overlay fill uses it instead of the user's
+   * `bubbleFillColor`, and a dark fill flips the text to light-on-dark.
+   * Optional and additive, same compatibility story as {@link shape}.
+   */
+  fillColor?: string;
 }
 
 /**

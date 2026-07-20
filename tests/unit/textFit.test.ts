@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   fitTextSize,
+  longestWord,
+  maxWordFitPx,
   resolveFontSize,
   type Measure,
 } from "../../src/content/overlay/textFit";
@@ -83,6 +85,40 @@ describe("textFit — fitTextSize (pure binary search)", () => {
   });
 });
 
+describe("textFit — maxWordFitPx (Phase 9.3 word-integrity cap)", () => {
+  it("returns the exact largest integer px at which the word fits unbroken", () => {
+    // "Besides" = 7 glyphs, w = 7·0.6·px = 4.2·px ≤ 52.8 ⇒ px ≤ 12.57 ⇒ 12.
+    expect(maxWordFitPx("Besides", 52.8, 8, 40, measure)).toBe(12);
+    // Sanity on the boundary the search must respect.
+    expect(measure("Besides", 12).w).toBeLessThanOrEqual(52.8);
+    expect(measure("Besides", 13).w).toBeGreaterThan(52.8);
+  });
+
+  it("returns null when even minPx overflows (fragmentation unavoidable → widen)", () => {
+    // "Extraordinary" = 13 glyphs, at minPx 8: 13·0.6·8 = 62.4 > 52.8 ⇒ null.
+    expect(maxWordFitPx("Extraordinary", 52.8, 8, 40, measure)).toBeNull();
+  });
+
+  it("an empty word imposes no cap (returns maxPx)", () => {
+    expect(maxWordFitPx("", 10, 8, 28, measure)).toBe(28);
+  });
+
+  it("returns null on degenerate bounds (maxPx < minPx)", () => {
+    expect(maxWordFitPx("a", 1e6, 20, 10, measure)).toBeNull();
+  });
+
+  it("is monotonic in width and deterministic", () => {
+    const narrow = maxWordFitPx("Besides", 40, 8, 40, measure);
+    const wide = maxWordFitPx("Besides", 80, 8, 40, measure);
+    expect(narrow).not.toBeNull();
+    expect(wide).not.toBeNull();
+    expect(wide!).toBeGreaterThanOrEqual(narrow!);
+    expect(maxWordFitPx("Besides", 52.8, 8, 40, measure)).toBe(
+      maxWordFitPx("Besides", 52.8, 8, 40, measure),
+    );
+  });
+});
+
 describe("textFit — resolveFontSize", () => {
   it("fixed mode bypasses the search entirely", () => {
     const spy = vi.fn(measure);
@@ -102,5 +138,50 @@ describe("textFit — resolveFontSize", () => {
     expect(
       resolveFontSize(font({ sizeMode: "fixed" }), "   ", 100, 100, measure),
     ).toBe(0);
+  });
+
+  it("auto mode honors a word cap below maxSizePx (min(maxSizePx, cap))", () => {
+    // Huge box → uncapped fit hits maxSizePx (28); the cap 15 binds instead.
+    expect(
+      resolveFontSize(font({ sizeMode: "auto" }), "hi", 1e6, 1e6, measure),
+    ).toBe(28);
+    expect(
+      resolveFontSize(font({ sizeMode: "auto" }), "hi", 1e6, 1e6, measure, 15),
+    ).toBe(15);
+  });
+
+  it("a cap ABOVE maxSizePx does not raise the size (min order)", () => {
+    expect(
+      resolveFontSize(font({ sizeMode: "auto", maxSizePx: 28 }), "hi", 1e6, 1e6, measure, 100),
+    ).toBe(28);
+  });
+
+  it("fixed mode ignores the word cap (the user chose that size)", () => {
+    expect(
+      resolveFontSize(font({ sizeMode: "fixed", fixedSizePx: 24 }), "hi", 100, 100, measure, 8),
+    ).toBe(24);
+  });
+});
+
+describe("textFit — longestWord (Phase 9.2 narrow-rect rescue)", () => {
+  it("returns the word with the most characters", () => {
+    expect(longestWord("That determination of yours, I admit—")).toBe(
+      "determination",
+    );
+  });
+
+  it("first word wins a tie; single word and empty/whitespace degrade cleanly", () => {
+    expect(longestWord("abc def")).toBe("abc");
+    expect(longestWord("Impressive.")).toBe("Impressive.");
+    expect(longestWord("")).toBe("");
+    expect(longestWord("   ")).toBe("");
+  });
+
+  it("splits on ANY whitespace run (newlines/tabs included)", () => {
+    expect(longestWord("my\n unbreakable\tsword")).toBe("unbreakable");
+  });
+
+  it("a no-whitespace CJK string returns whole (the caller widens, harmlessly)", () => {
+    expect(longestWord("これは長い台詞です")).toBe("これは長い台詞です");
   });
 });

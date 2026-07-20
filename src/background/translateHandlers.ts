@@ -42,10 +42,11 @@ import {
   cacheLookup,
   cacheStoreNegative,
   cacheStorePage,
+  classifyResnap,
   countCacheForOrigin,
   shouldNegativeCache,
 } from "./cache";
-import { snapPageRegions } from "./bubbleSnap";
+import { snapPageRegions, SNAP_VERSION } from "./bubbleSnap";
 import { coalesce } from "./coalesce";
 import { createSharedAbort, type SharedAbort } from "./sharedAbort";
 import { isAbortError } from "../shared/guards";
@@ -150,17 +151,33 @@ interface BatchMemberPayload {
 }
 
 /**
+ * Phase 9.1 §3: a completed translation carries BOTH the snapped `page` (served +
+ * cached as `CacheRecord.page`) and the pre-snap merged provider regions
+ * (`rawPage`, cached as `CacheRecord.rawPage`), so a later snap-logic change
+ * replays LOCALLY at hit time for zero provider spend (see {@link classifyResnap}).
+ */
+interface SnapPair {
+  page: PageTranslation;
+  rawPage: PageTranslation;
+}
+
+/** A {@link SnapPair} plus the solo path's tile count (usage `images`, F17). */
+interface TranslateOutcome extends SnapPair {
+  providerCalls: number;
+}
+
+/**
  * The one process-wide batch collector (F12). Lazily created (event-page
  * lifetime; a partial group is dropped on unload — gap #8, content re-requests).
  * Groups eligible priority-2 cache-miss jobs by signature and flushes each to
  * {@link executeBatchGroup}.
  */
-let batchCollector: BatchCollector<BatchMemberPayload, PageTranslation> | undefined;
+let batchCollector: BatchCollector<BatchMemberPayload, SnapPair> | undefined;
 
 /** Get/create the shared batch collector. */
-function getBatchCollector(): BatchCollector<BatchMemberPayload, PageTranslation> {
+function getBatchCollector(): BatchCollector<BatchMemberPayload, SnapPair> {
   if (!batchCollector) {
-    batchCollector = createBatchCollector<BatchMemberPayload, PageTranslation>({
+    batchCollector = createBatchCollector<BatchMemberPayload, SnapPair>({
       lingerMs: BATCH_LINGER_MS,
       runGroup: (jobs) => executeBatchGroup(jobs),
     });
@@ -447,7 +464,7 @@ async function translatePrepared(
   settings: Settings,
   providerSettings: ProviderSettings,
   signal: AbortSignal,
-): Promise<{ page: PageTranslation; providerCalls: number }> {
+): Promise<TranslateOutcome> {
   const prepared = await prepareImage(blob, {
     maxEdgePx: settings.maxImageEdgePx,
     jpegQuality: settings.jpegQuality,
@@ -472,7 +489,7 @@ async function translateTiles(
   pageHash: string,
   providerSettings: ProviderSettings,
   signal: AbortSignal,
-): Promise<{ page: PageTranslation; providerCalls: number }> {
+): Promise<TranslateOutcome> {
   const provider = createProvider(providerSettings);
   const gate = getRateGate();
   // WHY parallel: tiles of one strip are independent requests, and §7.5's
@@ -509,14 +526,16 @@ async function translateTiles(
   log.debug(
     `translated: ${snapped.regions.length} regions from ${prepared.tiles.length} tile(s)`,
   );
-  return { page: snapped, providerCalls: prepared.tiles.length };
+  // §3: keep `merged` (the pre-snap provider regions) as `rawPage` so a future
+  // SNAP_VERSION bump replays the snap locally with no re-fetch/re-translate.
+  return { page: snapped, rawPage: merged, providerCalls: prepared.tiles.length };
 }
 
 // --- Multi-page batch execution (F12, PROMPTS §4.2) -------------------------
 
 /** A single-tile batch member paired with its already-prepped image. */
 interface PreppedSingle {
-  job: BatchJob<BatchMemberPayload, PageTranslation>;
+  job: BatchJob<BatchMemberPayload, SnapPair>;
   prepared: PreparedImage;
 }
 
@@ -528,7 +547,7 @@ interface PreppedSingle {
  * Never throws: it settles every member's promise itself. The `.catch` handles
  * only a queue-level PRE-RUN abort (the task never ran → members unsettled).
  */
-function executeBatchGroup(jobs: BatchJob<BatchMemberPayload, PageTranslation>[]): void {
+function executeBatchGroup(jobs: BatchJob<BatchMemberPayload, SnapPair>[]): void {
   if (jobs.length === 0) return;
   // Members share settings by signature construction — use the first for the
   // group's concurrency, prep dims, and provider.
@@ -575,7 +594,7 @@ function executeBatchGroup(jobs: BatchJob<BatchMemberPayload, PageTranslation>[]
  * {@link runTranslateMiss} caller caches it exactly as if it had never batched.
  */
 function runPulledMemberSolo(
-  job: BatchJob<BatchMemberPayload, PageTranslation>,
+  job: BatchJob<BatchMemberPayload, SnapPair>,
   priority: number,
 ): void {
   const { blob, pageHash, settings, providerSettings, signal, onStarted, cacheKey } = job.payload;
@@ -593,7 +612,7 @@ function runPulledMemberSolo(
     .then(
       (result) => {
         void recordUsage(usageFromPage(result.page, result.providerCalls));
-        job.resolve(result.page);
+        job.resolve({ page: result.page, rawPage: result.rawPage }); // §3
       },
       (err: unknown) => job.reject(err),
     )
@@ -608,7 +627,7 @@ function runPulledMemberSolo(
  * completion INSIDE this one queue slot. Never throws (each member settles itself).
  */
 async function runBatchGroupTask(
-  jobs: BatchJob<BatchMemberPayload, PageTranslation>[],
+  jobs: BatchJob<BatchMemberPayload, SnapPair>[],
   settings: Settings,
   providerSettings: ProviderSettings,
   signal: AbortSignal,
@@ -665,13 +684,13 @@ async function runBatchGroupTask(
 
 /** Translate ONE already-prepped member solo and settle it (multi-tile divert + split-retry). */
 async function translateSoloAndSettle(
-  job: BatchJob<BatchMemberPayload, PageTranslation>,
+  job: BatchJob<BatchMemberPayload, SnapPair>,
   prepared: PreparedImage,
   providerSettings: ProviderSettings,
   signal: AbortSignal,
 ): Promise<void> {
   try {
-    const { page, providerCalls } = await translateTiles(
+    const { page, rawPage, providerCalls } = await translateTiles(
       prepared,
       job.payload.blob,
       job.payload.pageHash,
@@ -679,7 +698,7 @@ async function translateSoloAndSettle(
       signal,
     );
     void recordUsage(usageFromPage(page, providerCalls));
-    job.resolve(page);
+    job.resolve({ page, rawPage }); // §3
   } catch (err) {
     job.reject(err);
   }
@@ -733,7 +752,10 @@ async function runBatchSingles(
     pages.map(async (page, i) => {
       const s = singles[i]!;
       try {
-        s.job.resolve(await snapPageRegions(s.job.payload.blob, page));
+        // §3: `page` is the pre-snap provider result → snap for the served page,
+        // keep `page` as rawPage for local re-snap.
+        const snapped = await snapPageRegions(s.job.payload.blob, page);
+        s.job.resolve({ page: snapped, rawPage: page });
       } catch (err) {
         s.job.reject(err);
       }
@@ -830,6 +852,30 @@ export async function translateImage(
 
   const lookup = await cacheLookup(cacheKey);
   if (lookup.status === "hit") {
+    // §3: re-snap a stale entry LOCALLY (zero provider spend) when a SNAP_VERSION
+    // bump has landed and the entry retained its raw provider regions. Serve +
+    // write back the re-snapped page ONCE per page per version (the write-back
+    // stamps SNAP_VERSION, so the next hit classifies as up-to-date); any failure
+    // serves the stored page as-is (rule 6). Runs on the normal translate path AND
+    // the hydrate probe — both fetch/carry the bytes needed for the fill.
+    if (classifyResnap(lookup.record, SNAP_VERSION, blob.size > 0) && lookup.record.rawPage) {
+      try {
+        const resnapped = await snapPageRegions(blob, lookup.record.rawPage);
+        void cacheStorePage(
+          cacheKey,
+          resnapped,
+          cacheCapBytes(settings),
+          origin ?? lookup.record.origin,
+          lookup.record.rawPage,
+          SNAP_VERSION,
+        );
+        log.debug(`re-snapped cache hit for ${imageUrl} (snapVersion → ${SNAP_VERSION})`);
+        return resnapped;
+      } catch (err) {
+        log.debug("re-snap failed; serving cached page as-is", err);
+        return lookup.page;
+      }
+    }
     log.debug(`cache hit for ${imageUrl}`);
     return lookup.page;
   }
@@ -952,6 +998,7 @@ async function runTranslateMiss(
   onStarted?: () => void,
 ): Promise<PageTranslation> {
   let page: PageTranslation;
+  let rawPage: PageTranslation; // §3: pre-snap regions cached alongside the page
   try {
     if (batchEligible(priority, settings.pagesPerRequest)) {
       // Batch path (F12): group with other eligible priority-2 misses. The group
@@ -959,7 +1006,7 @@ async function runTranslateMiss(
       // translateBatch, records ONE usage event for the whole call, snaps, and
       // settles each member. We only CACHE the member's own page here (per its own
       // cacheKey) — a batch result caches under the SAME key as the single result.
-      page = await getBatchCollector().submit(
+      const out = await getBatchCollector().submit(
         batchSignature(providerSettings, {
           maxEdgePx: settings.maxImageEdgePx,
           jpegQuality: settings.jpegQuality,
@@ -967,6 +1014,8 @@ async function runTranslateMiss(
         clampBatchSize(settings.pagesPerRequest),
         { cacheKey, pageHash, blob, settings, providerSettings, signal, onStarted },
       );
+      page = out.page;
+      rawPage = out.rawPage;
     } else {
       const queue = getTranslationQueue(settings.concurrency);
       const handle = queue.addJob(
@@ -982,13 +1031,14 @@ async function runTranslateMiss(
       );
       // Register the handle so reprioritizeTranslation can lift this queued job (§2).
       queuedHandles.set(cacheKey, handle);
-      let result: { page: PageTranslation; providerCalls: number };
+      let result: TranslateOutcome;
       try {
         result = await handle.promise;
       } finally {
         if (queuedHandles.get(cacheKey) === handle) queuedHandles.delete(cacheKey);
       }
       page = result.page;
+      rawPage = result.rawPage;
       // Solo path records its own usage (the batch path records once per batch
       // call). providerCalls (tile count) → accurate `images` for strips (item 2).
       void recordUsage(usageFromPage(result.page, result.providerCalls));
@@ -1006,7 +1056,8 @@ async function runTranslateMiss(
   // clears on settle, so a request arriving in the ms-wide window between this
   // run settling and the IndexedDB commit landing re-pays one provider call.
   // Acceptable — the window is tiny and the worst case is a single duplicate.
-  void cacheStorePage(cacheKey, page, cacheCapBytes(settings), origin);
+  // §3: store `rawPage` + SNAP_VERSION so a later snap change re-snaps locally.
+  void cacheStorePage(cacheKey, page, cacheCapBytes(settings), origin, rawPage, SNAP_VERSION);
   return page;
 }
 

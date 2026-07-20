@@ -2207,3 +2207,523 @@ surface, noted as a possible later refinement (a "rate-limited, waiting" toast).
 batch max_tokens pair, 3 revoked-blob fallback). Typecheck + ESLint clean;
 `vite build` clean; `web-ext lint` 0/0/0; `npm run test:e2e` 3/3 green on this
 machine — now including the revoked-blob regression.
+
+## Phase 9 summary (reading-window prefetch budget + shaped bubble fills)
+
+Driven by the sixth live pass (2026-07-17, Anthropic `claude-sonnet-5`): the HAR
+showed **14 `v1/messages` POSTs in one 25-second burst** on opening a chapter at
+the top of an auto-opted reader — the whole chapter went out where ~5–6 pages
+were expected. Two root-cause layers: (a) structurally, `planEnqueues` bounded
+only the *extra prefetch per event* — every candidate the browser reported as
+intersecting was sent at its own tier, with no global budget; (b) manga readers
+generate **false tier events during load** (lazy-load accordion parking image N
+at the fold; stacked pages hidden via `opacity`/`visibility`, which still
+"intersect" to an IntersectionObserver), so "reported as intersecting" vastly
+overstates "being read". Item A makes `prefetchAhead` a hard invariant; item B
+(the user's bubble-taxonomy request) keeps the contour the `bubbleSnap` flood
+fill already computed and threw away, so fills hug the drawn bubble instead of
+covering art with a rounded rectangle.
+
+**§1 — the reading-window budget (viewportQueue).** No auto-send (visibility
+tier OR prefetch) may target a candidate more than `prefetchAhead` positions
+past the furthest page the user has *confirmed* visible. The cursor is DERIVED
+per plan (`deriveCursor` over element-keyed `confirmedVisible` flags in doc
+order — a stored number would go stale on lazy registration/unregistration;
+unregistering the cursor holder falls back to the next confirmed index). The
+gate lives in the pure planner (`PlanInput.cursor`; fresh sends beyond
+`cursor + prefetchAhead` become `suppressed` instructions; `cursor: undefined`
+suppresses every fresh send), NOT in `sendTranslate` — so `requestAll`
+(translate-all), drag-select, hydrate probes, and priority UPGRADES of
+already-paid jobs all bypass the window untouched. Suppressed candidates are
+re-observed when the window slides over them (the existing transition-only-IO
+`reobserve()` workaround), and raising `prefetchAhead` live also widens + slides
+(implementer's call — without it a suppressed page would ignore the new setting
+until the next cursor advance). The options `prefetchAhead` hint now states the
+guarantee (options HTML + `_locales`).
+
+**§2 — tier-0 confirmation (what makes the cursor trustworthy).** A tier-0 IO
+event no longer advances the cursor directly: after `CONFIRM_DELAY_MS` (300 ms,
+injectable) the layout is re-read and must show a meaningful overlap
+(`classifyConfirm`: at least min(48 px, half the candidate's height), pure) and
+pass `checkVisibility({opacityProperty, visibilityProperty})` (feature-detected,
+fail-open — the window still bounds the damage). Confirm-then-plan applies ONLY
+to cursor advancement: an unconfirmed tier-0 *within* the current window sends
+immediately (inside the accepted budget → zero added latency while reading
+normally); a mid-chapter jump pays one ~300 ms confirm before the window
+recenters. Tier-1 (near) events are never confirmed — they can't advance the
+cursor and the window already bounds them.
+
+**The §2 flaw the new e2e caught (design deviation, deliberate).** The handoff
+specified "on reject: drop silently; the observer pair will fire again on the
+next real transition". Scenario D proved that assumption wrong for the NORMAL
+reading path: a page's only tier-0 transition fires when it first pokes into the
+viewport with a few-px sliver, the 300 ms re-read still sees a sub-48 px
+overlap → reject — and scrolling *deeper into* the page never fires another
+IntersectionObserver event, so the cursor wedged at the fold and everything
+beyond stayed suppressed (8/10 pages painted; an instrumented headless run
+showed "overlap 42 px < 48" rejects for every page past the fifth — note the
+real headless viewport is 682 px, not the 768 window height). Fix: a rejected
+confirm now RETRIES on a capped exponential backoff (600 → 1200 → 2400 ms,
+reset by any fresh transition) *while the element still overlaps the viewport
+at all* (`classifyConfirm` verdict `retry`); a fully-departed streaker is a
+`drop` and stays transition-driven. `checkVisibility` rejects also retry —
+which incidentally makes opacity-stacked readers advance the cursor within
+~2.4 s of a page flip (an opacity change fires no IO event either). Polling
+cost is bounded: only unconfirmed candidates physically overlapping the
+viewport, at 2.4 s intervals once backed off.
+
+**§3 — contour capture (bubbleSnap).** `floodFill` now records a `filled` mask
+(separate from `visited`, which includes dark boundary rejects) plus running RGB
+sums. On an ACCEPTED fill only: dilate 1 px (3×3 — replaces the scalar bbox pad
+for the shape; the bbox pad itself is unchanged), trace the outer boundary with
+marching squares (outer contour only — glyph holes are covered automatically;
+saddles disambiguated by walk direction; any non-boundary state or step-cap
+overrun aborts the trace and keeps the bbox), simplify with Douglas-Peucker at
+epsilon = 1 snap-px (doubled once, then uniform subsample if still over the
+64-point cap), convert to full-image fractions clamped [0, 1] and rounded to 4
+decimals (~1 KB/region worst case in the cache's JSON sizing).
+`snapRegionToBubble` now returns `{ bbox, shape?, fillColor? }` (`SnapResult`,
+module-local API); `snapAllRegions`/`splitGroup`/`applySwallowGuard` updated
+mechanically — the 7.6 windowed per-lobe re-fills produce per-lobe contours
+with zero extra mechanism. Shapes are CACHED exactly as snapped boxes are
+(deterministic memoization, the 7.5 precedent), so reloads replay shaped fills
+with zero spend. **NO `CACHE_VERSION` bump** — the fields are additive;
+pre-Phase-9 entries render rectangles until they age out (retiring the store
+would re-pay provider $ for every cached page, the cost the 7.6 precedent
+refused). Drag-select clamps only the bbox; out-of-selection shape points are
+cropped at render by the box's `overflow: hidden` (no polygon-clipping code).
+
+**§4/§5 — shaped fill render (`overlay/shapePath.ts` + BubbleBox).** New pure
+module: `shapeToBoxPath` (image-normalized points → box-local px via
+`(s − bbox) × rect/bbox.w`, Catmull-Rom → cubic Bézier, closed SVG path at
+0.1 px — correct even for a `trimOverlaps`-trimmed or drag-clamped bbox copy
+because the trimmed bbox and box rect describe the same displayed
+sub-rectangle, so out-of-box points just land outside [0, rectW] where
+`overflow: hidden` crops), and `inscribedInnerRect` (largest centered scale of
+the padded inner box whose corners lie inside the polygon, binary search,
+floored at 0.6×). BubbleBox applies the path as `clip-path` on the FILL LAYER
+ONLY (text is never clipped), box radius drops to 0 with a shape (rounded
+corners would crop a near-rectangular traced bubble), text fits + centers in
+the inscribed rect, peek keeps the shape with the dashed cue on the box. Resize
+repaints re-run the whole function — no new listeners, no cached px.
+`PADDING_RATIO` moved to shapePath (pure module), re-exported from BubbleBox.
+§5 fallback: an UNSHAPED bubble/thought with aspect w/h in [0.4, 2.5] renders
+`border-radius: 50%` with the text box at 1/√2 of the inner rect
+(`fallbackRadius`, a single independent pure decision so a bad live pass can
+revert §5 alone). **Flagged risk, accepted:** an ellipse inscribed in a *tight*
+provider box can leave glyph corners uncovered; 7.5 evidence says provider
+boxes are loose.
+
+**§7 — sampled fill color + dark polarity.** The fill's mean RGB accumulates
+during the fill (three sums + count, no second pass) → `region.fillColor` hex.
+Render: a sampled color wins over `font.bubbleFillColor` — **deliberate call,
+flagged**: the sampled color IS the bubble's actual paper color (visually
+identical for the common white bubble); settings-gate later if contested. Pure
+`pickTextStyle` flips to light text + dark stroke when fill luma < 128. Dark
+polarity: when ALL nine seeds are dark (≤ `DARK_CEILING` = 80), the seed loop
+re-runs inverted (fill luminance ≤ min(darkCeiling, seedLum + tolerance) —
+mirroring the light path's max()), same min-area/leak guards, same kind gate —
+flash/inverted-flash bubbles get a dark shaped fill with light text instead of
+a white rectangle punched into black art. Mixed light/dark seeds keep the light
+path only.
+
+**Contract change (the ONE sanctioned `shared/types.ts` change, rule 4):**
+`TranslatedRegion` gains `shape?: Array<[number, number]>` and
+`fillColor?: string` — both optional, both additive; absent fields render
+exactly the pre-Phase-9 rounded rect. NO new `messages.ts` entries (shape/fill
+ride inside `PageTranslation`), no manifest change, `PROMPT_VERSION` = 2 and
+`CACHE_VERSION` = 2 untouched.
+
+**§6 — e2e Scenario D.** The 2026-07-17 failure as a permanent assertion: fresh
+cache, auto site, chapter opened at the top, NO translate-all, ~8 s wait →
+`1 ≤ chatRequests ≤ 6` (1366×768 over 800×1200 pages: 1–2 visible + 1–2 near +
+3 prefetch; observed: exactly 4), then stepped scroll to the bottom → all 10
+pages paint (the window slides; nothing wedges — this assertion is what caught
+the §2 sliver-wedge). Scenarios A–C pass UNMODIFIED (A/B use translate-all,
+which is itself the §1 bypass test; C's auto path re-confirms per swap cycle).
+
+**Tests — 694 green** (+54: window-gate/cursor/confirm planners + shell
+scenarios in `viewportWindow.test.ts` incl. the sliver-retry and hidden-stack
+heals, contour capture + dark polarity + sampled color in `bubbleSnap.test.ts`,
+`shapePath.test.ts` for path mapping/inscribed rect/fallback table/text flip;
+existing viewportQueue + bubbleSnap suites updated mechanically — generous
+cursor, confirm seams, `.bbox` accessors). Typecheck + ESLint clean; `vite
+build` clean; `web-ext lint` 0/0/0; **`npm run test:e2e` 4/4 green on this
+machine** (A 7.8 s, B 7.6 s, C 3.7 s, D 18.5 s).
+
+**Manual verification: NOT run** (needs a live key + real reader). The
+handoff's manual list is outstanding — in particular: confirm which reader the
+2026-07-17 HAR came from, the ≤ ~6-requests-in-minute-one check on that reader,
+shaped fills on oval/cloud/wavy/thought + the 7.6 Eminence joined-bubble page,
+cached-shape replay on reload, drag-select clamp, a dark/inverted-flash page,
+peek, and pre-Phase-9 cache-entry compatibility (do NOT clear the cache first).
+
+## Phase 9.1 summary (fill fidelity, placement rescue, cost hardening)
+
+Driven by the **seventh live pass** (2026-07-18, MangaDex confirmed via the HAR's
+`mangadex.org` entry, Anthropic `claude-sonnet-5`) — the first live pass over the
+Phase 9 shaped fills + reading-window budget. What it ESTABLISHED (not
+re-litigated): the Phase 9 budget **held at chapter open** — 1 request at t=0 vs
+14 the day before on the same chapter — and the later 21-request sequence was
+fully explained (cache cleared, auto toggled ON mid-chapter, whole chapter
+skimmed → scroll-driven purchases at `prefetchAhead: 3`). What it exposed
+(screenshot-verified defects): a 1–3 display-px rim of original ink around many
+shaped fills; a grey patch on white bubbles (the sampled MEAN reads `#e6e6e6`);
+offset provider boxes that escape the snap and paint a loose white ellipse over a
+neighbour beside still-visible original text; a neighbour's opaque fill painting
+over an earlier bubble's text; and two cheap holes in the reading window
+(unloaded placeholders can confirm; backward scrolling buys instantly). Nine
+fronts, all tuning/hardening the Phase 9 machinery — nothing rebuilt.
+
+**§1 — close the ink rim (bubbleSnap).** Root-cause arithmetic (in the WHY
+comments): the snap bitmap's long edge is capped at 512, so 1 snap-px ≈ 2–2.5
+display px; the fill stops ~1–1.5 snap-px inside the ink, the ε-doubling shaved
+convex edge, and Catmull-Rom undershot arcs → the fill edge landed ~4–6 display px
+inside the true boundary. Fix: new pure `offsetPolygonOutward(points, offsetPx)`
+pushes each vertex out along its vertex normal (average of adjacent edge normals;
+orientation from the ring's SIGNED AREA, not a centroid — a concave contour has
+vertices on the far side of any centroid), applied AFTER simplification in snap-px
+BEFORE normalization (rule 5). `SHAPE_OUTWARD_OFFSET_PX = 1` (dilation 1 + offset 1
+≈ 2 snap-px ≈ 4–5 display px, covers the AA halo and *kisses* the ink line — the
+tuning knob, raise to 1.5 if rims persist). Dropped the ε-doubling escape in
+`traceBlobShape`: simplify ONCE at ε=1, then straight to uniform subsampling
+(keeps vertices ON the boundary). Self-intersection at 1 px is negligible and
+accepted (a degenerate ring still renders inside the `overflow: hidden` box).
+
+**§2 — median fill color + paper snap (bubbleSnap).** Replaced the running RGB
+mean (`sumR/G/B` + `blobMeanHex`) with three 256-bin per-channel histograms
+accumulated during the fill (memory ≈ 3 KB, still one pass) → per-channel MEDIAN
+at accept (`blobFillHex`), immune to the AA fringe that dragged the mean grey.
+**Paper snap:** median luma ≥ `PAPER_WHITE_LUMA` (245) → `#ffffff`, ≤
+`PAPER_BLACK_LUMA` (12) → `#000000`; a genuine mid-grey screentone stays its
+median grey. The existing uniform-230 fixture still samples `#e6e6e6` (below the
+snap); the dark ellipse still `#1e1e1e`.
+
+**§3 — raw regions in cache + `SNAP_VERSION` local re-snap (the user's testing
+workflow).** The user clears the cache between fill tests to see snap changes,
+**re-paying the provider for translations that did not change**. Fix: cache the
+provider's RAW regions alongside the snapped result and re-snap LOCALLY when the
+snap-logic version changes. `SNAP_VERSION = 1` in bubbleSnap (bump on any future
+snap-output change; **NEVER in `buildCacheKey`**, ground rule 8 — a key change
+would re-pay the provider for every page, the exact cost this eliminates).
+Threaded the pre-snap `rawPage` through the solo + batch paths (new internal
+`SnapPair`/`TranslateOutcome` types; the batch collector's result generic is now
+`SnapPair`). Cache-hit path: `classifyResnap(record, SNAP_VERSION, hasBytes)` (pure,
+unit-tested decision table) gates a one-time re-snap on a positive hit whose stored
+`snapVersion` lags + retained `rawPage` + the request carries bytes; it re-runs
+`snapPageRegions(blob, record.rawPage)`, serves + writes back the re-snapped page
+with the bumped version (so it runs once per page per version), and any failure
+serves the cached page as-is (rule 6). Full-page entries only (a drag-select crop's
+recovery was not worth the extra plumbing — WHY-noted). After this ships, §1/§2-style
+tuning costs **zero provider dollars** on already-paid pages.
+
+**§4 — seed rescue for offset provider boxes (bubbleSnap).** After the light +
+dark seed loops both fail, a rescue pass samples a fixed 5×5 grid over the provider
+box expanded 25 % per side (clamped to image/window) and runs the LIGHT-path fill
+from each qualifying seed (dark path stays flash-only — rare and rarely offset).
+**Acceptance guard:** the accepted blob's bbox must cover ≥
+`RESCUE_MIN_PROVIDER_OVERLAP` (0.4) of the ORIGINAL provider box, else the rescue
+wandered to a neighbour → null (today's loose box, rule 6). A leak/min-area on a
+grid point `continue`s (unlike the main loops' abandon) — the box is offset, so one
+background seed leaking says nothing about the target bubble. Rescued results flow
+through the existing accept path unchanged.
+
+**§5 — centroid-centered inscribed text rect (shapePath + BubbleBox).**
+`inscribedInnerRect` now centers the binary search on the polygon's AREA centroid
+(pure `polygonCentroid`, exported + tested) instead of the box center, and returns
+the rect at that centroid clamped inside the box — an asymmetric shape no longer
+shrinks to the 0.6× floor and spills text outside itself. A symmetric shape's
+centroid IS the box center, so it reduces to the Phase 9 result (the slab/circle
+regressions hold within FP epsilon). BubbleBox positions the shaped label
+EXPLICITLY (a wrapper at the inscribed rect that flex-centers it) rather than
+relying on box flex centering; the no-shape paths (padded rect, ellipse) keep flex
+centering.
+
+**§6 — fills paint under ALL labels (BubbleBox).** `z-index: 1` on every fill
+layer, `z-index: 2` on every label. WHY it works across boxes: the box divs stay
+`position: absolute; z-index: auto` with no transform/filter, so they do NOT form
+stacking contexts — every label interleaves above every fill in the one overlay
+root context. A WHY comment on the box style guards the invariant ("adding
+z-index/transform/filter to the box breaks §6 layering").
+
+**§7 — gate the §5 ellipse to snapped regions (BubbleBox).** The ellipse fallback
+now fires only when `region.fillColor !== undefined` — the snap sets `fillColor`
+exactly when a blob was accepted, so it is a reliable "this bbox is tight" proxy
+with no new contract field. An UNSNAPPED (loose) bubble/thought keeps the pre-Phase-9
+8 px rounded rect (small spill, soft corners — strictly less harm than a white oval
+on a loose box). The pure `fallbackRadius` table is unchanged; the proxy lives at
+its call site (kind×aspect stays the table's only inputs).
+
+**§8 — anchored reading window (viewportQueue).** Generalized the single Phase 9
+cursor to ANCHORS: a fresh send at index `i` is allowed iff some CONFIRMED index
+`j` satisfies `i − prefetchAhead ≤ j ≤ i` — the reading window is the UNION of each
+anchor's forward `[j, j + prefetchAhead]` range (pure `anchoredWindowAllows`,
+O(prefetchAhead) backward scan, replaces `PlanInput.cursor` with `confirmed:
+boolean[]`; `deriveCursor` deleted). Contiguous forward reading stays byte-identical
+to Phase 9; a backward/jumped page only buys near a page the user actually
+confirmed — a fast reverse skim buys nothing, a backward jump confirms once (~300 ms)
+then reads forward with the normal tail. Shell: `onTier0Event` now schedules a
+confirmation for EVERY unconfirmed tier-0 (any page can become an anchor, forward or
+backward), keeping the immediate within-window plan; `runConfirm` sets the flag,
+re-plans tier 0, and slides over the NEW anchor's forward range only (`slideWindow`
+generalized); `setPrefetchAhead` re-scans suppressed candidates the widened window
+now allows. Cost contract WHY-noted at the module head: "auto-translate spends only
+within `prefetchAhead` of a page the user has confirmably looked at."
+
+**§9 — loaded-image confirm guard (viewportQueue).** `classifyConfirm` gains a
+`loaded: boolean` parameter (default true, so every prior expectation is unchanged):
+`!loaded` with any overlap → `"retry"` (never `"confirm"`; no-overlap `"drop"`
+unchanged), so a not-yet-loaded MangaDex placeholder can't confirm as "being read"
+while still a mid-height skeleton. The shell passes `!(el instanceof
+HTMLImageElement) || (el.complete && el.naturalWidth > 0)` (non-image candidates and
+a runtime without `HTMLImageElement` fail OPEN); the retry rides the existing capped
+backoff, so a slow page confirms within ~2.4 s of its image arriving (an image load
+fires no IntersectionObserver event).
+
+**Contract changes (flagged, all internal — NO `shared/types.ts`, no new messages,
+no manifest, `PROMPT_VERSION` = 2, `CACHE_VERSION` = 2):** (a, rule-4 sanctioned)
+`CacheRecord` gains `rawPage?: PageTranslation` and `snapVersion?: number` (both
+optional/additive; `estimatePageBytes` sizes `rawPage` in); (b, rule-4 sanctioned)
+`PlanInput` swaps `cursor` for `confirmed: readonly boolean[]`. **Beyond the
+sanctioned list (flagged):** the module-local `CacheLookup` `hit` variant now carries
+the whole `record`, so `classifyResnap` receives it without a second IndexedDB read
+— a cache.ts-internal type only. `SNAP_VERSION` introduced at 1 and NOT in the cache
+key.
+
+**Deliberate calls:** offset = 1 snap-px (dilation + offset ≈ 2 snap-px, the tuning
+knob); median + paper snap at luma 245/12; re-snap write-back once per page per
+version, full-page entries only; rescue light-path-only with a ≥ 40 % provider-box
+overlap guard; `fillColor` as the "snapped/tight" proxy for the ellipse gate;
+anchored-window union semantics (backward never buys); `loaded` fail-open for
+non-image/absent-`HTMLImageElement`.
+
+**Tests — 734 green** (+40: `offsetPolygonOutward` + median/paper-snap + seed-rescue
+in `bubbleSnap.test.ts`; `polygonCentroid` + centroid-rect in `shapePath.test.ts`;
+new `BubbleBox.test.ts` jsdom §6/§7 layering + ellipse-gate DOM assertions;
+`classifyResnap` + `estimatePageBytes` rawPage + `CacheLookup.record` in
+`cache.test.ts`; `anchoredWindowAllows` + §8 anchored-window planner + §9
+`classifyConfirm`/shell in `viewportWindow.test.ts`; existing suites updated
+mechanically — bbox+offset containment tolerance, `confirmed` flags for `cursor`,
+per-field FP compares for the centroid rect, `SNAP_VERSION`/`classifyResnap` mock
+exports). Typecheck + ESLint clean; `vite build` clean; `web-ext lint` 0/0/0;
+**`npm run test:e2e` 4/4 green on this machine** (A 8.2 s, B 7.6 s, C 3.7 s, D
+18.6 s) — Scenarios A–D UNMODIFIED, D's budget arithmetic holding under §8 without
+edits.
+
+**Manual verification: NOT run** (needs a live key + MangaDex). The handoff's
+manual list is outstanding — in particular, WITHOUT clearing the cache except where
+noted: re-visit the 2026-07-18 screenshot pages (ink rim gone/≤ ~1 px; no grey patch
+on white bubbles); the offset-box page now snapped (fill covers the original text, no
+oval over the neighbour); the clipped-"Ev" page (earlier bubble's text above the
+neighbour's fill); peek still shows the dashed cue above neighbouring fills; the §3
+workflow check (bump `SNAP_VERSION` locally, reload → new snap output, ZERO provider
+calls); the §8 budget/skim checks (≤ ~6 at open, forward reading tracks ~3 ahead, a
+mid-chapter jump pauses once, a **fast reverse skim buys at most 1–2, not one per
+page**); the §9 slow-load check (placeholders don't confirm until the image appears);
+translate-all still fills the whole chapter.
+
+## Phase 9.2 summary (fill-edge tuning, sprawl guard, narrow-rect text rescue)
+
+Driven by the **ninth live-pass evidence** (2026-07-19 screenshots, MangaDex,
+vertical-CJK series, on the Phase 9.1 build): the user asked whether the fill/text
+spill defects trace to "downgrading the panels" — triaged into three distinct
+causes, only one of them resolution-related, and all three addressed in-session
+(no handoff doc, per the user's direct request). SNAP-side changes are FREE on
+already-paid pages via the 9.1 §3 machinery (`SNAP_VERSION` bump → local re-snap;
+do NOT clear the cache to see them).
+
+**§1 — outward offset 1 → 0.5 (`bubbleSnap.ts`).** The 9.1 §1 stack (dilation 1 +
+offset 1 ≈ 2 snap-px ≈ 4–6 display px) OVERSHOT on these pages: fills visibly
+painted over the drawn ink line — the exact failure mode the 9.1 WHY flagged.
+`SHAPE_OUTWARD_OFFSET_PX = 0.5` (float vertex math, sub-px is fine) lands ≈ 1.5
+snap-px ≈ 3–4 display px: still covers the flood fill's AA halo, kisses the ink
+from inside. Remains the documented tuning knob in both directions.
+
+**§2 — sprawl guard (`bubbleSnap.ts`).** The weird-shaped white spills were
+PARTIAL leaks: a fill escaping through an open/spiky outline into a bounded
+background pocket that stays UNDER both Phase 7.5 leak caps (4× box / 35 % image),
+then gets traced as a "bubble" shape painted over art. New `MIN_BLOB_BBOX_FILL =
+0.3` (+ `SnapOptions.minBlobBboxFill` override): a blob filling < 0.3 of its own
+pixel bounds is rejected at `accept()` time, BEFORE the trace — real interiors are
+bbox-compact (clean ellipse π/4 ≈ 0.79, glyph holes ~0.6, tails/spiky bursts
+~0.4), a sprawl is mostly not-blob. Rejection fails soft exactly like the other
+guards (next seed/grid point → eventually null → provider box, rule 4); the
+rescue path's coverage check sits after it, so a sprawling rescue also rejects.
+**`SNAP_VERSION` → 2** (both §1 and §2 change snap output; NEVER in the cache key,
+ground rule 8 — cached pages re-snap locally, zero provider spend).
+
+**§3 — narrow-rect text rescue (`textFit.ts` + `shapePath.ts` + `BubbleBox.ts`).**
+The character-shredded columns ("is imp ress ive", "Yuanx i Qingli u") are a
+LAYOUT defect, not resolution: a tall vertical-CJK bubble's inscribed rect (often
+the 0.6× floor) is narrower than any horizontal English word, and `word-break:
+break-word` fragments per-letter. New pure `longestWord(text)` (char-count proxy;
+whitespace split) and `widenLabelRect(inner, rectW, rectH)` (full padded-box
+width, vertical placement kept; returns the SAME reference on no-op so the shell
+detects it cheaply). BubbleBox: after the normal fit, probe the longest word's
+UNBROKEN extent at `WORD_PROBE_WIDTH` (100 000 — the shadow measurer breaks words
+at whatever width it's given, so only an effectively-infinite width reveals the
+true extent); if it exceeds the rect, widen + refit. Whole words reaching past the
+shape's edge (still box-clipped) beat fragments inside it. Applies to shaped AND
+ellipse-shrunk rects; the plain padded path is a structural no-op. Deliberate
+call: peek-mode CJK (no whitespace) probes as one long "word" and may widen — 
+harmless (CJK wraps at any width) and WHY-noted on `longestWord`.
+
+**Out of scope (unchanged from 9.1):** true provider bubble-detection misses and
+offset boxes beyond the §4 rescue's reach (untranslated CJK beside a translation
+in the screenshots — provider-side, a future prompt phase); `SNAP_MAX_EDGE` stays
+512 (raising it is the finer-quantization lever, but the ≤512 blur is load-bearing
+for gap-self-closing — revisit only if 0.5 still overshoots); hyphenation.
+
+**Contracts: NONE changed.** No `shared/types.ts`/messages/manifest change;
+`PROMPT_VERSION` 2, `CACHE_VERSION` 2, `SNAP_VERSION` 2 (not in the key).
+
+**Tests: 747 unit (+13)** — sprawl cross fixtures (main + rescue paths, each
+pinned to the guard via `minBlobBboxFill: 0` control runs, π/4-threshold
+regression, determinism) in `bubbleSnap.test.ts`; `widenLabelRect` exact/no-op in
+`shapePath.test.ts`; `longestWord` table in `textFit.test.ts`; widen-vs-keep DOM
+wiring in `BubbleBox.test.ts`. Existing suites pass UNTOUCHED (the offset tests
+pass explicit offsets; the contour test derives its pad from the constant).
+Typecheck + ESLint clean; `vite build` clean; `web-ext lint` 0/0/0; **`npm run
+test:e2e` 4/4 green on this machine, Scenarios A–D UNMODIFIED** (A 7.9 s, B 7.6 s,
+C 3.7 s, D 18.6 s).
+
+**Manual verification: NOT run** (needs a live key + MangaDex). WITHOUT clearing
+the cache: re-visit the 2026-07-19 screenshot pages — (1) fills no longer paint
+over bubble outlines (ink line visible around shaped fills; if a thin rim of ink
+returns instead, raise `SHAPE_OUTWARD_OFFSET_PX` toward 0.75); (2) the weird
+sprawl-shaped white blobs are gone (those bubbles fall back to plain provider-box
+fills — less pretty, never wrong-shaped); (3) narrow vertical bubbles show whole
+words (possibly overhanging the bubble's sides) instead of letter columns; (4) the
+re-snap is free — network panel shows ZERO provider calls while previously-paid
+pages visibly change shape output on reload.
+
+## Phase 9.3 summary (leak confinement, word-integrity text fit, sharper snap)
+
+Driven by the **tenth live-pass evidence** (2026-07-19 screenshots, MangaDex,
+vertical-CJK series, Anthropic `claude-sonnet-5`, on the Phase 9.2 build) and its
+handoff (`docs/PHASE-9.3-HANDOFF.md`). Three fronts; SNAP-side changes are FREE on
+already-paid pages via the 9.1 §3 re-snap machinery (`SNAP_VERSION` → 3; do NOT
+clear the cache to see them).
+
+**§1 — confine the flood fill; reject wall-slams (`bubbleSnap.ts`).** The worst
+remaining fill defect: a bubble fill escapes through the WHITE page margin/gutter
+(thin panel borders alias away at snap resolution) into a NEIGHBOURING panel,
+connects to other white, and paints a giant cross-panel blob whose OUTER contour
+swallows enclosed art (white over dark hair). Every 9.2 guard is blind to it — the
+escaped margin is SOLID white (compactness guard passes) and its area stays under
+the 4×-box / 35 %-image caps. Fix structurally: hard-wall the fill to the provider
+box expanded `SNAP_CONFINE_EXPAND = 0.5` per side (⇒ a 2×-per-axis window,
+intersected with any 7.6 `opts.window` slab), and reject a fill that slams a HARD
+wall. New pure `confineWindow(...)` computes the effective window + which edges are
+hard: an edge is hard iff confinement binds it STRICTLY tighter than the slab (a
+slab edge — a lobe's group cut — is never hard, so 7.6 lobes may touch it) — which
+also implies "strictly inside the bitmap", so a page-edge bubble is safe. `floodFill`
+now records per-side whether a FILLABLE pixel just beyond a window edge blocked it
+(“the fill wanted to keep going”); `accept` rejects when such a hit lands on a hard
+wall, BEFORE the trace, failing soft to the provider box (rule 4). The rescue path
+derives its confinement from the RESCUE-expanded box (the offset bubble it reaches
+for would be walled off by the raw box); the ≥40 % overlap guard still anchors it.
+`SnapOptions.confineExpand` (module-local; `Infinity` disables). `MAX_BLOB_BOX_RATIO`
+/ `MAX_BLOB_IMAGE_FRACTION` / `MIN_BLOB_BBOX_FILL` kept as backstops.
+
+**§1 — three deliberate deviations from the handoff's literal text, all flagged:**
+(a) **Wall-slam is “a fillable pixel BEYOND a hard wall”, not the handoff's bare
+`blob.maxX === winMaxX` touch.** A real bubble whose ink ends exactly at 2× the box
+(the existing glyph-counter fixture: bubble right edge = the wall) touches the wall
+but has NOTHING fillable beyond it — the bare-touch rule wrongly rejected it. The
+“fillable-beyond” refinement is the correct realization of the handoff's own WHY
+(“a fill pressed against the wall wanted to keep going”) and keeps that fixture
+green. (b) **Confinement rounds OUTWARD** (floor min, ceil max — dropped the
+half-open `−1` the `opts.window` slab uses), so a bubble filling up to exactly 2×
+its box is never falsely clipped one pixel short. (c) **`snapAllRegions` is now a
+DUAL pass** (stage 1a un-confined DETECTION → group detect → stage 1b confined
+FINAL results / confined split). WHY: a connected multi-bubble blob (7.6 peanut) is
+filled identically by every member's seed, but that union spans more than 2× either
+member's box — a confined stage-1 would wall each member and reject the slam, so the
+shared blob would never be DETECTED. Detection therefore runs un-confined; the
+FINAL result of a LONE region is the confined snap (where a single-bubble margin
+leak is rejected), and a group is split with confined windowed re-fills (the slab
+binds tighter than the wall, so the lobe touches only the slab — not a hard wall —
+and is accepted). A lone region is byte-identical to a direct `snapRegionToBubble`.
+
+**§2 — word-integrity font cap (`textFit.ts` + `BubbleBox.ts`).** “Pleas e!” /
+“Besi des” / “Yuanx i Qingli u” at LARGE sizes. Root cause: the shadow measurer has
+`word-break: break-word`, so a fragmented word still “fits” — `fitTextSize`
+maximizes px and shreds the longest word, and the 9.2 widen reused that same blind
+predicate. Fix at the root: new pure `maxWordFitPx(word, widthPx, minPx, maxPx,
+probeMeasure)` — the largest integer px at which the longest word renders UNBROKEN,
+or `null` when even `minPx` overflows (binary search, same skeleton as
+`fitTextSize`; empty word → no cap). `resolveFontSize` gains an optional
+`wordCapPx` (content-internal): AUTO mode's effective max becomes
+`min(maxSizePx, wordCapPx)`; FIXED mode IGNORES it (the user chose that size).
+BubbleBox is restructured **cap-then-widen** (was 9.2's widen-eagerly): cap the fit
+at the word-fit px; only when the cap is `null` (the word can't fit the rect at ANY
+legal size) widen to the padded box (9.2's `widenLabelRect`, demoted to fallback)
+and recompute the cap; a still-null cap after widening accepts today's
+floor-and-crop. A word that fits the narrow rect at a smaller size now renders SMALL
+AND WHOLE inside the bubble instead of large and overhanging. `longestWord` /
+`widenLabelRect` / `WORD_PROBE_WIDTH` unchanged.
+
+**§3 — `SNAP_MAX_EDGE` 512 → 768 (`bubbleSnap.ts`).** The ≤512 downsample
+self-closed 1–2 px outline gaps but eroded THIN PANEL BORDERS (the §1 escape route)
+and coarsened edge quantization (1 snap-px ≈ 2–2.5 display px). At 768 borders
+survive (fewer margin escapes at the source) and quantization drops to ≈ 1.5–1.7
+display px; safe NOW because §1's wall bounds any new outline-gap leak the weaker
+blur no longer self-closes. Note the interaction: `SHAPE_OUTWARD_OFFSET_PX` + the
+1-px dilation are in SNAP-px, so the outward reach SHRINKS in display px at 768 —
+the desired direction after the 9.2 overshoot fix; it stays the rim knob. Snap cost
+grows ≈ 2.25× in pixels, still one trivial per-region pass. `SNAP_MIN_SHORT_EDGE`
+(256) unchanged.
+
+**Sanctioned test edits (flagged):** (1) the 9.2 sprawl-guard **rescue** control
+(`minBlobBboxFill: 0`) now also passes `confineExpand: Infinity` — the cross slams
+the §1 wall before the ratio is consulted, so isolating the sprawl guard needs
+confinement off; both variants asserted. (The two MAIN sprawl controls pass
+UNCHANGED — that box's 3×-rescue window clamps to the whole bitmap, so its rescue
+still accepts with the guard off.) (2) The “rescues an OFFSET provider box” fixture
+was **replaced**: the old one relied on a lucky MAIN-loop seed (its title's “nine
+seeds all miss” was inaccurate) and its bubble overflowed 2× the box while covering
+it only ~32 %, so §1 walls the main fill and the ≥40 % rescue can't anchor it — a
+genuine §1 behaviour change (that offset box now shows a loose provider box, rule
+4). It is split into a POSITIVE test (an offset bubble whose ellipse FITS the
+rescue's expanded window and covers ≥40 % — still recovered by the rescue under
+confinement) and a NEGATIVE test pinning the new fall-back-to-provider-box behaviour
+(with `confineExpand: Infinity` proving the wall, not another guard, rejects it).
+The 9.2 “Extraordinary” BubbleBox fixture passes UNCHANGED (it still widens; its
+font size is now additionally capped but was never asserted).
+
+**Contracts (flagged, all internal — NO `shared/types.ts`, no new messages, no
+manifest change):** `SnapOptions.confineExpand?: number` (module-local),
+`resolveFontSize`'s optional `wordCapPx` (content-internal). `SNAP_VERSION` → 3
+(covers §1 + §3; NEVER in `buildCacheKey`, ground rule 8). `PROMPT_VERSION` = 2,
+`CACHE_VERSION` = 2 untouched.
+
+**Deliberate calls:** confinement 0.5 (2× box, matching the pre-existing 4×-area
+growth bound); wall-slam via fillable-beyond a hard wall, in `accept`;
+outward-rounded confinement window; dual-pass detection (un-confined) vs. final
+(confined); rescue confinement from the expanded box; cap-then-widen (small-and-whole
+over large-and-overhanging); 512 → 768 (borders over gap-self-closing, quantization
+tightens, §1 bounds the blast radius); offset boxes beyond 2× now fail soft to the
+provider box.
+
+**Tests: 763 unit (+16)** — §1 confinement (margin-leak reject + Infinity-accept
+control, byte-identical-in-window, page-edge-not-hard, determinism, redesigned
+offset-rescue positive/negative, sprawl-rescue control) in `bubbleSnap.test.ts`;
+`maxWordFitPx` table + `resolveFontSize` cap (auto honours, fixed ignores, min
+order) in `textFit.test.ts`; cap-then-widen DOM wiring (caps-not-widens vs
+widens-and-caps) in `BubbleBox.test.ts`; `computeSnapSize` derives its expectation
+from `SNAP_MAX_EDGE` (no hard-coded 512). All other suites pass UNCHANGED (the 7.6
+peanut/group + rescue-miss + swallow-guard fixtures hold under the dual pass).
+Typecheck + ESLint clean; `vite build` clean; `web-ext lint` 0/0/0; **`npm run
+test:e2e` 4/4 green on this machine, Scenarios A–D UNMODIFIED** (A 9.0 s, B 7.6 s,
+C 3.6 s, D 18.5 s).
+
+**Manual verification: NOT run** (needs a live key + MangaDex). WITHOUT clearing
+the cache (§1/§3 arrive via re-snap): (1) background console shows `re-snapped
+cache hit … (snapVersion → 3)` on previously-paid pages, ZERO provider calls; (2)
+the cross-panel blob pages — no fill crosses a panel border/gutter (worst case a
+plain loose box); (3) the “Pleas e!”/“Besi des” pages — whole words at a smaller
+size (or, where impossible, the widened rect), NO letter columns; (4) fill edges
+tighter to the ink at 768, no ink rims (if rims return, the knob is
+`SHAPE_OUTWARD_OFFSET_PX`, not a §3 revert); (5) spend unchanged (§8/§9 untouched).
+Watch for offset boxes that used to snap now showing a loose box — the §1 tradeoff.

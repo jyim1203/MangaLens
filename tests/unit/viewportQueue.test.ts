@@ -21,7 +21,24 @@ import type { PageTranslation, ProviderErrorKind } from "../../src/shared/types"
 
 const mockSend = vi.mocked(sendToBackground);
 
-const base = { count: 5, sentPriority: new Map<number, number>(), prefetchAhead: 3 };
+// Phase 9.1 §8: ALL pages confirmed keeps the pre-Phase-9 plans byte-identical
+// (every index sits in some anchor's forward window) — the anchored-window cases
+// themselves live in viewportWindow.test.ts.
+const base = {
+  count: 5,
+  sentPriority: new Map<number, number>(),
+  prefetchAhead: 3,
+  confirmed: [true, true, true, true, true],
+};
+
+/** Phase 9 §2 shell seams shared by every suite: a 0 ms confirm delay and a
+ *  fixed viewport, so a visible fire + one `tick()` completes the confirmation
+ *  and the send. Elements carry an always-visible client rect. */
+const CONFIRM_SEAMS = {
+  confirmDelayMs: 0,
+  getViewport: () => ({ w: 1366, h: 768 }),
+};
+const VISIBLE_RECT = { top: 0, bottom: 600, left: 0, right: 800, height: 600 };
 
 describe("viewportQueue — planEnqueues (§7.5 priority planner + §2 upgrades)", () => {
   it("visible tier enqueues the page at priority 0 plus N+1..N+3 prefetch at priority 2", () => {
@@ -147,7 +164,7 @@ function fakeOverlay(): OverlaySink {
 
 const CAND: Candidate = {
   id: "c1",
-  el: {} as unknown as Element,
+  el: { getBoundingClientRect: () => VISIBLE_RECT } as unknown as Element,
   url: "https://x/page.jpg",
 };
 
@@ -168,7 +185,10 @@ describe("viewportQueue — requestAll (F8 translate-all)", () => {
 
   /** A fake element whose compareDocumentPosition keeps registration order. */
   const fakeEl = (): Element =>
-    ({ compareDocumentPosition: () => 2 }) as unknown as Element;
+    ({
+      compareDocumentPosition: () => 2,
+      getBoundingClientRect: () => VISIBLE_RECT,
+    }) as unknown as Element;
 
   const candA: Candidate = { id: "a", el: fakeEl(), url: "https://x/a.jpg" };
   const candB: Candidate = { id: "b", el: fakeEl(), url: "https://x/b.jpg" };
@@ -180,19 +200,21 @@ describe("viewportQueue — requestAll (F8 translate-all)", () => {
       autoEnqueue: true,
       hydrate: false,
       makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
       createObserver: (cb, options) =>
         new FakeIO(cb, options) as unknown as IntersectionObserver,
     });
   }
 
-  it("dry run counts unrequested candidates without sending anything", () => {
+  it("dry run counts unrequested candidates without sending anything", async () => {
     mockSend.mockReturnValue(new Promise<never>(() => {}));
     const queue = makeQueue(fakeOverlay());
     queue.register(candA);
     queue.register(candB);
 
-    // A becomes visible → requested; B untouched.
+    // A becomes visible → confirmed (§2) → requested; B untouched.
     FakeIO.instances[0]!.fire(candA.el, true);
+    await tick();
     expect(mockSend).toHaveBeenCalledTimes(1);
 
     expect(queue.requestAll(true)).toBe(1);
@@ -201,13 +223,14 @@ describe("viewportQueue — requestAll (F8 translate-all)", () => {
     queue.stop();
   });
 
-  it("real run sends the remaining candidates at the prefetch/all priority", () => {
+  it("real run sends the remaining candidates at the prefetch/all priority", async () => {
     mockSend.mockReturnValue(new Promise<never>(() => {}));
     const overlay = fakeOverlay();
     const queue = makeQueue(overlay);
     queue.register(candA);
     queue.register(candB);
     FakeIO.instances[0]!.fire(candA.el, true); // A requested at priority 0
+    await tick(); // §2: confirmation completes the send
 
     expect(queue.requestAll()).toBe(1);
     expect(mockSend).toHaveBeenCalledTimes(2);
@@ -239,6 +262,7 @@ describe("viewportQueue — onProviderError toast hook (Phase 7 item 6)", () => 
       autoEnqueue: true,
       hydrate: false,
       makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
       onProviderError,
       createObserver: (cb, options) =>
         new FakeIO(cb, options) as unknown as IntersectionObserver,
@@ -291,6 +315,7 @@ describe("viewportQueue — retry path re-observes a static image (item 6)", () 
       autoEnqueue: true,
       hydrate: false,
       makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
       requestTimeoutMs,
       createObserver: (cb, options) =>
         new FakeIO(cb, options) as unknown as IntersectionObserver,
@@ -306,7 +331,8 @@ describe("viewportQueue — retry path re-observes a static image (item 6)", () 
     queue.register(CAND);
     const [visible, near] = FakeIO.instances;
 
-    visible!.fire(CAND.el, true); // enters the viewport → sends at priority 0
+    visible!.fire(CAND.el, true); // enters the viewport → confirmed → priority 0
+    await tick();
     expect(mockSend).toHaveBeenCalledTimes(1);
     expect(mockSend.mock.calls[0]![0]).toBe("translatePage");
 
@@ -335,9 +361,8 @@ describe("viewportQueue — retry path re-observes a static image (item 6)", () 
     const [visible] = FakeIO.instances;
 
     visible!.fire(CAND.el, true);
+    await tick(); // §2 confirmation + the aborted result are both handled here
     expect(mockSend).toHaveBeenCalledTimes(1);
-
-    await tick(); // let the aborted result be handled
 
     expect(overlay.clear).toHaveBeenCalled();
     expect(visible!.unobserveLog).toContain(CAND.el); // re-observed
@@ -357,12 +382,12 @@ describe("viewportQueue — blob bytes dispatch (item 1)", () => {
 
   const BLOB: Candidate = {
     id: "b1",
-    el: {} as unknown as Element,
+    el: { getBoundingClientRect: () => VISIBLE_RECT } as unknown as Element,
     url: "blob:https://reader.example.com/9f8c",
   };
   const HTTP: Candidate = {
     id: "h1",
-    el: {} as unknown as Element,
+    el: { getBoundingClientRect: () => VISIBLE_RECT } as unknown as Element,
     url: "https://reader.example.com/page.jpg",
   };
 
@@ -376,6 +401,7 @@ describe("viewportQueue — blob bytes dispatch (item 1)", () => {
       autoEnqueue: true,
       hydrate: false,
       makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
       acquireBytes,
       createObserver: (cb, options) =>
         new FakeIO(cb, options) as unknown as IntersectionObserver,
@@ -451,7 +477,10 @@ describe("viewportQueue — pause/resume (Phase 7.4 item 4)", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   const fakeEl = (): Element =>
-    ({ compareDocumentPosition: () => 2 }) as unknown as Element;
+    ({
+      compareDocumentPosition: () => 2,
+      getBoundingClientRect: () => VISIBLE_RECT,
+    }) as unknown as Element;
   const candA: Candidate = { id: "a", el: fakeEl(), url: "https://x/a.jpg" };
   const BLOB: Candidate = { id: "b", el: fakeEl(), url: "blob:https://x/9f8c" };
 
@@ -465,6 +494,7 @@ describe("viewportQueue — pause/resume (Phase 7.4 item 4)", () => {
       autoEnqueue: true,
       hydrate: false,
       makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
       acquireBytes,
       createObserver: (cb, options) =>
         new FakeIO(cb, options) as unknown as IntersectionObserver,
@@ -480,6 +510,7 @@ describe("viewportQueue — pause/resume (Phase 7.4 item 4)", () => {
 
     queue.register(candA);
     FakeIO.instances[0]!.fire(candA.el, true);
+    await tick(); // §2 confirmation runs; the plan then hits the pause gate
 
     expect(mockSend).not.toHaveBeenCalled();
     expect(overlay.setPending).not.toHaveBeenCalled();
@@ -603,7 +634,10 @@ describe("viewportQueue — cache-only hydrate (Phase 7.6)", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   const fakeEl = (): Element =>
-    ({ compareDocumentPosition: () => 2 }) as unknown as Element;
+    ({
+      compareDocumentPosition: () => 2,
+      getBoundingClientRect: () => VISIBLE_RECT,
+    }) as unknown as Element;
   const httpCand = (id: string): Candidate => ({ id, el: fakeEl(), url: `https://x/${id}.jpg` });
   const BLOB: Candidate = { id: "b", el: fakeEl(), url: "blob:https://x/9f8c" };
   const PAGE = { imageHash: "h", regions: [] } as unknown as PageTranslation;
@@ -620,6 +654,7 @@ describe("viewportQueue — cache-only hydrate (Phase 7.6)", () => {
       autoEnqueue: false, // hydrate is the non-auto complement
       hydrate,
       makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
       acquireBytes,
       requestTimeoutMs,
       createObserver: (cb, options) =>
@@ -834,7 +869,10 @@ describe("viewportQueue — §3 shell (budget + setPrefetchAhead)", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   const fakeEl = (): Element =>
-    ({ compareDocumentPosition: () => 2 }) as unknown as Element;
+    ({
+      compareDocumentPosition: () => 2,
+      getBoundingClientRect: () => VISIBLE_RECT,
+    }) as unknown as Element;
   const cand = (id: string): Candidate => ({ id, el: fakeEl(), url: `https://x/${id}.jpg` });
 
   function makeQueue(overlay: OverlaySink, prefetchAhead: number, requestTimeoutMs?: number) {
@@ -845,6 +883,7 @@ describe("viewportQueue — §3 shell (budget + setPrefetchAhead)", () => {
       autoEnqueue: true,
       hydrate: false,
       makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
       requestTimeoutMs,
       createObserver: (cb, options) =>
         new FakeIO(cb, options) as unknown as IntersectionObserver,
@@ -890,42 +929,58 @@ describe("viewportQueue — priority upgrade shell (§2)", () => {
   beforeEach(() => {
     FakeIO.instances = [];
     mockSend.mockReset();
+    vi.stubGlobal("Node", { DOCUMENT_POSITION_FOLLOWING: 4 });
   });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const fakeEl = (): Element =>
+    ({
+      compareDocumentPosition: () => 2,
+      getBoundingClientRect: () => VISIBLE_RECT,
+    }) as unknown as Element;
 
   function makeQueue(overlay: OverlaySink) {
     return createViewportQueue({
       overlay,
-      prefetchAhead: 0,
+      prefetchAhead: 1,
       autoEnqueue: true,
       hydrate: false,
       makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
       createObserver: (cb, options) =>
         new FakeIO(cb, options) as unknown as IntersectionObserver,
     });
   }
 
-  it("a near→visible transition on a requested candidate sends reprioritizeTranslation (not a re-send)", async () => {
+  it("tier improvements on a requested candidate send reprioritizeTranslation (not a re-send)", async () => {
     mockSend.mockReturnValue(new Promise<never>(() => {})); // translatePage hangs (stays in-flight)
+    const candA: Candidate = { id: "a", el: fakeEl(), url: "https://x/a.jpg" };
+    const candB: Candidate = { id: "b", el: fakeEl(), url: "https://x/b.jpg" };
     const queue = makeQueue(fakeOverlay());
-    queue.register(CAND);
+    queue.register(candA);
+    queue.register(candB);
     const [visible, near] = FakeIO.instances;
 
-    // First it enters at the near tier → sent at priority 1.
-    near!.fire(CAND.el, true);
+    // A confirms visible → A sent at 0 and B prefetched at 2 (inside the window).
+    visible!.fire(candA.el, true);
     await tick();
-    const firstCall = mockSend.mock.calls[0]!;
-    expect(firstCall[0]).toBe("translatePage");
-    expect((firstCall[1] as { priority: number }).priority).toBe(1);
+    const sent = mockSend.mock.calls.filter((c) => c[0] === "translatePage");
+    expect(sent).toHaveLength(2);
+    expect((sent[1]![1] as { priority: number }).priority).toBe(2);
 
-    // Now it becomes visible → an UPGRADE, not a second translatePage.
-    visible!.fire(CAND.el, true);
+    // B enters the near tier → an UPGRADE (2 → 1), not a second translatePage.
+    near!.fire(candB.el, true);
     await tick();
+    let repro = mockSend.mock.calls.filter((c) => c[0] === "reprioritizeTranslation");
+    expect(repro).toHaveLength(1);
+    expect(repro[0]![1]).toEqual({ requestId: "rq", priority: 1 });
 
-    const reproCall = mockSend.mock.calls.find((c) => c[0] === "reprioritizeTranslation");
-    expect(reproCall).toBeDefined();
-    expect(reproCall![1]).toEqual({ requestId: "rq", priority: 0 });
-    // No second translatePage was sent for the same candidate.
-    expect(mockSend.mock.calls.filter((c) => c[0] === "translatePage")).toHaveLength(1);
+    // B becomes visible → a further upgrade to 0, still no re-send.
+    visible!.fire(candB.el, true);
+    await tick();
+    repro = mockSend.mock.calls.filter((c) => c[0] === "reprioritizeTranslation");
+    expect(repro[repro.length - 1]![1]).toEqual({ requestId: "rq", priority: 0 });
+    expect(mockSend.mock.calls.filter((c) => c[0] === "translatePage")).toHaveLength(2);
     queue.stop();
   });
 });
@@ -939,7 +994,10 @@ describe("viewportQueue — hydrateAll (Phase 8 §0 Show cached button)", () => 
   afterEach(() => vi.unstubAllGlobals());
 
   const fakeEl = (): Element =>
-    ({ compareDocumentPosition: () => 2 }) as unknown as Element;
+    ({
+      compareDocumentPosition: () => 2,
+      getBoundingClientRect: () => VISIBLE_RECT,
+    }) as unknown as Element;
   const httpCand = (id: string): Candidate => ({ id, el: fakeEl(), url: `https://x/${id}.jpg` });
   const PAGE = { imageHash: "h", regions: [] } as unknown as PageTranslation;
 
@@ -952,6 +1010,7 @@ describe("viewportQueue — hydrateAll (Phase 8 §0 Show cached button)", () => 
       autoEnqueue,
       hydrate: false, // the button ignores this flag
       makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
       requestTimeoutMs,
       createObserver: (cb, options) =>
         new FakeIO(cb, options) as unknown as IntersectionObserver,
@@ -1052,7 +1111,10 @@ describe("viewportQueue — autoEnqueue=false (per-site opt-in, item 3)", () => 
   afterEach(() => vi.unstubAllGlobals());
 
   const fakeEl = (): Element =>
-    ({ compareDocumentPosition: () => 2 }) as unknown as Element;
+    ({
+      compareDocumentPosition: () => 2,
+      getBoundingClientRect: () => VISIBLE_RECT,
+    }) as unknown as Element;
   const candA: Candidate = { id: "a", el: fakeEl(), url: "https://x/a.jpg" };
   const candB: Candidate = { id: "b", el: fakeEl(), url: "https://x/b.jpg" };
 
@@ -1063,6 +1125,7 @@ describe("viewportQueue — autoEnqueue=false (per-site opt-in, item 3)", () => 
       autoEnqueue: false,
       hydrate: false,
       makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
       requestTimeoutMs,
       createObserver: (cb, options) =>
         new FakeIO(cb, options) as unknown as IntersectionObserver,

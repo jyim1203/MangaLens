@@ -63,6 +63,23 @@ export interface CacheRecord {
   imageHash: string;
   /** The translation, or `null` for a negative (cached-failure) entry. */
   page: PageTranslation | null;
+  /**
+   * Phase 9.1 §3 (sanctioned rule-4 contract change, both fields optional +
+   * additive): the merged provider regions BEFORE `snapPageRegions` ran, kept so
+   * a later snap-logic change can be replayed LOCALLY at hit time for ZERO
+   * provider spend. Written on every new positive entry; absent on pre-9.1
+   * entries (they serve as-is forever). Roughly DOUBLES the entry's size — the
+   * LRU cap absorbs it.
+   */
+  rawPage?: PageTranslation;
+  /**
+   * Phase 9.1 §3: the {@link import("./bubbleSnap").SNAP_VERSION} the stored
+   * `page` was snapped at. When it lags the current SNAP_VERSION and `rawPage` is
+   * present, the cache-hit path re-snaps once and writes the record back. NEVER
+   * folded into the cache KEY (ground rule 8) — a key change would re-pay the
+   * provider for every page, the exact cost §3 eliminates.
+   */
+  snapVersion?: number;
   /** Negative entries only: the failure kind to re-surface. */
   errorKind?: ProviderErrorKind;
   /** Negative entries only: the human-readable failure message. */
@@ -82,7 +99,7 @@ export interface CacheRecord {
 /** The typed result of a cache read, produced by {@link classifyCacheLookup}. */
 export type CacheLookup =
   | { status: "miss" }
-  | { status: "hit"; page: PageTranslation }
+  | { status: "hit"; page: PageTranslation; record: CacheRecord }
   | { status: "negative"; errorKind: ProviderErrorKind; message: string }
   | { status: "expired" };
 
@@ -141,17 +158,24 @@ export function buildCacheKey(parts: CacheKeyParts): string {
 }
 
 /**
- * Estimate the stored size of a page translation in bytes, used to keep the
- * store under {@link import("../shared/settings").Settings.cacheCapMb}. This is
- * an approximation (serialized JSON UTF-8 length + fixed record overhead), which
- * is all the soft size cap needs. A `null` page (negative entry) is tiny.
+ * Estimate the stored size of a cache record in bytes, used to keep the store
+ * under {@link import("../shared/settings").Settings.cacheCapMb}. This is an
+ * approximation (serialized JSON UTF-8 length + fixed record overhead), which is
+ * all the soft size cap needs. A `null` page (negative entry) is tiny.
  *
  * @param page the translation to size, or `null` for a negative entry.
+ * @param rawPage Phase 9.1 §3: the retained raw provider regions, if any — sized
+ *   in too (a positive entry with `rawPage` roughly doubles; the LRU cap handles
+ *   it). Omitted / `null` adds nothing.
  * @returns approximate bytes the record occupies.
  */
-export function estimatePageBytes(page: PageTranslation | null): number {
+export function estimatePageBytes(
+  page: PageTranslation | null,
+  rawPage?: PageTranslation | null,
+): number {
   const body = page ? new TextEncoder().encode(JSON.stringify(page)).length : 0;
-  return body + RECORD_OVERHEAD_BYTES;
+  const raw = rawPage ? new TextEncoder().encode(JSON.stringify(rawPage)).length : 0;
+  return body + raw + RECORD_OVERHEAD_BYTES;
 }
 
 /**
@@ -170,12 +194,37 @@ export function classifyCacheLookup(
   if (typeof record.expiresAt === "number" && record.expiresAt <= now) {
     return { status: "expired" };
   }
-  if (record.page) return { status: "hit", page: record.page };
+  // Phase 9.1 §3: a hit carries the whole record so the caller can decide whether
+  // to re-snap it locally (see {@link classifyResnap}) without a second read.
+  if (record.page) return { status: "hit", page: record.page, record };
   return {
     status: "negative",
     errorKind: record.errorKind ?? "unknown",
     message: record.message ?? "cached failure",
   };
+}
+
+/**
+ * Phase 9.1 §3 decision: should a cache-hit record be re-snapped locally before
+ * serving? True IFF it is a POSITIVE entry (`page` present) whose stored
+ * `snapVersion` lags `snapVersion`, it retained its `rawPage` (the pre-snap
+ * provider regions), AND the request carries the image bytes needed to re-run the
+ * fill. Pre-9.1 entries (no `rawPage`/`snapVersion`), version-matched entries, and
+ * byte-less requests all classify false → serve the stored page as-is (rule 6).
+ * Pure — the browser-only re-snap + write-back lives in `translateHandlers`.
+ *
+ * @param record the stored record, or `undefined` when the key was absent.
+ * @param snapVersion the current {@link import("./bubbleSnap").SNAP_VERSION}.
+ * @param hasBytes whether the incoming request carries decodable image bytes.
+ */
+export function classifyResnap(
+  record: CacheRecord | undefined,
+  snapVersion: number,
+  hasBytes: boolean,
+): boolean {
+  if (!record || !record.page || !record.rawPage) return false;
+  if (!hasBytes) return false;
+  return record.snapVersion !== snapVersion;
 }
 
 /**
@@ -381,15 +430,22 @@ async function deleteEntry(
  * a write error is logged and swallowed (the translation is already in hand).
  *
  * @param key composite key from {@link buildCacheKey}.
- * @param page the translation to cache.
+ * @param page the translation to cache (the SNAPPED page for a positive entry).
  * @param capBytes the store byte budget (`Settings.cacheCapMb` × 2²⁰).
  * @param origin hostname the image was translated for (per-site clear), if known.
+ * @param rawPage Phase 9.1 §3: the pre-snap provider regions, kept so a later
+ *   snap-logic change replays locally for zero spend. Omit to store none.
+ * @param snapVersion Phase 9.1 §3: the {@link import("./bubbleSnap").SNAP_VERSION}
+ *   `page` was snapped at (stamped alongside `rawPage`; a re-snap write-back
+ *   passes the bumped value).
  */
 export async function cacheStorePage(
   key: string,
   page: PageTranslation,
   capBytes: number,
   origin?: string,
+  rawPage?: PageTranslation,
+  snapVersion?: number,
 ): Promise<void> {
   try {
     const now = Date.now();
@@ -397,7 +453,9 @@ export async function cacheStorePage(
       key,
       imageHash: page.imageHash,
       page,
-      bytes: estimatePageBytes(page),
+      ...(rawPage ? { rawPage } : {}),
+      ...(snapVersion !== undefined ? { snapVersion } : {}),
+      bytes: estimatePageBytes(page, rawPage),
       origin,
       createdAt: now,
       lastAccess: now,

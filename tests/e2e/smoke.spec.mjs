@@ -1,7 +1,9 @@
 /**
- * e2e smoke suite (Phase 8 §6) — the two Architecture acceptance criteria plus
- * the batching scenario, driven against a real Firefox with the built extension
- * temporarily installed and the dependency-free mock provider (mockProvider.mjs).
+ * e2e smoke suite (Phase 8 §6, Phase 9 §6) — the two Architecture acceptance
+ * criteria, the batching scenario, and the Phase 9 auto-visibility budget
+ * regression (Scenario D — the 2026-07-17 whole-chapter burst), driven against
+ * a real Firefox with the built extension temporarily installed and the
+ * dependency-free mock provider (mockProvider.mjs).
  *
  * DRIVER: selenium-webdriver + geckodriver. `installAddon(path, temporary=true)`
  * is first-class in geckodriver, and the internal UUID is PINNED via the
@@ -181,6 +183,35 @@ async function translateAllOnChapter() {
   return res;
 }
 
+/**
+ * Clear the extension's translation cache from an extension-origin page (the
+ * current tab must already be on one — seedSettings leaves the driver on the
+ * options page). WHY store.clear() over deleteDatabase: a normal transaction is
+ * NOT blocked by the background's open connection, so it can't hang the script.
+ */
+async function clearTranslationCache() {
+  await driver.executeAsyncScript(
+    `const done = arguments[0];
+     (async () => {
+       const dbs = (await indexedDB.databases())
+         .filter((d) => d.name && d.name.startsWith('mangalens-cache'));
+       for (const info of dbs) {
+         await new Promise((resolve) => {
+           const req = indexedDB.open(info.name);
+           req.onsuccess = () => {
+             const db = req.result;
+             if (!db.objectStoreNames.contains('translations')) { db.close(); resolve(); return; }
+             const tx = db.transaction('translations', 'readwrite');
+             tx.objectStore('translations').clear();
+             tx.oncomplete = tx.onerror = tx.onabort = () => { db.close(); resolve(); };
+           };
+           req.onerror = req.onblocked = () => resolve();
+         });
+       }
+     })().then(() => done(), () => done());`,
+  );
+}
+
 before(async () => {
   // Lazy import so the file loads (and `node --test` reports a clear skip) even
   // when the optional selenium deps aren't installed.
@@ -260,29 +291,8 @@ test("Scenario B — translate-all with pagesPerRequest=3 issues ceil-batched re
 
   // Force real requests: clear the cache Scenario A populated (batch and single
   // results share the SAME composite key, so those pages would otherwise all
-  // cache-hit and the mock would see zero requests). WHY store.clear() over
-  // deleteDatabase: a normal transaction is NOT blocked by the background's open
-  // connection, so it can't hang the async script.
-  await driver.executeAsyncScript(
-    `const done = arguments[0];
-     (async () => {
-       const dbs = (await indexedDB.databases())
-         .filter((d) => d.name && d.name.startsWith('mangalens-cache'));
-       for (const info of dbs) {
-         await new Promise((resolve) => {
-           const req = indexedDB.open(info.name);
-           req.onsuccess = () => {
-             const db = req.result;
-             if (!db.objectStoreNames.contains('translations')) { db.close(); resolve(); return; }
-             const tx = db.transaction('translations', 'readwrite');
-             tx.objectStore('translations').clear();
-             tx.oncomplete = tx.onerror = tx.onabort = () => { db.close(); resolve(); };
-           };
-           req.onerror = req.onblocked = () => resolve();
-         });
-       }
-     })().then(() => done(), () => done());`,
-  );
+  // cache-hit and the mock would see zero requests).
+  await clearTranslationCache();
   await resetMockStats();
 
   // Navigate, let the content script scan + register all 10 candidates (nothing
@@ -332,4 +342,51 @@ test("Scenario C — no overlay-host leak after 100 SPA-style page swaps", async
   // The mock shows cache hits after cycle 1, not 100× duplicate spend.
   const stats = await mockStats();
   assert.ok(stats.chatRequests < PAGE_COUNT * 5, `too much provider traffic: ${stats.chatRequests}`);
+});
+
+test("Scenario D — auto-visibility budget: opening a chapter never bursts the whole chapter (Phase 9 §6)", async () => {
+  // The exact 2026-07-17 failure as a permanent assertion: an auto-opted reader
+  // opened at the top must send only the reading window, not all 10 pages.
+  // Settings persist across scenarios, so pin prefetchAhead back to the default
+  // 3 (Scenario C raised it to PAGE_COUNT, which would legally widen the budget).
+  await seedSettings({ pagesPerRequest: 1, prefetchAhead: 3 });
+  // Deterministic viewport for the budget arithmetic below.
+  await driver.manage().window().setRect({ width: 1366, height: 768 });
+  // Fresh spend: Scenarios A–C filled the cache, and a cache hit makes zero
+  // provider requests — both bounds need real traffic.
+  await clearTranslationCache();
+  await resetMockStats();
+
+  // Open the chapter and STAY AT THE TOP — no translate-all, no scrolling.
+  // ~8 s covers scan + the ~300 ms visibility confirmation + sends + the 2 s
+  // mock latency, plus slack.
+  await driver.get(`${mock.baseUrl}/chapter.html`);
+  await new Promise((r) => setTimeout(r, 8000));
+  const stats = await mockStats();
+  // Budget arithmetic at 1366×768 over 800×1200 pages, cursor at page 1:
+  //   visible: page 1 (bottom edge 1208 > 768 → only page 1 intersects)
+  //   near (one-viewport rootMargin → 1536 px): page 2
+  //   prefetch: pages 2–4 (cursor 0 + prefetchAhead 3)
+  //   → union = pages 1–4 ⇒ ≤ 4 requests; bound 6 leaves slack for a taller
+  //   viewport (1–2 visible + 1–2 near + 3 prefetch). ≥ 1 proves real spend.
+  assert.ok(stats.chatRequests >= 1, `expected ≥ 1 auto request, got ${stats.chatRequests}`);
+  assert.ok(
+    stats.chatRequests <= 6,
+    `auto-open burst: ${stats.chatRequests} provider requests at the top of the chapter (budget ≤ 6) — the reading window failed`,
+  );
+
+  // Scroll to the bottom in steps with settle pauses (each pause > the 300 ms
+  // confirmation delay): the window slides with the confirmed reading position
+  // and every page eventually paints — nothing wedges suppressed.
+  const totalHeight = await driver.executeScript("return document.body.scrollHeight;");
+  for (let y = 600; y < totalHeight; y += 600) {
+    await driver.executeScript(`window.scrollTo(0, ${y});`);
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  await driver.executeScript("window.scrollTo(0, document.body.scrollHeight);");
+  const painted = await waitForCount(paintedOverlayCount, PAGE_COUNT, 30000);
+  assert.ok(
+    painted !== Infinity,
+    `only ${await paintedOverlayCount()} of ${PAGE_COUNT} pages painted after scrolling to the bottom — a page wedged outside the window`,
+  );
 });

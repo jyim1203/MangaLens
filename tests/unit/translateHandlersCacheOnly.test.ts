@@ -84,7 +84,12 @@ describe("translateHandlers — cacheOnly probe (Phase 7.6 hydrate)", () => {
   });
 
   it("hit → returns the cached page (no provider call)", async () => {
-    mockLookup.mockResolvedValue({ status: "hit", page: PAGE });
+    // A pre-9.1-style record (no rawPage) → classifyResnap is false → served as-is.
+    mockLookup.mockResolvedValue({
+      status: "hit",
+      page: PAGE,
+      record: { key: "k", imageHash: PAGE.imageHash, page: PAGE, bytes: 1, createdAt: 0, lastAccess: 0 },
+    });
     const handlers = createTranslateHandlers();
 
     const result = await handlers.translatePage!(

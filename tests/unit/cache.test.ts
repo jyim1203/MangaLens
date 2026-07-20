@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildCacheKey,
   classifyCacheLookup,
+  classifyResnap,
   estimatePageBytes,
   planLruEviction,
   totalAfterPut,
@@ -116,6 +117,58 @@ describe("cache — estimatePageBytes", () => {
     // Same character count, but CJK is 3 bytes/char in UTF-8 → larger estimate.
     expect(cjk).toBeGreaterThan(ascii);
   });
+
+  it("§3: including a rawPage grows the estimate (the retained raw regions)", () => {
+    const p = page({
+      regions: [
+        { bbox: { x: 0, y: 0, w: 0.1, h: 0.1 }, original: "日本語テキスト", translated: "text", isSfx: false },
+      ],
+    });
+    const withoutRaw = estimatePageBytes(p);
+    const withRaw = estimatePageBytes(p, p);
+    expect(withRaw).toBeGreaterThan(withoutRaw);
+    expect(estimatePageBytes(p, null)).toBe(withoutRaw); // null rawPage adds nothing
+  });
+});
+
+describe("cache — classifyResnap (§3 local re-snap decision)", () => {
+  const P = page();
+  const rec = (o: Partial<CacheRecord>): CacheRecord => ({
+    key: "k",
+    imageHash: "h",
+    page: P,
+    bytes: 10,
+    createdAt: 0,
+    lastAccess: 0,
+    ...o,
+  });
+
+  it("false for a miss (no record)", () => {
+    expect(classifyResnap(undefined, 1, true)).toBe(false);
+  });
+
+  it("false for a negative entry (no page)", () => {
+    expect(classifyResnap(rec({ page: null, rawPage: P, snapVersion: 0 }), 1, true)).toBe(false);
+  });
+
+  it("false when the entry kept no rawPage (pre-9.1) — serve as-is forever", () => {
+    expect(classifyResnap(rec({ snapVersion: 0 }), 1, true)).toBe(false);
+    expect(classifyResnap(rec({}), 1, true)).toBe(false); // no snapVersion either
+  });
+
+  it("false when the request carries no bytes", () => {
+    expect(classifyResnap(rec({ rawPage: P, snapVersion: 0 }), 1, false)).toBe(false);
+  });
+
+  it("false when the stored snapVersion already matches (up to date)", () => {
+    expect(classifyResnap(rec({ rawPage: P, snapVersion: 1 }), 1, true)).toBe(false);
+  });
+
+  it("true only on a version mismatch WITH rawPage + bytes", () => {
+    expect(classifyResnap(rec({ rawPage: P, snapVersion: 0 }), 1, true)).toBe(true);
+    // A pre-9.1 write-back path: snapVersion undefined ≠ 1, with rawPage + bytes.
+    expect(classifyResnap(rec({ rawPage: P }), 1, true)).toBe(true);
+  });
 });
 
 describe("cache — classifyCacheLookup", () => {
@@ -137,10 +190,11 @@ describe("cache — classifyCacheLookup", () => {
     expect(classifyCacheLookup(undefined, now)).toEqual({ status: "miss" });
   });
 
-  it("a positive record → hit carrying the page", () => {
+  it("a positive record → hit carrying the page AND the whole record (§3 re-snap)", () => {
     const p = page();
-    const result = classifyCacheLookup(record({ page: p }), now);
-    expect(result).toEqual({ status: "hit", page: p });
+    const rec = record({ page: p });
+    const result = classifyCacheLookup(rec, now);
+    expect(result).toEqual({ status: "hit", page: p, record: rec });
   });
 
   it("a live negative record → negative with kind + message", () => {
