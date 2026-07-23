@@ -36,6 +36,68 @@ function contains(
   );
 }
 
+/** Exact equality of two bboxes (Phase 9.4 §3 tie-break for mutual containment). */
+function boxesEqual(
+  a: TranslatedRegion["bbox"],
+  b: TranslatedRegion["bbox"],
+): boolean {
+  return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
+}
+
+/**
+ * Phase 9.4 §3: decide, per region, whether its FILL should be suppressed because
+ * another region's (trimmed) draw box fully contains it. Returns a parallel
+ * boolean array (index-aligned to `regions`, the output of {@link trimOverlaps}) —
+ * NOT a `TranslatedRegion` field, so the {@link import("../../shared/types").TranslatedRegion}
+ * contract is untouched; the overlay threads it into `renderBubbleBox`'s
+ * `suppressFill` option.
+ *
+ * A region is suppressed iff some OTHER region's draw box `contains` it. WHY
+ * suppress the inner fill: two stacked fills double-paint / patch-fight and read
+ * as a smeared overlap in the Phase 9 fill era (`trimOverlaps` deliberately leaves
+ * containment pairs alone — a duplicate detection it won't distort — and relies on
+ * draw order). The OUTER fill already covers the inner region's area, so dropping
+ * the inner fill can only ever remove a redundant double-cover; the inner LABEL is
+ * untouched (the two detections may carry different text — a model split or a
+ * double-OCR — so dropping the region would lose a translation). WHY not merge:
+ * merging invents a bubble that doesn't exist ({@link trimOverlaps}' own rule).
+ *
+ * Tie-stable for EXACT-equal boxes (mutual containment): suppress the LATER one in
+ * reading order only — never both, which would expose the artwork with no paint.
+ *
+ * Pure and deterministic (same input → same output); does not read or mutate the
+ * regions beyond their bboxes.
+ *
+ * @param regions the trimmed regions, in reading (draw) order.
+ * @returns `suppressFill[i]` — true iff region `i`'s fill should be skipped.
+ */
+export function computeContainedFillSuppression(
+  regions: readonly TranslatedRegion[],
+): boolean[] {
+  const suppress = new Array<boolean>(regions.length).fill(false);
+  for (let i = 0; i < regions.length; i++) {
+    const bi = regions[i]!.bbox;
+    for (let j = 0; j < regions.length; j++) {
+      if (j === i) continue;
+      const bj = regions[j]!.bbox;
+      if (!contains(bj, bi)) continue; // j must fully contain i
+      if (boxesEqual(bi, bj)) {
+        // Mutual containment: suppress the LATER index only (i suppressed iff an
+        // equal partner sits EARLIER in reading order — j < i).
+        if (j < i) {
+          suppress[i] = true;
+          break;
+        }
+        continue; // an equal partner at j > i leaves the earlier i painting
+      }
+      // Strict containment: j is the larger outer box → suppress the inner i.
+      suppress[i] = true;
+      break;
+    }
+  }
+  return suppress;
+}
+
 /**
  * Nudge overlapping neighbours apart. For each ordered pair (i < j, reading
  * order) whose bboxes intersect with positive area, shrink BOTH boxes along the

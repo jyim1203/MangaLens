@@ -2727,3 +2727,537 @@ size (or, where impossible, the widened rect), NO letter columns; (4) fill edges
 tighter to the ink at 768, no ink rims (if rims return, the knob is
 `SHAPE_OUTWARD_OFFSET_PX`, not a §3 revert); (5) spend unchanged (§8/§9 untouched).
 Watch for offset boxes that used to snap now showing a loose box — the §1 tradeoff.
+
+## Phase 9.4 summary (graceful fill fallback, confinement cascade, contained-fill suppression)
+
+Driven by the **eleventh live-pass evidence** (2026-07-20 screenshots, MangaDex,
+vertical-CJK series, Anthropic `claude-sonnet-5`, on the Phase 9.3 build) and its
+handoff (`docs/PHASE-9.4-HANDOFF.md`). Phase 9.3 did its job — the cross-panel
+white-fill leaks are gone; the symptom shifted to the *failure path* (text floats
+over an unpainted bubble, the source Chinese leaking through). This phase makes
+that path graceful and recovers more real bubbles before we reach it. Every
+change is client-side — **zero provider cost, no cache clear, no re-pay.** §1/§3
+are pure render changes (reach cached pages on the next repaint); §2 arrives via
+the existing `SNAP_VERSION` re-snap machinery (`SNAP_VERSION` → 4).
+
+**Evidence established (not re-litigated):** the **provider-resolution ceiling is
+real and binding** — bumping `maxImageEdgePx` 1200 → 1600 → 1800 (with a cache
+clear + full re-translate) made detection SIGNIFICANTLY WORSE (Anthropic caps
+effective input at ~1.15 MP / 1568 px and downsamples larger images a SECOND time
+on top of our JPEG-0.8, smearing thin CJK strokes and bubble outlines). 1200 sits
+just under the ceiling and is seen essentially as-sent. `maxImageEdgePx` is NOT a
+quality lever — reverted/left at 1200; resolution is closed as an option. And
+**fill opacity < 1 is a direct bleed-through cause** — the default 0.92 lets ~8 %
+of source ink show wherever a fill sits over ink. No image-prep changes this phase.
+
+**§1 — graceful snap-failure fallback: opaque cover (`BubbleBox.ts` + a pure
+helper).** When the snap accepts no blob on a speech bubble (`region.fillColor`
+undefined), BubbleBox drew the raw provider box filled at the user's
+`bubbleFillOpacity` (0.92) — translucent, so the source bleeds through, and on an
+offset/tight box the English floats over near-unpainted paper. New pure,
+unit-tested `effectiveFillOpacity(kind, fillColor, userOpacity)`: a snap-eligible
+bubble kind (`bubble`/`thought`) with `fillColor === undefined` → **opacity 1**
+(we could not find the paper, so cover the source completely); everything else —
+a successfully-snapped bubble (honors the user's art-peek translucency) and every
+non-bubble kind (SFX/narration art must stay visible) — keeps `userOpacity`. Wired
+at the fill layer only; the successful-snap path (shaped fill, ellipse gate,
+inscribed rect) is untouched. This is the single biggest visible win and reaches
+cached pages on the next repaint with NO re-snap. **The optional outward
+cover-pad (handoff §1 bullet 3) was DELIBERATELY DEFERRED** — the handoff scoped
+it "ship the opacity fix first, decide from the live pass," and padding risks
+nudging a fallback box over a neighbour; no constant was added (reserved for a
+future pass if a tight box still shows a CJK rim after the opacity fix).
+
+**§2 — bounded confinement cascade (`bubbleSnap.ts`, `snapAllRegions` Stage 1b).**
+New module-local `SNAP_CONFINE_EXPAND_LOOSE = 1.0` (3× per axis). The lone-region
+final snap becomes a cascade: try `snapRegionToBubble` at the default 0.5 wall; if
+it returns `null`, retry once at 1.0 through the EXISTING `confineExpand` option;
+first non-null wins, still-null keeps the provider box (→ §1 fallback). The
+detection pass (Stage 1a, `confineExpand: Infinity`) and grouped/lobe fills are
+UNCHANGED — only the lone-region result cascades, and a first-pass accept never
+runs pass 2 (a fully-inside bubble is byte-identical to pre-9.4). WHY 1.0 not
+`Infinity`: keep a hard wall so a cross-panel margin leak stays bounded — 1.0
+doubles the 0.5 reach while staying inside the 4×-box area cap; the leak defense
+shifts onto the UNCHANGED `MIN_BLOB_BBOX_FILL` compactness guard (a real undersized
+bubble is COMPACT and merely runs past 2× the box → the guard passes and the wall
+was all that rejected it; a margin leak is SPINDLY → the guard rejects it at 1.0
+exactly as at 0.5). **Flagged nuance for the reviewer:** the Phase-9.3 seed-rescue
+already reaches ~3× the box (its rescue-window at `confineExpand 0.5` equals the
+main window at 1.0), so the cascade's genuinely NEW recovery is the case where the
+rescue's ≥40 %-provider-overlap guard rejects (an offset box whose blob covers the
+box only ~25 %) while the main path at 1.0 — which has no overlap guard — accepts.
+The §2 fixture (`undersizedOffset`, a compact 13×13 bubble under an offset box) is
+built on exactly that mechanism: `null` at 0.5, snaps at 1.0.
+
+**§3 — contained-fill suppression (`overlapTrim.ts` + a threading seam).**
+`trimOverlaps` deliberately leaves CONTAINMENT pairs alone (one box fully inside
+another — a duplicate detection it won't distort) and relies on draw order;
+pre-Phase-9 that stacked readably, but now each region also paints a FILL, so two
+stacked fills double-paint / patch-fight and read as a smeared overlap. New pure,
+unit-tested `computeContainedFillSuppression(regions)` returns a `suppressFill[]`
+boolean PARALLEL to the trimmed regions: true iff another region's draw box fully
+`contains` this one (exact-equal boxes = mutual containment → suppress the LATER
+one in reading order only, never both). BubbleBox skips appending the fill node
+when `suppressFill` is set (paint the label only) — the outer fill already covers
+that area, so the inner fill can only ever double-cover it; the LABEL is untouched
+(the two detections may carry different text — a model split or a double-OCR — so
+dropping the region would lose a translation; suppressing only the redundant paint
+is the minimal always-safe fix; merging would invent a bubble).
+
+**Surface changes (flagged, all internal — NO `shared/types.ts`, no new messages,
+no manifest change):** (a) new shared `src/shared/regionKind.ts` with
+`isBubbleKind(kind)` — factored out of `bubbleSnap`'s old `SNAP_KINDS` set so the
+snap-eligibility check (`shouldSnapKind` now delegates to it) and §1's
+opaque-fallback decision key off ONE source and can't drift; no cross-layer import
+(background ⇸ content avoided). (b) `SNAP_CONFINE_EXPAND_LOOSE` + the Stage-1b
+cascade (passes the EXISTING `confineExpand` option — no new `SnapOptions` field).
+(c) `effectiveFillOpacity` (content-internal, exported for its own test) and the
+`RenderBubbleOptions.suppressFill` render-local option. (d) the `suppressFill[]`
+threading seam: a **parallel array** computed in `OverlayManager.paint` (indexed
+by the raw region index) rather than a `TranslatedRegion` field — the contract
+stays untouched. `SNAP_VERSION` → 4 (§2; NEVER in `buildCacheKey`, ground rule 8).
+`PROMPT_VERSION` = 2, `CACHE_VERSION` = 2 untouched.
+
+**Deliberate calls:** opaque fallback SCOPED to bubble kinds with no snapped
+fillColor (SFX art stays visible, snapped bubbles keep the user's translucency);
+the bounded 1.0 cascade (hard wall retained, leak defense on the compactness
+guard); the optional cover-pad DEFERRED (opacity fix first); fill-suppression, not
+region-drop, for contained pairs; the shared `isBubbleKind` factor-out; the
+`suppressFill` parallel-array seam over a contract field.
+
+**Tests: 786 unit (+23)** — §1 `effectiveFillOpacity` table (bubble/thought +
+undefined → 1; snapped bubble + non-bubble kinds → user opacity; determinism) and
+render assertions (fallback fill node `opacity: "1"`, snapped honors 0.92, SFX not
+whited out) in `BubbleBox.test.ts`; §3 `computeContainedFillSuppression`
+(inner-not-outer, equal→later-only, disjoint/partial→neither, three-region nest,
+purity) in `overlapTrim.test.ts` plus the suppressFill render wiring (no fill node,
+label present) in `BubbleBox.test.ts`; §2 the cascade recovery (null at 0.5, snaps
+at 1.0, end-to-end via `snapAllRegions`), the margin leak STILL null at 1.0 (leak
+defense held), fully-inside byte-identical at 0.5/1.0, `SNAP_VERSION === 4`,
+determinism in `bubbleSnap.test.ts`. All other suites pass UNCHANGED. Typecheck +
+ESLint clean; `vite build` clean; `web-ext lint` 0/0/0; **`npm run test:e2e` 4/4
+green on this machine, Scenarios A–D UNMODIFIED** (A 9.6 s, B 7.6 s, C 3.6 s,
+D 18.5 s).
+
+**Manual verification: NOT run** (needs a live key + MangaDex). WITHOUT clearing
+the cache (§1/§3 arrive on the next repaint, §2 via re-snap): (1) background
+console shows `re-snapped cache hit … (snapVersion → 4)` on previously-paid pages,
+ZERO provider calls; (2) snap-failure bubbles (captions, textured-background
+panels, the offset boxes from the 2026-07-20 screenshots) now render an OPAQUE
+fill — no Chinese bleeding under the English (worst case a clean opaque box); (3)
+some previously-fallback bubbles now snap tight (the §2 cascade), no NEW
+cross-panel fills (leak defense held at 1.0); (4) the "weird overlap" pages —
+stacked/duplicate bubbles no longer show a smeared double-fill (one fill per
+contained pair, both labels present); (5) spend unchanged. Immediate no-code
+levers for the user, independent of this phase: revert `maxImageEdgePx` to 1200 in
+Options (undo the 1600/1800 test); set bubble fill opacity to 100 % (kills
+source bleed-through on GOOD hits today — §1 makes the FALLBACK opaque regardless).
+
+## Phase 9.5 summary (whole-balloon boxes, duplicate-region cleanup, fallback cover-pad)
+
+Driven by the **twelfth live-pass evidence** (2026-07-20 HAR + screenshots,
+MangaDex, vertical-CJK series, Anthropic `claude-sonnet-5`, on the Phase 9.4
+build) and its handoff (`docs/PHASE-9.5-HANDOFF.md`). This phase attacks the
+chronic "text floats out of the bubble" defect at its **root — a prompt
+instruction** — instead of a sixth round of downstream snap recovery (the 9.4
+handoff flagged this as the deferred "future, paid iteration"; this is it).
+
+**Evidence established (not re-litigated):** the floating symptom's ROOT is the
+old prompt line *"The box must tightly enclose the TEXT itself, not the entire
+bubble outline"* — for vertical-CJK dialogue that box is a narrow glyph strip,
+offset from the round balloon and barely overlapping its white interior, so every
+9.0–9.4 mechanism was reverse-engineering the balloon from a box we told the model
+NOT to draw around it; on a snap failure the fallback IS that strip, so the patch +
+English land off the bubble. Fix the box at the source and the whole failure class
+shrinks (seeds land dead-centre → snap succeeds far more, and a residual failure
+boxes the *balloon*). Also from the HAR's Call 11: the model emitted the SAME
+bubble two/three times (`與此類似` ×3, `讓其結合並提高密度的話` ×2) at IoU ≤ 0.32 (some
+disjoint) — far under the strict `IoU>0.85` dedupe — plus a **negative-height**
+corner box (r12 `[0.480,0.650,0.650,0.620]`) that `parseBbox` reinterpreted as a
+quarter-page `w/h` rectangle. And the **provider-resolution ceiling stays binding**
+(1200 is at Anthropic's ~1.15 MP cap; 1600/1800 tested WORSE) — no image-prep
+changes; the 4 HAR aborts are benign fast-scroll cancels (diagnosed, deferred).
+
+**§1 — whole-balloon bounding boxes (the PAID root fix — `prompt.ts` +
+`shared/constants.ts`).** Rewrote the `BOUNDING BOX RULES` block into a
+**kind-conditional** rule: `bubble`/`thought` kinds are boxed as the **ENTIRE
+balloon** (the whole drawn white/solid shape, blank margin included), while on-art
+text (`caption`/`sfx`/`sign`/`other`) keeps the tight-text rule; added "one box per
+balloon" with a lobe-split clause (a line spanning joined balloons → one region per
+lobe). Dropped the now-counterproductive "Boxes for different regions should not
+overlap" line — balloon boxes legitimately overlap neighbours more than tight
+strips did (expected; `trimOverlaps` + the 9.4 contained-fill suppression absorb
+it, and snap should now SUCCEED on most, yielding tight shaped fills). `PROMPT_VERSION`
+2 → 3 — the bbox instruction is part of the cache-key prompt identity, so every
+cached `p2` page re-translates once on next view (**the accepted paid cost, the
+ONLY spend in this phase**). The `bbox` schema `description` was left unchanged: it
+is already format-only (corner sentence, no "tight to text" implication), so it does
+NOT contradict the new per-kind rule — no edit needed. No JSON-schema-shape,
+dialect, honorifics, or reading-order changes.
+
+**§2 — duplicate + degenerate region cleanup (P1, free — `ProviderBase.ts`,
+sanitizer-local).** Two small fixes, both upstream of the snap, reaching cached
+pages via the §1 re-translate (no `SNAP_VERSION`/`CACHE_VERSION` bump).
+(a) **`parseBbox` plausibility guard** (`PLAUSIBLE_WH_EPS = 0.02`): when the corners
+reading is degenerate and the code falls to the legacy `[x,y,w,h]` reading, accept
+that reading ONLY if it plausibly fits the image (`c>0 && d>0 && x+c ≤ 1+ε &&
+y+d ≤ 1+ε`); else return `null` (drop). WHY: a real third-party w/h box fits the
+frame; a noisy CORNER box (r12: `w=0.65` from `x=0.48` → `x+w=1.13`) does not, and
+that heavy overflow is the tell it was corners-with-noise, not w/h — dropping beats
+clamping a quarter-page rectangle. Preserves w/h back-compat for the
+half-of-Haiku-emits-w/h case (a fitting w/h box still parses). (b) **Overlap-gated
+identical-text collapse** in `dedupeIdentical` (`IDENTICAL_OVERLAP_IOU = 0.3`,
+`OVERLAP_DEDUPE_KINDS = {bubble,thought,caption}`): for a pair whose NORMALIZED
+`original` (trim + collapse whitespace, so newline-wrapped OCR matches) is
+identical, whose kind is in that set, and whose `IoU > 0.3`, keep the **larger-area**
+region and drop the other; the existing `IoU>0.85` exact-original rule stays as the
+general path for all kinds. WHY overlap-gated + kind-scoped (the user's explicit
+steer): repeated dialogue across a real conversation lives in SEPARATE,
+non-overlapping balloons (`IoU ≈ 0`) — never collapse those; two detections of the
+SAME balloon overlap. `sfx` legitimately repeats verbatim (パチ/ドズ) at disjoint
+spots, so it stays on the strict path only. WHY keep-larger: the bigger box is
+likelier the real balloon, the smaller the spurious echo. A disjoint third copy
+(r18) intentionally SURVIVES — one stray copy is far less harm than risking a
+genuinely repeated line.
+
+**§3 — snap-failure fallback cover-pad (render safety net, free — a new pure
+module + a threading seam).** For the residual pages where the model still boxes
+tight despite §1, the opaque 9.4 fallback is smaller than the balloon (English
+cramped, source rim showing). New pure, unit-tested
+`computeFallbackCoverRects(regions, rects, opts)` returns a `PxRect[]` **parallel**
+to `rects` (same seam as 9.4's `suppressFill`): for a snap-FAILURE bubble
+(`isBubbleKind(kind) && fillColor === undefined`) it grows the rect outward by
+`FALLBACK_COVER_PAD = 0.12` of the box extent per side, then CLAMPS each edge so it
+neither leaves the image bounds nor crosses INTO another region's draw rect lying
+in that direction (per-edge min against the nearest neighbour, sharing the
+perpendicular span); every other region returns its rect UNCHANGED. `OverlayManager.paint`
+computes it once (it already holds all regions + rects) and threads each region's
+cover rect into `renderBubbleBox` via a new render-local `RenderBubbleOptions.drawRect`;
+BubbleBox lays the box out at that rect, so the fill AND the derived inner text rect
+both grow toward balloon size. The successful-snap path (shape/ellipse/inscribed
+rect) is untouched (`drawRect === rect` for every snapped/non-bubble region). WHY a
+neighbour clamp, not a flat pad: an isolated tight box grows to cover its balloon; a
+crowded one grows only into empty space, never over a neighbour — removing exactly
+the spill risk the 9.4 handoff deferred the cover-pad over. WHY 0.12: covers a
+typical text-strip→balloon margin without being reckless; it is THE tuning knob.
+Pure render change — reaches cached pages on the next repaint, no re-snap.
+
+**Cover-pad module choice (flagged):** a NEW sibling pure module
+`src/content/overlay/coverPad.ts`, not an extension of `overlapTrim.ts` — the
+cover-pad works in overlay-local PIXELS (`PxRect`) at paint time while `overlapTrim`
+works in normalized 0–1 bbox space on the cached page, and mixing the two coordinate
+systems in one file invites confusion; the cover-pad also needs the `isBubbleKind`
+predicate `overlapTrim` does not.
+
+**§4 (snap-outcome instrumentation): SKIPPED.** It was OPTIONAL/not-in-DoD and
+would require editing `bubbleSnap.ts`'s `snapAllRegions` — OUTSIDE the sanctioned
+surface list for this phase — so per the "stop and flag, don't expand scope" rule it
+was not built. The next live pass can add it under its own scope.
+
+**Surface changes (flagged, all within the sanctioned list — NO `shared/types.ts`,
+no new messages, no manifest change):** (a) `PROMPT_VERSION` 2 → 3 + the
+`SYSTEM_PROMPT_TEMPLATE` bbox rule in `prompt.ts` (schema description untouched).
+(b) sanitizer-local `parseBbox` plausibility guard (`PLAUSIBLE_WH_EPS`) +
+`dedupeIdentical` overlap-gate (`IDENTICAL_OVERLAP_IOU`, `OVERLAP_DEDUPE_KINDS`) in
+`ProviderBase.ts`. (c) the new pure `coverPad.ts` (`computeFallbackCoverRects`,
+`FALLBACK_COVER_PAD`) + `OverlayManager.paint` computing the parallel cover-rect
+array once + the render-local `RenderBubbleOptions.drawRect` thread through
+`BubbleBox`. `SNAP_VERSION` = 4 and `CACHE_VERSION` = 2 **untouched**: §2 is upstream
+of the snap and reaches pages via the §1 re-translate (the cached `rawPage` is
+post-sanitize), §3 is a pure repaint; old `p2` entries age out via the existing LRU.
+
+**Deliberate calls:** whole-balloon boxes as the paid root fix (over another
+downstream recovery layer); the overlap-gated + kind-scoped dedupe that PRESERVES
+repeated dialogue in separate balloons; keep-larger within a cluster; the r12
+plausibility DROP over a clamp (and the deliberate consequence — the pre-existing
+`out_of_range_bbox` fixture's two overflowing legacy-w/h rows are now BOTH dropped as
+noisy corners, updated to expect 0 regions; the joint clamp still applies to
+overflowing CORNER boxes); the neighbour-clamped cover-pad and its 0.12 knob; §4
+skipped as out-of-surface; the cover-pad as a new PxRect-space sibling module.
+
+**Tests: 805 unit (+19 net over the 786 baseline).** §1: the built system prompt
+CONTAINS the new per-kind language ("enclose the ENTIRE balloon", "box the TEXT
+tightly", "One box per balloon.") and no longer the old tight-text line, corner
+format retained (`prompt.test.ts`); `PROMPT_VERSION === 3` (`constants.test.ts`).
+§2 (`providerPipeline.test.ts`): `parseBbox` — the r12 vector `[0.48,0.65,0.65,0.62]`
+→ `null`, the genuine w/h box `[0.1,0.2,0.3,0.15]` → still `{0.1,0.2,0.3,0.15}`
+(back-compat pinned), a valid corner box unaffected; `dedupeIdentical` via the
+pipeline — three identical `bubble` regions (two overlapping + one disjoint) → the
+two collapse to the LARGER + the disjoint survives, two overlapping `sfx` → BOTH kept
+(kind exemption), different-text overlapping → both kept, a whitespace/newline-only
+difference treated as identical; the `out_of_range_bbox` update; and a 24-region
+Call-11 golden fixture (`call11_duplicates.json` → r12 dropped, each duplicate
+cluster collapsed by one, 22 out). §3: `computeFallbackCoverRects` (isolated
+4-side expand, right-neighbour clamp with full pad elsewhere, snapped/non-bubble
+pass-through, image-bounds clamp both edges, pad override, purity/determinism) in
+`coverPad.test.ts` + a `drawRect` render assertion (fallback box uses the padded
+rect → wider fill + larger text rect; snapped unchanged) in `BubbleBox.test.ts`.
+Typecheck + ESLint clean; `vite build` clean; `web-ext lint` **0/0/0**.
+
+**`npm run test:e2e` 4/4 green on this machine, Scenarios A–D UNMODIFIED** (A
+9.3 s, B 7.7 s, C 4.6 s, D 18.6 s) — after diagnosing an ENVIRONMENTAL break
+unrelated to Phase 9.5: Selenium Manager's "latest browser" TTL expired and
+silently moved the suite from Firefox 152.0.6 (the 9.4 baseline browser) to
+153.0, whose Marionette adds a new `navigateTo` guard (`driver.sys.mjs` ~L2378,
+verified by extracting both versions' omni.ja) refusing WebDriver navigation to
+non-"safe" URLs — including the `moz-extension://` options page `seedSettings`
+drives — unless `RemoteAgent.allowSystemAccess` is set. All four scenarios
+failed identically in that setup step BEFORE any Phase 9.5 code ran. Fix (the
+one infra change outside the 9.5 surfaces, harness `before()` only, scenarios
+untouched): launch Firefox with `--remote-allow-system-access` (exists since
+~Firefox 138, inert on older versions). Verified 4/4 BOTH ways: pinned to the
+152.0.6 baseline via `E2E_FIREFOX_BIN` (no harness change needed), and on
+default-resolved 153.0 with the flag.
+
+**Manual verification (live key + MangaDex): NOT run.** §1 re-translates on view
+(the network panel showing provider calls the first time a previously-cached page is
+re-opened is EXPECTED — the `p2 → p3` re-key). Expected: (1) bubbles now box the
+balloon — fills snap tight to the drawn outline, English sits centred INSIDE, no
+source bleeding around a floating strip; connected/spanning bubbles get one fill per
+lobe; (2) the "magic power" ad page (Call 11) — the tripled *"it's similar to magic
+power too."* and the panel-covering *"…bond and increase the density,"* box are GONE
+(at most one stray copy, no quarter-page rectangle); (3) a page where the model still
+boxes tight — the §3 cover-pad grows the opaque fallback toward balloon size without
+spilling onto neighbours; (4) spend — after the one-time re-translate, re-opening a
+page is free; (5) no regressions on good 9.4 hits. Immediate no-code levers for the
+user (independent of this phase): keep `maxImageEdgePx` at 1200 (do not re-test
+higher); set bubble fill opacity to 100 % in Options (kills source bleed on good hits
+today); expect a one-time spend bump as cached chapters re-translate to `p3`, free
+thereafter.
+
+## Phase 9.6 summary (translate-all tail resilience: soft-cancel, dead-signal guards, recycle-persistent sends)
+
+Driven by the **thirteenth live-pass evidence** (2026-07-21 HAR
+`devtools_Archive [26-07-21 23-46-44].har`, MangaDex, OpenAI `gpt-5.6-luna`, on the
+Phase 9.5 build) and its handoff (`docs/PHASE-9.6-HANDOFF.md`). The user clicked
+**Translate all** at the top of a chapter, scrolled at reading pace, and the **tail
+pages were never translated** — paying the P3 deferral the 9.5 handoff recorded
+("retry-on-recycle for cancelled pages … a future queue refinement"). The HAR showed
+the class at scale — **6 of 19 pages lost** — so it is no longer benign.
+
+**Evidence established (not re-litigated):** 19 solo `translatePage` jobs went out
+(`pagesPerRequest` 1 → `batchEligible` false). Requests **0–12 succeeded** (HTTP 200,
+`finish=stop`, ~22 s/page) at exactly **concurrency 6** — textbook dispatch. Requests
+**13–18 died client-side**: HAR `status 0`, `time 0–1 ms`, every timing field zero,
+yet each carried a **fully serialized body** (195–257 KB with the image data URL) —
+the signature of a `fetch` launched with an **already-/immediately-aborted
+AbortSignal**. Zero 429s, zero 4xx/5xx, no network faults: **NOT a provider, auth,
+rate-limit, or network problem.** Each dead request's start paired with a *successful*
+response's end to ~0.1 s — the queue dequeued the next job the instant a slot freed and
+that job's signal was dead within the dequeue→fetch window. The only production writers
+of those aborts are content-initiated cancels on **DOM reconcile**: MangaDex
+detaches/replaces `<img>` elements while the user scrolls (lazy-load hydration + node
+recycling), the overlay notices `!el.isConnected`, the scanner unregisters the
+candidate, and `unregister → cancel → cancelTranslation` aborted the per-request
+controller **unconditionally**. Tail pages whose jobs sat behind the ~90 s backlog
+(19 ÷ 6 × ~22 s) had their elements churned before their jobs ran; each reconcile
+cancelled a still-pending job, and nothing re-sent the recycled element (translate-all
+already ran; a non-auto site never sends on visibility). The **no-refund economics**
+(not re-litigated): aborting an already-SENT provider call refunds nothing (the provider
+bills regardless of client disconnect), so cancelling a STARTED call destroys the cache
+value for ~zero saving — the "stop paying" rationale is only true for jobs still QUEUED.
+Model latency (~22 s/page) is an aggravator, not the cause; the fix is provider-agnostic.
+
+**§3 — dead-signal guards (belt-and-braces; landed first, `queue.ts` +
+`translateTiles` + `ProviderBase.callOnce`).** Closes the status-0 ghost-request class
+structurally instead of chasing the interleaving: (a) `queue.ts` `runWithRetry` throws
+`abortReason(signal)` at the **top of each attempt** before invoking the task — covers a
+merged signal aborted in the dequeue→start window, for every current + future task type;
+(b) `translateTiles` throws `ProviderError("aborted")` **once after prep**, before any
+`sha256Hex`/provider call — prep is the longest in-slot window (~100–500 ms), where a
+cancel used to sail on to base64+`fetch`; (c) `ProviderBase.callOnce` calls
+`throwIfAborted(signal)` **immediately before `this.fetchFn(...)`** — the hard guarantee
+(an aborted signal ⇒ `fetchFn` never invoked), covering the repair-retry and 400-downgrade
+re-entries for free. All three surface as the existing `aborted` kind, so negative-cache
+exclusion (`shouldNegativeCache("aborted")` is false) and silent content handling behave
+exactly as today.
+
+**§1 — soft-cancel: unregister spares started jobs (the spend-preserving fix,
+`messages.ts` + `translateHandlers.ts` + `viewportQueue.ts`).** `cancelTranslation`'s
+request gains `mode?: "hard" | "queued-only"` (absent ⇒ `"hard"`, so every pre-9.6 caller
+is **byte-compatible**). The handler routes through a pure, unit-tested decision table
+`classifyCancel(mode, hasController, started)` → `hard-aborted` / `queued-aborted` /
+`started-spared` / `unknown-noop`, drawing the **same started boundary** the pause feature
+already uses (`startedRequests`): a `"queued-only"` cancel of a STARTED request is a no-op
+(spared) — the run finishes, caches, and its own `finally` cleans both registries exactly
+as a normal completion; everything else aborts. The content DOM-reconcile `unregister`
+path sends `"queued-only"`; teardown `stop()` keeps `"hard"` (the user is leaving); the
+region-select cancel path is untouched (absent mode ⇒ hard). **SharedAbort verified, not
+guessed:** a spared run never aborts its caller's controller, its waiter stays live, and
+the caller-side `stopWaiting()` still detaches on normal settle — no refcount change, no
+listener leak.
+
+**§2 — translate-all persistence across element recycling (the blank-page fix,
+`viewportQueue.ts`).** A real `requestAll` arms a queue-lifetime intent
+`translateAllIntent = { href: getHref(), budgetMs }` (the same backlog-scaled
+`requestAllTimeoutMs` budget the burst used). `register` runs a pure, unit-tested
+predicate `classifyRegisterIntent(intent, currentHref, paused)` → `send` / `disarm` /
+`ignore`: while armed on the **same page URL** and not paused, a candidate **registered
+later** — a recycled `<img>`'s fresh candidate OR a late lazy-loaded page — auto-sends at
+`TRANSLATE_ALL_PRIORITY`; combined with §1 the background coalesces onto the still-running
+spared job by cacheKey (or cache-hits the finished one) and renders. Disarmed on
+`setPaused(true)` (user revoked), `stop()` (teardown), and lazily on an **href mismatch**
+at register time (an SPA chapter change must not inherit spend the user never clicked
+for — the URL is the cheapest precise "this chapter" scope). NOT gated on the anchored
+reading window — translate-all is explicit intent and bypasses the window by existing
+doctrine. The `requested` re-check inside `sendTranslate` dedupes against anything in
+flight, so a double registration can't double-send.
+
+**§4 — cancel disposition logging (`translateHandlers.ts`).** One `log.debug` per id in
+both cancel handlers — short id + mode + disposition (`started-spared` / `queued-aborted`
+/ `hard-aborted` / `unknown-noop`, reusing `classifyCancel`) — so the next live pass reads
+attribution off the console instead of burning a session on a HAR. No new flags, no UI.
+
+**Surface changes (flagged, all within the sanctioned list — NO version bumps, no
+manifest change, no new message types):** (a) `messages.ts`: the `cancelTranslation`
+`mode?` field only (default-hard, byte-compatible). (b) `translateHandlers.ts`: the pure
+`classifyCancel` decision table (+ `CancelMode`/`CancelDisposition` types,
+`shouldAbort`/`shortId` helpers), the handler's started-boundary check, and the §4 logging
+in both cancel handlers; plus a `requestControllerHasForTest` seam mirroring the existing
+`startedRequestsHasForTest`. (c) `queue.ts` + `ProviderBase.ts` + `translateTiles`: the
+three §3 guards (a few lines each). (d) `viewportQueue.ts`: the §2 intent state,
+`classifyRegisterIntent` predicate (+ `TranslateAllIntent`/`RegisterIntentAction` types),
+`maybeAutoSendForIntent`, a `safeBool` helper, the `"queued-only"` unregister cancel, and a
+new **injectable `getHref` seam** (defaulted to `location.href`, fail-soft to `""` in a
+location-less runtime — the same feature-detect pattern as `isImageLoaded`) so the
+persistence shell is testable. `PROMPT_VERSION` 3 / `SNAP_VERSION` 4 / `CACHE_VERSION` 2
+**untouched** — nothing here changes prompts, the cache key, or cached shapes (a **free**
+phase, no forced re-translation).
+
+**Deliberate calls:** the no-refund economics behind soft-cancel (finish a started call →
+convert sunk cost into a cache entry §2 will hit, rather than kill it for ~zero saving);
+the href-scoped intent (cheapest precise "this chapter" scope for an SPA); the three-seam
+§3 placement (queue start / post-prep / pre-fetch) as defense-in-depth so the ghost class
+is structurally impossible; the §2 micro-cleanup (skip a hydrate probe for a candidate the
+intent is about to real-send — the invisible probe only loses the race). **Considered and
+rejected** (per the handoff's out-of-scope list): overlay/`Tracked`-record migration across
+recycled elements (the cacheKey coalesce/cache-hit path achieves the same render for less
+machinery); debouncing the `isConnected` reconcile in `OverlayManager.syncPositions` (with
+§1+§2 the reconcile's cancel is harmless, and timing heuristics there risk real teardown
+bugs); model/latency/concurrency changes; batch-path abort rework (batching was OFF in this
+evidence — the §3 queue/provider guards cover its fetches incidentally).
+
+**Tests: 826 unit (+21 net over the 805 baseline).** §1: `classifyCancel` truth table
+(unknown→noop; hard→abort started-or-queued; queued-only spares started, aborts queued) in
+`translateHandlers.test.ts`; handler behaviour (queued-only aborts a not-started job +
+deregisters; queued-only SPARES a started job — controller + started mark retained; hard
+aborts a started job; mode-absent defaults to hard; unknown id silent in both modes) via
+the started-poll seam in `translateHandlersPause.test.ts`. §2:
+`classifyRegisterIntent` truth table + a five-case shell suite (real requestAll arms →
+later registration auto-sends at priority 2; dry-run does NOT arm; `setPaused(true)`
+disarms; `stop()` disarms; an href mismatch disarms permanently) on a non-auto queue with
+an injected `getHref`, in `viewportQueue.test.ts`; the existing unregister-cancels-probe
+assertion updated to expect `mode: "queued-only"`. §3: the queue guard (task NEVER invoked
+when the merged signal is aborted at start, via a no-op-`addEventListener` fake signal that
+survives to `start()`) in `queue.test.ts`; the `callOnce` guard (`fetchFn` spy not called
+when the signal aborts between entry and callOnce — both the **primary** and **repair**
+re-entries, via a `buildRequest`-time abort) in `providerBase.test.ts`; the post-prep tiles
+guard (a cancel landing mid-prep fires **no** provider `fetch`) via a controllable
+`prepareImage` mock in the new `translateHandlersDeadSignal.test.ts`. Typecheck + ESLint
+clean; `vite build` clean; `web-ext lint` **0/0/0**.
+
+**`npm run test:e2e` 4/4 green on this machine, Scenarios A–D UNMODIFIED** (A 9.0 s,
+B 7.7 s, C 3.7 s, D 18.5 s) on default-resolved Firefox 153 with the 9.5 harness flag
+`--remote-allow-system-access` (the only e2e-harness change, `before()` only, carried over
+from 9.5; the scenario bodies were not touched this phase).
+
+**Manual verification (live key + MangaDex): NOT run.** Expected on a fresh ≥15-page
+translate-all scrolled at reading pace: every page ends translated; the network panel shows
+**zero `status 0`** provider entries; tail pages may re-send and must coalesce/cache-hit (no
+duplicate paid call for the same page bytes); a mid-burst fast scroll to the end and back
+re-renders recycled pages from cache/coalesce (no permanently blank page); pause mid-burst
+lets started calls finish + render and stops the queued ones (unchanged); toggling the
+extension off mid-burst hard-aborts in-flight calls (unchanged); with debug on, every cancel
+logs a disposition line. **Immediate no-code levers for the user** (independent of this
+phase): at ~22 s/page and concurrency 6 a 19-page translate-all needs ~90 s before the tail
+lands — end-of-chapter skeletons during that window are expected and now RESOLVE instead of
+dying; if the OpenAI tier allows it, raising `concurrency` in Options shrinks the tail
+window linearly, and a faster model shrinks it more.
+
+## Phase 9.7 summary (temperature-400 downgrade race: the FIRST-wave blank pages)
+
+Driven by the **fourteenth live-pass evidence** (2026-07-22 HAR `devtools_Archive
+[26-07-22 01-50-37].har`, MangaDex, OpenAI `gpt-5.6-luna`) — the user switched from
+`claude-sonnet-5` to `gpt-5.6-luna` and reported the OPPOSITE end of the chapter from
+9.6: the **earliest pages** of a translate-all now left blank. This is a distinct bug
+from the 9.6 tail-cancel class, and the HAR proves it cold. **Evidence (not
+re-litigated):** 22 `/v1/chat/completions` requests. The first **concurrency-6 wave**
+(all dispatched at t≈0) each sent `temperature: 0.25` and got **HTTP 400** —
+`"'temperature' does not support 0.25 with this model. Only the default (1) value is
+supported."` Every request *after* that wave omitted temperature and returned 200. Of
+the six 400'd images, **one** was retried (temperature dropped) and rendered; the other
+**five never made a second request and stayed blank**. Zero status-0 ghosts, zero 4xx
+besides the temperature 400s, zero 429/5xx: **NOT the 9.6 recycle-cancel class, NOT a
+network/auth/rate problem** — a request-shape 400 whose recovery was being dropped for
+five of six siblings.
+
+**Root cause (the shared-memo concurrency race).** `gpt-5.x`/`o-series` reasoning models
+reject any non-default `temperature` — the same class Phase 3.1 first hit on Claude 4.6+,
+handled by the persisted `samplingReject` memo (`endpointModes.ts`) that the provider
+`buildRequest` reads to omit temperature once a model is known to reject it. But the
+`downgrade` (400-recovery) path in **both** `openai.ts` and `anthropic.ts` gated the
+temperature RETRY on that same memo (`!isSamplingRejected(model)` / `|| isSamplingRejected
+(model)`). The memo is shared and set **synchronously** by the first sibling to process
+its 400. So at concurrency 6 the whole first wave builds with temperature (memo empty) and
+all 400 together; the first to recover flips the memo; the other five then hit a downgrade
+that sees `isSamplingRejected === true`, **skips the temperature branch, falls through to a
+null downgrade, and lets the raw 400 propagate as a hard error** — a permanent blank page
+(only the learn-race winner recovered, exactly the 1-of-6 in the HAR). A second-order
+aggravator: the startup memo hydrate (`index.ts`) is fire-and-forget, so even a returning
+user whose prior session already learned `gpt-5.6-luna` re-sent temperature because the
+translate-all burst out-raced the async `storage.get`.
+
+**Fix (correctness — the blank pages).** In both providers the temperature-retry decision
+now keys **only on what THIS request sent** (`ctx.temperature !== undefined`) plus the
+error regex — never the shared memo. The `ctx.temperature !== undefined` guard already
+excludes the already-learned case (buildRequest omits temperature once the memo is set, so
+a later request never sends it and can't 400 on it), and the retry re-enters `callOnce`
+with `allowDowngrade=false` which already prevents any loop — so the memo check in
+`downgrade` was pure harm. `learnSamplingRejected` stays (idempotent); every concurrent
+temperature-400 now strips and retries, so the whole first wave recovers.
+
+**Fix (cost/latency — the re-paid 400 wave).** The `translatePage` handler now awaits
+`loadEndpointModes()` + `loadSamplingMemo()` **in parallel with `loadSettings()`** before
+building any request, so a model already known (from a persisted past session) to reject
+temperature omits it from the very first call instead of re-paying six 400s + doubled
+first-wave latency every time the event page wakes — fulfilling the Phase 8 §4 persistence
+intent the fire-and-forget hydrate was defeating. Memoized promises → effectively free
+after the first await; fail-soft (a storage fault just re-pays one recoverable 400 per
+model). **Considered and rejected:** seeding the memo from a hardcoded `gpt-5|o-series`
+model regex — the codebase philosophy (endpointModes.ts, anthropic.ts) is explicit that
+learn-on-400 + persist beats a model list that goes stale as BYOK users type arbitrary ids;
+the two fixes above make the learned path both correct under concurrency and durable across
+sessions, which is the same outcome without the stale-list liability.
+
+**Surface changes (all internal — NO shared-contract, message, manifest, or version
+change):** (a) `openai.ts` `downgrade`: drop the `!isSamplingRejected` guard from the
+temperature branch (+ WHY note on the race). (b) `anthropic.ts` `downgrade`: drop the
+`|| isSamplingRejected` guard from the sampling branch (+ WHY note). (c)
+`translateHandlers.ts`: import `loadEndpointModes`/`loadSamplingMemo` and fold them into the
+handler's opening `Promise.all` with `loadSettings`. `PROMPT_VERSION` 3 / `SNAP_VERSION` 4 /
+`CACHE_VERSION` 2 untouched — no prompt, cache-key, or cached-shape change (a **free** fix,
+no forced re-translation), and no touch to the 9.x render/snap/prompt pipeline or the 9.6
+cancel machinery.
+
+**Tests: 828 unit (+2 over the 826 baseline).** A concurrency-race regression per provider
+(`providers.test.ts`): two `translatePage` calls fired together against a body-keyed fetch
+mock (any request carrying `temperature` 400s; the temperature-dropped retry succeeds) —
+**both** pages must resolve with regions (before the fix the second rejected with the raw
+400) and exactly four fetches fire (two initial + two retries). The existing single-request
+downgrade + per-model/per-endpoint memoization tests are unchanged and still green.
+`npm run check` green (typecheck + ESLint + 828 tests); `vite build` clean (background
+58.85 kB). **`npm run test:e2e` not re-run this fix** — no content/overlay/e2e-path change
+(background provider + handler only); the 9.6 baseline (4/4 A–D on Firefox 153 with
+`--remote-allow-system-access`) stands.
+
+**Manual verification (live key + MangaDex): NOT run.** Expected on a fresh translate-all
+after switching to a temperature-rejecting model (`gpt-5.x`/`o-series`, or Claude 4.6+):
+the **first** wave may show a brief burst of `temperature` 400s in the network panel on the
+very first ever use of that model, but **every** one now retries and renders (no permanently
+blank early pages); on the **next** session the memo is hydrated before the first call, so
+that model sends **zero** temperature 400s. With debug on, a `sampling-reject` learn is
+logged once per new model. **No-code lever for the user (independent of this fix):** the
+400s never billed and are harmless once recovered, but a user who wants a clean first wave
+can leave `temperature` at the default the model accepts — the extension now handles the
+mismatch either way.
+

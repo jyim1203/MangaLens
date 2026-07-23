@@ -210,10 +210,10 @@ export const SYSTEM_PROMPT_TEMPLATE = `You are a professional manga and comic tr
 BOUNDING BOX RULES:
 - Coordinates are FRACTIONS of the image dimensions, between 0 and 1.
 - Format: [x_min, y_min, x_max, y_max] — the top-left and bottom-right corners. x_max must be greater than x_min, and y_max greater than y_min.
-- The box must tightly enclose the TEXT itself, not the entire bubble outline. If unsure, err slightly larger, never smaller.
-- Never let boxes extend past the image edges.
-- Two different bubbles must never share one box. One bubble split across two lines is still ONE region.
-- Boxes for different regions should not overlap.
+- For SPEECH BUBBLES and THOUGHT BUBBLES (kind "bubble" or "thought"): the box must enclose the ENTIRE balloon — the whole drawn white or solid-coloured bubble shape, INCLUDING the blank margin around the text — not just the glyphs. Use the balloon's drawn outline as the box extent.
+- For text that sits on the artwork — CAPTIONS, SOUND EFFECTS, SIGNS (kind "caption", "sfx", "sign", "other"): box the TEXT tightly, so the box does not cover the surrounding art.
+- One box per balloon. If a single line of dialogue spans two connected or joined balloons, emit a SEPARATE region for each balloon lobe, each boxed to its own lobe.
+- If unsure, err slightly larger, never smaller. Never let a box extend past the image edges.
 
 TRANSCRIPTION RULES:
 - Preserve the original script exactly (kanji/kana/hangul/etc.). Do not romanize.

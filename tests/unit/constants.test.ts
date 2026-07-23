@@ -13,10 +13,11 @@ describe("shared/constants", () => {
     expect(PROMPT_VERSION).toBeGreaterThan(0);
   });
 
-  it("pins PROMPT_VERSION at 2 (Phase 7.4 corner-format bbox schema)", () => {
-    // The corner-format bbox schema + no-overlap rule changed prompt output, so
-    // the version bumped from 1 → 2 to invalidate old-format-era cache entries.
-    expect(PROMPT_VERSION).toBe(2);
+  it("pins PROMPT_VERSION at 3 (Phase 9.5 whole-balloon bbox rule)", () => {
+    // Phase 9.5 §1 rewrote the bbox rule to box speech/thought bubbles as the
+    // WHOLE balloon (not the tight text strip), so the version bumped 2 → 3 to
+    // re-translate every cached p2 page once on next view (the accepted paid cost).
+    expect(PROMPT_VERSION).toBe(3);
   });
 
   it("command ids stay in sync with the manifest (edge: drift)", () => {

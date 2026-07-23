@@ -32,8 +32,12 @@ export const DEFAULT_MODELS: Record<ProviderId, string> = {
  * Bumped whenever prompt text in providers/prompt.ts changes in a way that
  * affects output. Part of the translation cache key so stale translations
  * are never served after a prompt change. (Gap resolution #4 — see docs.)
+ *
+ * v3 (Phase 9.5 §1): the bbox rule now boxes speech/thought bubbles as the WHOLE
+ * balloon (not the tight text strip) — the paid root fix for "text floats out of
+ * the bubble". Every cached `p2` page re-translates once on next view (accepted).
  */
-export const PROMPT_VERSION = 2;
+export const PROMPT_VERSION = 3;
 
 /**
  * Bumped whenever the {@link import("./types").PageTranslation} shape stored in

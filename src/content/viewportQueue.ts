@@ -78,6 +78,54 @@ export function requestAllTimeoutMs(
   return Math.min(baseMs + waves * 30_000, TRANSLATE_ALL_MAX_TIMEOUT_MS);
 }
 
+/**
+ * Phase 9.6 §2 persistent translate-all intent. Armed by a real `requestAll`,
+ * scoped to the page URL it was clicked on (`href`) and carrying the same
+ * backlog-scaled per-send `budgetMs` the burst used. While armed, a candidate
+ * registered LATER auto-sends at {@link TRANSLATE_ALL_PRIORITY} so it isn't left
+ * blank.
+ */
+export interface TranslateAllIntent {
+  /** The page URL the intent was armed on — the scope of "this chapter". */
+  href: string;
+  /** The per-send timeout budget to reuse for auto-sends ({@link requestAllTimeoutMs}). */
+  budgetMs: number;
+}
+
+/** What {@link classifyRegisterIntent} says to do with a fresh registration. */
+export type RegisterIntentAction = "send" | "disarm" | "ignore";
+
+/**
+ * Phase 9.6 §2 — decide what a freshly-registered candidate should do against the
+ * armed translate-all intent. Pure so the persistence policy is unit-tested apart
+ * from the DOM shell:
+ *  - `"ignore"` — no intent armed (nothing to persist).
+ *  - `"disarm"` — the page URL no longer matches the intent's: MangaDex is an SPA,
+ *    so a chapter change re-registers a whole new chapter's images; auto-sending
+ *    THOSE would be spend the user never clicked for. The href is the cheapest
+ *    precise scope for "this chapter", and a mismatch lapses the intent.
+ *  - `"send"` — armed, same page, not paused → auto-send this candidate (a recycled
+ *    element's fresh candidate re-sends → the background coalesces onto the
+ *    §1-spared in-flight run or cache-hits the finished one; a late lazy-loaded
+ *    page finally sends). NOT gated on the anchored reading window: translate-all
+ *    is explicit intent and bypasses the window by existing doctrine.
+ *
+ * @param intent the armed intent, or `undefined` when none.
+ * @param currentHref the page URL at registration time.
+ * @param paused whether the queue is paused (a paused queue never auto-sends;
+ *   `setPaused(true)` also disarms, so this is belt-and-braces).
+ */
+export function classifyRegisterIntent(
+  intent: TranslateAllIntent | undefined,
+  currentHref: string,
+  paused: boolean,
+): RegisterIntentAction {
+  if (!intent) return "ignore";
+  if (intent.href !== currentHref) return "disarm";
+  if (paused) return "ignore";
+  return "send";
+}
+
 /** The visibility tier a candidate just entered. 0 = visible, 1 = near. */
 export type Tier = 0 | 1;
 
@@ -362,6 +410,10 @@ export interface ViewportQueueOptions {
    *  `window.innerWidth/innerHeight`. Injectable so the confirmation shell is
    *  testable in a windowless runtime. */
   getViewport?: () => { w: number; h: number };
+  /** Current page URL reader for the Phase 9.6 §2 translate-all intent scope;
+   *  defaulted to `location.href` (empty string in a location-less test runtime).
+   *  Injectable so the persistence shell is testable without a real `location`. */
+  getHref?: () => string;
   /**
    * Called with the error kind when a translation fails with a rendered badge
    * (Phase 7 item 6) — drives the actionable-error toast policy. NOT called for
@@ -486,6 +538,11 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
   const confirmDelayMs = opts.confirmDelayMs ?? CONFIRM_DELAY_MS;
   const getViewport =
     opts.getViewport ?? (() => ({ w: window.innerWidth, h: window.innerHeight }));
+  // §2: read the current page URL for the translate-all intent scope. Fails soft to
+  // "" in a location-less runtime (the Node test env) — mirrors `isImageLoaded`'s
+  // feature-detect — so the shell never throws where `location` is absent.
+  const getHref =
+    opts.getHref ?? (() => (typeof location !== "undefined" ? location.href : ""));
   const makeObserver =
     opts.createObserver ??
     ((cb, options) => new IntersectionObserver(cb, options));
@@ -497,6 +554,15 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
   /** Pause state (Phase 7.4): while true, no new sends leave this queue. Per-tab
    *  RUNTIME state — it dies with the content script on navigation. */
   let paused = false;
+  /**
+   * Phase 9.6 §2: the armed translate-all intent, or `undefined` when disarmed.
+   * Queue-lifetime state (a fresh queue per activation starts disarmed). Set by a
+   * real `requestAll`; disarmed by `setPaused(true)`, `stop()`, and lazily on an
+   * href mismatch at register time — so persistence only ever spends under the
+   * exact intent the user bought (translate-all on this page URL) and stops the
+   * moment that intent lapses.
+   */
+  let translateAllIntent: TranslateAllIntent | undefined;
 
   const indexOf = (candidate: Candidate): number =>
     order.findIndex((c) => c.id === candidate.id);
@@ -886,14 +952,48 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
     }
   }
 
-  /** Cancel a candidate's in-flight request, if any (item 4). Fire-and-forget. */
-  const cancel = (rec: Tracked): void => {
+  /**
+   * Cancel a candidate's in-flight request, if any (item 4). Fire-and-forget.
+   *
+   * `mode` (Phase 9.6 §1) picks the background cancel semantics:
+   *  - `"queued-only"` (the DOM-reconcile `unregister` path) spares a started
+   *    provider call — MangaDex recycles `<img>` elements mid-scroll, and killing
+   *    the in-flight tail-page jobs those unregisters trigger refunds nothing while
+   *    destroying the cache value the recycled element's §2 re-send would hit.
+   *  - `"hard"` (teardown `stop()`) aborts unconditionally — the user is switching
+   *    off / leaving, so respect it.
+   */
+  const cancel = (rec: Tracked, mode: "hard" | "queued-only"): void => {
     if (!rec.requestId) return;
     const requestId = rec.requestId;
     rec.requestId = undefined;
-    void sendToBackground("cancelTranslation", { requestId }).catch((err) =>
+    void sendToBackground("cancelTranslation", { requestId, mode }).catch((err) =>
       log.warn("cancelTranslation failed", err),
     );
+  };
+
+  /**
+   * Phase 9.6 §2: if the translate-all intent is armed for the CURRENT page,
+   * auto-send this freshly-registered candidate at {@link TRANSLATE_ALL_PRIORITY}
+   * (a recycled `<img>`'s new candidate re-sends → coalesces/cache-hits; a late
+   * lazy-loaded page finally sends). Lazily disarms the intent on an href mismatch
+   * (an SPA chapter change). Returns whether a send was fired.
+   *
+   * The `!translateAllIntent` fast-path means the common (unarmed) case never even
+   * reads `getHref()`, so a location-less runtime is untouched unless intent is armed.
+   * `sendTranslate`'s own `requested` re-check dedupes against anything already in
+   * flight, so a double registration can't double-send.
+   */
+  const maybeAutoSendForIntent = (candidate: Candidate): boolean => {
+    if (!translateAllIntent) return false;
+    const action = classifyRegisterIntent(translateAllIntent, getHref(), paused);
+    if (action === "disarm") {
+      translateAllIntent = undefined; // SPA navigated off the clicked chapter
+      return false;
+    }
+    if (action !== "send") return false;
+    void sendTranslate(candidate, TRANSLATE_ALL_PRIORITY, translateAllIntent.budgetMs);
+    return true;
   };
 
   // --- Phase 7.6 cache-only hydrate -----------------------------------------
@@ -1021,11 +1121,17 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
         safe(() => visibleObserver.observe(candidate.el));
         safe(() => nearObserver.observe(candidate.el));
       }
+      // §2: translate-all persistence. A recycled `<img>` (or a late lazy-loaded
+      // page) registers as a fresh candidate after the burst already ran and would
+      // otherwise stay blank; while the intent is armed for THIS page, auto-send it.
+      const autoSent = safeBool(() => maybeAutoSendForIntent(candidate));
       // Hydrate probe (Phase 7.6): non-auto sites only (autoEnqueue and hydrate are
       // complementary). Probing on register — not one batch at activation — covers
       // lazily-added images for free. Fire-and-forget; the origin gate + concurrency
-      // gate inside keep it cheap and bounded.
-      if (hydrate) void maybeProbe(candidate);
+      // gate inside keep it cheap and bounded. Skip it when §2 just fired a real send
+      // for this candidate — the invisible probe would only lose the race (§2
+      // micro-cleanup, flagged in PROGRESS).
+      if (hydrate && !autoSent) void maybeProbe(candidate);
     },
 
     unregister(candidate: Candidate): void {
@@ -1037,7 +1143,9 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
       cancelConfirm(rec); // §2: no dangling confirm → no post-removal send
       safe(() => visibleObserver.unobserve(candidate.el));
       safe(() => nearObserver.unobserve(candidate.el));
-      cancel(rec); // stop paying the provider for work nobody will see (item 4)
+      // §1: soft-cancel — a started run finishes + caches (the recycled element's
+      // §2 re-send hits it); only a still-queued job is aborted (it cost nothing).
+      cancel(rec, "queued-only");
       safe(() => overlay.clear(candidate));
     },
 
@@ -1054,6 +1162,11 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
         // each send a backlog-scaled timeout instead of the flat 120 s (which a
         // 200-page chapter blows, churning resets). Visibility sends keep 120 s.
         const budget = requestAllTimeoutMs(pending.length, concurrency, requestTimeoutMs);
+        // Phase 9.6 §2: arm the persistent intent for THIS page so a candidate
+        // REGISTERED LATER — a recycled element's fresh candidate (the MangaDex
+        // element-churn hole) or a late lazy-loaded page — auto-sends at the same
+        // priority + budget instead of staying blank. A dry-run never arms it.
+        translateAllIntent = { href: getHref(), budgetMs: budget };
         for (const c of pending) void sendTranslate(c, TRANSLATE_ALL_PRIORITY, budget);
       }
       return pending.length;
@@ -1109,6 +1222,10 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
       if (next === paused) return 0;
       paused = next;
       if (next) {
+        // §2: pausing revokes the translate-all intent — the user chose to stop
+        // spending, so a later-registered candidate must NOT auto-send. Resume does
+        // not re-arm it; the user re-clicks Translate all to buy the rest.
+        translateAllIntent = undefined;
         // Collect every tracked job's live requestId and cancel the queued ones in
         // ONE message; already-STARTED calls finish + render (background skips
         // them). An id present here but not yet started is aborted; its
@@ -1141,9 +1258,10 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
 
     stop(): void {
       probeQueue.length = 0; // drop not-yet-started hydrate probes (item: teardown)
+      translateAllIntent = undefined; // §2: teardown revokes translate-all persistence
       for (const rec of tracked.values()) {
         cancelConfirm(rec); // §2: no confirm may fire after teardown
-        cancel(rec);
+        cancel(rec, "hard"); // teardown: the user is leaving — abort unconditionally
       }
       tracked.clear();
       order.length = 0;
@@ -1176,5 +1294,15 @@ function safe(fn: () => void): void {
     fn();
   } catch (err) {
     log.warn("viewport-queue step failed", err);
+  }
+}
+
+/** {@link safe} for a boolean-returning step: any throw degrades to `false` (rule 6). */
+function safeBool(fn: () => boolean): boolean {
+  try {
+    return fn();
+  } catch (err) {
+    log.warn("viewport-queue step failed", err);
+    return false;
   }
 }

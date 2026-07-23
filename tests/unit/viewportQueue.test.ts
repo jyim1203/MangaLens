@@ -10,6 +10,7 @@ vi.mock("../../src/shared/messages", () => ({ sendToBackground: vi.fn() }));
 import {
   TRANSLATE_ALL_MAX_TIMEOUT_MS,
   TRANSLATE_ALL_PRIORITY,
+  classifyRegisterIntent,
   createViewportQueue,
   planEnqueues,
   requestAllTimeoutMs,
@@ -798,7 +799,11 @@ describe("viewportQueue — cache-only hydrate (Phase 7.6)", () => {
     expect(probeCalls()).toHaveLength(1);
 
     queue.unregister(cand);
-    expect(mockSend).toHaveBeenCalledWith("cancelTranslation", { requestId: "rq" });
+    // §1: the DOM-reconcile unregister path sends the soft "queued-only" mode.
+    expect(mockSend).toHaveBeenCalledWith("cancelTranslation", {
+      requestId: "rq",
+      mode: "queued-only",
+    });
     queue.stop();
   });
 
@@ -1172,6 +1177,153 @@ describe("viewportQueue — autoEnqueue=false (per-site opt-in, item 3)", () => 
       expect(io.observeLog).toEqual([]);
       expect(io.unobserveLog).toEqual([]);
     }
+    queue.stop();
+  });
+});
+
+describe("viewportQueue — classifyRegisterIntent (§2 persistence predicate)", () => {
+  const intent = { href: "https://mangadex.org/ch/1", budgetMs: 90_000 };
+
+  it("no intent armed → ignore", () => {
+    expect(classifyRegisterIntent(undefined, "https://mangadex.org/ch/1", false)).toBe(
+      "ignore",
+    );
+  });
+
+  it("armed + same href + not paused → send", () => {
+    expect(classifyRegisterIntent(intent, "https://mangadex.org/ch/1", false)).toBe("send");
+  });
+
+  it("armed + same href + paused → ignore (a paused queue never auto-sends)", () => {
+    expect(classifyRegisterIntent(intent, "https://mangadex.org/ch/1", true)).toBe("ignore");
+  });
+
+  it("armed + different href → disarm (SPA chapter change), regardless of pause", () => {
+    expect(classifyRegisterIntent(intent, "https://mangadex.org/ch/2", false)).toBe("disarm");
+    expect(classifyRegisterIntent(intent, "https://mangadex.org/ch/2", true)).toBe("disarm");
+  });
+});
+
+describe("viewportQueue — translate-all persistence across recycling (§2 shell)", () => {
+  beforeEach(() => {
+    FakeIO.instances = [];
+    mockSend.mockReset();
+    vi.stubGlobal("Node", { DOCUMENT_POSITION_FOLLOWING: 4 });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const fakeEl = (): Element =>
+    ({
+      compareDocumentPosition: () => 2,
+      getBoundingClientRect: () => VISIBLE_RECT,
+    }) as unknown as Element;
+  const cand = (id: string): Candidate => ({ id, el: fakeEl(), url: `https://x/${id}.jpg` });
+
+  /** A NON-auto site (autoEnqueue false) — the exact hole: translate-all works,
+   *  visibility never sends, so §2 is the only path that reaches a recycled page. */
+  function makeQueue(overlay: OverlaySink, getHref: () => string) {
+    return createViewportQueue({
+      overlay,
+      prefetchAhead: 0,
+      concurrency: 6,
+      autoEnqueue: false,
+      hydrate: false,
+      makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
+      getHref,
+      createObserver: (cb, options) =>
+        new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+  }
+
+  const translateCalls = () =>
+    mockSend.mock.calls.filter((c) => c[0] === "translatePage");
+
+  it("a real requestAll arms the intent → a later registration auto-sends at translate-all priority", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const overlay = fakeOverlay();
+    const queue = makeQueue(overlay, () => "https://mangadex.org/ch/1");
+    queue.register(cand("a"));
+    queue.register(cand("b"));
+    expect(queue.requestAll()).toBe(2); // sends a + b, arms the intent
+    expect(translateCalls()).toHaveLength(2);
+
+    // A recycled <img>'s fresh candidate (or a late lazy-loaded page) registers
+    // AFTER the burst → §2 auto-sends it instead of leaving it blank.
+    const late = cand("c");
+    queue.register(late);
+    await tick();
+    expect(translateCalls()).toHaveLength(3);
+    expect(translateCalls()[2]![1]).toMatchObject({
+      imageUrl: late.url,
+      priority: TRANSLATE_ALL_PRIORITY,
+    });
+    expect(overlay.setPending).toHaveBeenCalledWith(late);
+    queue.stop();
+  });
+
+  it("a dry-run requestAll does NOT arm the intent", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const queue = makeQueue(fakeOverlay(), () => "https://mangadex.org/ch/1");
+    queue.register(cand("a"));
+    expect(queue.requestAll(true)).toBe(1); // counts only — sends nothing, arms nothing
+    expect(translateCalls()).toHaveLength(0);
+
+    queue.register(cand("b"));
+    await tick();
+    expect(translateCalls()).toHaveLength(0); // unarmed → no auto-send
+    queue.stop();
+  });
+
+  it("setPaused(true) disarms → a later registration is not auto-sent", async () => {
+    mockSend.mockImplementation((type: string) =>
+      type === "cancelQueuedTranslations"
+        ? Promise.resolve({ cancelled: 0 })
+        : new Promise<never>(() => {}),
+    );
+    const queue = makeQueue(fakeOverlay(), () => "https://mangadex.org/ch/1");
+    queue.register(cand("a"));
+    queue.requestAll(); // arm + send a
+    expect(translateCalls()).toHaveLength(1);
+
+    await queue.setPaused(true); // revoke the intent
+    queue.register(cand("b"));
+    await tick();
+    expect(translateCalls()).toHaveLength(1); // disarmed → no auto-send
+    queue.stop();
+  });
+
+  it("stop() disarms → a registration afterward is not auto-sent", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const queue = makeQueue(fakeOverlay(), () => "https://mangadex.org/ch/1");
+    queue.register(cand("a"));
+    queue.requestAll(); // arm + send a
+    expect(translateCalls()).toHaveLength(1);
+
+    queue.stop(); // teardown revokes the intent
+    queue.register(cand("b"));
+    await tick();
+    expect(translateCalls()).toHaveLength(1);
+  });
+
+  it("an href mismatch at register time disarms and does not send (SPA chapter change)", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    let href = "https://mangadex.org/ch/1";
+    const queue = makeQueue(fakeOverlay(), () => href);
+    queue.register(cand("a"));
+    queue.requestAll(); // arm on ch/1 + send a
+    expect(translateCalls()).toHaveLength(1);
+
+    href = "https://mangadex.org/ch/2"; // SPA navigated to a new chapter
+    queue.register(cand("b")); // a new chapter's image must NOT inherit the intent
+    await tick();
+    expect(translateCalls()).toHaveLength(1);
+
+    // The intent is now permanently disarmed — returning to ch/1 does not re-arm it.
+    href = "https://mangadex.org/ch/1";
+    queue.register(cand("c"));
+    await tick();
+    expect(translateCalls()).toHaveLength(1);
     queue.stop();
   });
 });

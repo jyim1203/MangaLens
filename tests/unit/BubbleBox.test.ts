@@ -7,7 +7,10 @@
  * call-site wiring, which the pure tables can't express.
  */
 import { describe, expect, it } from "vitest";
-import { renderBubbleBox } from "../../src/content/overlay/BubbleBox";
+import {
+  effectiveFillOpacity,
+  renderBubbleBox,
+} from "../../src/content/overlay/BubbleBox";
 import type { FontSettings } from "../../src/shared/settings";
 import type { PxRect } from "../../src/content/overlay/geometry";
 import type { TranslatedRegion } from "../../src/shared/types";
@@ -160,6 +163,90 @@ describe("BubbleBox — Phase 9.2 narrow-rect rescue", () => {
     const label = textLayer.children[0] as HTMLElement;
     expect(parseFloat(textLayer.style.width)).toBeCloseTo(88, 5); // widened
     expect(parseFloat(label.style.fontSize)).toBe(11); // capped on the widened width
+  });
+});
+
+describe("BubbleBox — Phase 9.4 §1 effectiveFillOpacity (opaque snap-failure fallback)", () => {
+  it("a bubble whose snap accepted no blob (undefined fillColor) → opaque 1", () => {
+    expect(effectiveFillOpacity("bubble", undefined, 0.92)).toBe(1);
+  });
+
+  it("a thought bubble with no fillColor also → opaque 1", () => {
+    expect(effectiveFillOpacity("thought", undefined, 0.92)).toBe(1);
+  });
+
+  it("a successfully-snapped bubble (fillColor set) keeps the user opacity", () => {
+    expect(effectiveFillOpacity("bubble", "#ffffff", 0.92)).toBe(0.92);
+  });
+
+  it("non-bubble kinds with no fillColor keep the user opacity (art stays visible)", () => {
+    expect(effectiveFillOpacity("sfx", undefined, 0.92)).toBe(0.92);
+    expect(effectiveFillOpacity("caption", undefined, 0.92)).toBe(0.92);
+    expect(effectiveFillOpacity(undefined, undefined, 0.92)).toBe(0.92);
+  });
+
+  it("is deterministic", () => {
+    expect(effectiveFillOpacity("bubble", undefined, 0.5)).toBe(
+      effectiveFillOpacity("bubble", undefined, 0.5),
+    );
+  });
+
+  it("renders a fallback bubble's fill node fully opaque", () => {
+    const box = renderBubbleBox(region(), RECT, FONT, makeMeasure); // bubble, no fillColor
+    const fill = box.children[0] as HTMLElement;
+    expect(fill.style.opacity).toBe("1");
+  });
+
+  it("renders a snapped bubble's fill node at the user opacity", () => {
+    const box = renderBubbleBox(region({ fillColor: "#ffffff" }), RECT, FONT, makeMeasure);
+    const fill = box.children[0] as HTMLElement;
+    expect(fill.style.opacity).toBe("0.92");
+  });
+
+  it("renders an SFX fallback at the user opacity (never whited out)", () => {
+    const box = renderBubbleBox(region({ kind: "sfx" }), RECT, FONT, makeMeasure);
+    const fill = box.children[0] as HTMLElement;
+    expect(fill.style.opacity).toBe("0.92");
+  });
+});
+
+describe("BubbleBox — Phase 9.4 §3 suppressFill (contained-fill suppression)", () => {
+  it("omits the fill node but still paints the label when suppressFill is set", () => {
+    const box = renderBubbleBox(region(), RECT, FONT, makeMeasure, { suppressFill: true });
+    // No fill node — the only child is the label.
+    expect(box.children.length).toBe(1);
+    const label = box.children[0] as HTMLElement;
+    expect(label.style.zIndex).toBe("2"); // it's the label, not a fill
+    expect(label.textContent).toBe("Hello");
+  });
+
+  it("draws the fill node by default (suppressFill unset)", () => {
+    const box = renderBubbleBox(region(), RECT, FONT, makeMeasure);
+    expect(box.children.length).toBe(2); // fill + label
+    expect((box.children[0] as HTMLElement).style.zIndex).toBe("1");
+  });
+});
+
+describe("BubbleBox — Phase 9.5 §3 drawRect (fallback cover-pad geometry)", () => {
+  it("lays the box out at the supplied cover rect (wider fill + larger text rect)", () => {
+    const drawRect: PxRect = { left: 10, top: 10, width: 150, height: 150 };
+    const box = renderBubbleBox(region(), RECT, FONT, makeMeasure, { drawRect });
+    // The box element uses the cover rect, not the (smaller) region px rect.
+    expect(box.style.left).toBe("10px");
+    expect(box.style.top).toBe("10px");
+    expect(box.style.width).toBe("150px");
+    expect(box.style.height).toBe("150px");
+    // The derived inner text rect grows with the box, so the label gets more room.
+    const label = box.children[1] as HTMLElement; // no shape → label is a direct child
+    const boxNoPad = renderBubbleBox(region(), RECT, FONT, makeMeasure);
+    const labelNoPad = boxNoPad.children[1] as HTMLElement;
+    expect(parseFloat(label.style.width)).toBeGreaterThan(parseFloat(labelNoPad.style.width));
+  });
+
+  it("uses the region's own rect when no drawRect is supplied (snapped/unchanged path)", () => {
+    const box = renderBubbleBox(region({ fillColor: "#ffffff" }), RECT, FONT, makeMeasure);
+    expect(box.style.left).toBe("0px");
+    expect(box.style.width).toBe("100px"); // RECT, untouched
   });
 });
 

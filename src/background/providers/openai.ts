@@ -22,7 +22,9 @@ import {
 import { toOpenAiBatchSchema, toOpenAiStrictSchema } from "./prompt";
 import {
   getEndpointMode,
+  isSamplingRejected,
   learnEndpointMode,
+  learnSamplingRejected,
   resetEndpointModes,
 } from "../endpointModes";
 import type { ProviderId } from "../../shared/types";
@@ -74,9 +76,13 @@ export class OpenAiProvider extends ProviderBase {
         ? `${ctx.systemPrompt}\n\nReturn a JSON object matching this schema exactly:\n${JSON.stringify(schema)}`
         : ctx.systemPrompt;
 
+    // gpt-5.x/o-series reasoning models 400 on any non-default `temperature`
+    // ("Only the default (1) value is supported"). Same learn-on-400 memo the
+    // Anthropic provider uses — omit it once the model is known to reject it.
+    const temperature = isSamplingRejected(ctx.model) ? undefined : ctx.temperature;
     const body: Record<string, unknown> = {
       model: ctx.model,
-      ...(ctx.temperature !== undefined && { temperature: ctx.temperature }),
+      ...(temperature !== undefined && { temperature }),
       messages: [
         { role: "system", content: system },
         {
@@ -119,9 +125,10 @@ export class OpenAiProvider extends ProviderBase {
         ? `${ctx.systemPrompt}\n\nReturn a JSON object matching this schema exactly:\n${JSON.stringify(schema)}`
         : ctx.systemPrompt;
 
+    const temperature = isSamplingRejected(ctx.model) ? undefined : ctx.temperature;
     const body: Record<string, unknown> = {
       model: ctx.model,
-      ...(ctx.temperature !== undefined && { temperature: ctx.temperature }),
+      ...(temperature !== undefined && { temperature }),
       messages: [
         { role: "system", content: system },
         {
@@ -190,6 +197,26 @@ export class OpenAiProvider extends ProviderBase {
     ctx: C,
     bodyText: string,
   ): C | null {
+    // A 400 blaming `temperature` means this model rejects a non-default value
+    // (gpt-5.x / o-series only allow the default 1): remember the model and
+    // retry once with it omitted. Checked before the response_format downgrade
+    // because the two 400 causes are independent and the retry is one-shot.
+    //
+    // WHY the retry decision keys off `ctx.temperature` (what THIS request sent)
+    // and NOT `isSamplingRejected(ctx.model)`: the memo is shared and set
+    // SYNCHRONOUSLY the instant any sibling learns. At concurrency N the whole
+    // first wave builds with temperature (memo empty) and all 400 together; if
+    // the retry were gated on `!isSamplingRejected`, the first sibling to process
+    // its 400 flips the memo and every OTHER sibling then skips this branch,
+    // falls through to a null downgrade, and blanks permanently (only the winner
+    // recovers). `ctx.temperature !== undefined` already excludes the
+    // already-learned case (buildRequest omits temperature once the memo is set,
+    // so a later request never sends it) and `allowDowngrade=false` on the retry
+    // prevents any loop — so the memo guard was pure harm.
+    if (ctx.temperature !== undefined && /temperature/i.test(bodyText)) {
+      learnSamplingRejected(ctx.model);
+      return { ...ctx, temperature: undefined };
+    }
     // Only worth retrying if we haven't already downgraded and the server is
     // complaining about the structured-output request specifically. Generic over
     // the context so the single-page AND batch requests share this downgrade.

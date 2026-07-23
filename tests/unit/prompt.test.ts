@@ -62,11 +62,17 @@ describe("prompt — buildSystemPrompt", () => {
     expect(sys).toContain("left-to-right, top-to-bottom.");
   });
 
-  it("uses the Phase 7.4 corner-format bbox rule + no-overlap line", () => {
+  it("uses the Phase 9.5 whole-balloon per-kind bbox rule (corner format kept)", () => {
     const sys = buildSystemPrompt(buildPromptContext(settings()));
     expect(sys).toContain("[x_min, y_min, x_max, y_max]");
     expect(sys).toContain("x_max must be greater than x_min");
-    expect(sys).toContain("Boxes for different regions should not overlap.");
+    // §1: bubbles/thoughts box the ENTIRE balloon; on-art text stays tight; one
+    // box per balloon lobe.
+    expect(sys).toContain("enclose the ENTIRE balloon");
+    expect(sys).toContain("box the TEXT tightly");
+    expect(sys).toContain("One box per balloon.");
+    // The old tight-text-only rule is gone.
+    expect(sys).not.toContain("tightly enclose the TEXT itself, not the entire bubble outline");
     // The old w/h wording is gone.
     expect(sys).not.toContain("[x, y, width, height]");
   });

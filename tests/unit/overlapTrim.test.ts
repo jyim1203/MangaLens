@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { trimOverlaps } from "../../src/content/overlay/overlapTrim";
+import {
+  computeContainedFillSuppression,
+  trimOverlaps,
+} from "../../src/content/overlay/overlapTrim";
 import type { BBox, TranslatedRegion } from "../../src/shared/types";
 
 /** A minimal region at `bbox` (text/flags irrelevant to the geometry). */
@@ -91,5 +94,57 @@ describe("overlay/overlapTrim — trimOverlaps (Phase 7.4 item 3)", () => {
       region({ x: 0.5, y: 0.5, w: 0.2, h: 0.2 }),
     ];
     expect(trimOverlaps(input)).toEqual(trimOverlaps(input));
+  });
+});
+
+describe("overlay/overlapTrim — computeContainedFillSuppression (Phase 9.4 §3)", () => {
+  it("suppresses the INNER fill of a contained pair, not the outer", () => {
+    const outer = region({ x: 0.1, y: 0.1, w: 0.4, h: 0.4 });
+    const inner = region({ x: 0.2, y: 0.2, w: 0.1, h: 0.1 });
+    expect(computeContainedFillSuppression([outer, inner])).toEqual([false, true]);
+    // Order-independent: the inner region is suppressed wherever it sits.
+    expect(computeContainedFillSuppression([inner, outer])).toEqual([true, false]);
+  });
+
+  it("for exact-equal boxes suppresses only the LATER one in reading order", () => {
+    const box = { x: 0.2, y: 0.2, w: 0.3, h: 0.3 };
+    expect(computeContainedFillSuppression([region(box), region(box)])).toEqual([
+      false,
+      true,
+    ]);
+  });
+
+  it("does not suppress disjoint boxes (regression: fill behaviour unchanged)", () => {
+    const a = region({ x: 0.1, y: 0.1, w: 0.2, h: 0.2 });
+    const b = region({ x: 0.5, y: 0.5, w: 0.2, h: 0.2 });
+    expect(computeContainedFillSuppression([a, b])).toEqual([false, false]);
+  });
+
+  it("does not suppress a partial overlap (neither box contains the other)", () => {
+    const a = region({ x: 0.1, y: 0.1, w: 0.3, h: 0.3 });
+    const b = region({ x: 0.3, y: 0.3, w: 0.3, h: 0.3 });
+    expect(computeContainedFillSuppression([a, b])).toEqual([false, false]);
+  });
+
+  it("a three-region nest suppresses the middle and inner, never the outer", () => {
+    const outer = region({ x: 0.0, y: 0.0, w: 0.9, h: 0.9 });
+    const mid = region({ x: 0.1, y: 0.1, w: 0.5, h: 0.5 });
+    const inner = region({ x: 0.2, y: 0.2, w: 0.1, h: 0.1 });
+    expect(computeContainedFillSuppression([outer, mid, inner])).toEqual([
+      false,
+      true,
+      true,
+    ]);
+  });
+
+  it("is pure and deterministic (no mutation, same input → same output)", () => {
+    const input = [
+      region({ x: 0.1, y: 0.1, w: 0.4, h: 0.4 }),
+      region({ x: 0.2, y: 0.2, w: 0.1, h: 0.1 }),
+    ];
+    const snapshot = JSON.parse(JSON.stringify(input));
+    const first = computeContainedFillSuppression(input);
+    expect(input).toEqual(snapshot); // untouched
+    expect(computeContainedFillSuppression(input)).toEqual(first);
   });
 });

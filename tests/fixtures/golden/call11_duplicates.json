@@ -1,0 +1,29 @@
+{
+  "source_lang": "zh",
+  "regions": [
+    { "bbox": [0.02, 0.02, 0.08, 0.07], "original": "filler-00", "translated": "F00", "is_sfx": false },
+    { "bbox": [0.21, 0.02, 0.27, 0.07], "original": "filler-01", "translated": "F01", "is_sfx": false },
+    { "bbox": [0.40, 0.02, 0.46, 0.07], "original": "filler-02", "translated": "F02", "is_sfx": false },
+    { "bbox": [0.59, 0.02, 0.65, 0.07], "original": "filler-03", "translated": "F03", "is_sfx": false },
+    { "bbox": [0.78, 0.02, 0.84, 0.07], "original": "filler-04", "translated": "F04", "is_sfx": false },
+    { "bbox": [0.02, 0.09, 0.08, 0.14], "original": "filler-05", "translated": "F05", "is_sfx": false },
+    { "bbox": [0.21, 0.09, 0.27, 0.14], "original": "filler-06", "translated": "F06", "is_sfx": false },
+    { "bbox": [0.40, 0.09, 0.46, 0.14], "original": "filler-07", "translated": "F07", "is_sfx": false },
+    { "bbox": [0.59, 0.09, 0.65, 0.14], "original": "filler-08", "translated": "F08", "is_sfx": false },
+    { "bbox": [0.78, 0.09, 0.84, 0.14], "original": "filler-09", "translated": "F09", "is_sfx": false },
+    { "bbox": [0.02, 0.16, 0.08, 0.21], "original": "filler-10", "translated": "F10", "is_sfx": false },
+    { "bbox": [0.21, 0.16, 0.27, 0.21], "original": "filler-11", "translated": "F11", "is_sfx": false },
+    { "bbox": [0.40, 0.16, 0.46, 0.21], "original": "filler-12", "translated": "F12", "is_sfx": false },
+    { "bbox": [0.59, 0.16, 0.65, 0.21], "original": "filler-13", "translated": "F13", "is_sfx": false },
+    { "bbox": [0.78, 0.16, 0.84, 0.21], "original": "filler-14", "translated": "F14", "is_sfx": false },
+    { "bbox": [0.02, 0.23, 0.08, 0.28], "original": "filler-15", "translated": "F15", "is_sfx": false },
+    { "bbox": [0.21, 0.23, 0.27, 0.28], "original": "filler-16", "translated": "F16", "is_sfx": false },
+    { "bbox": [0.40, 0.23, 0.46, 0.28], "original": "filler-17", "translated": "F17", "is_sfx": false },
+    { "bbox": [0.59, 0.23, 0.65, 0.28], "original": "filler-18", "translated": "F18", "is_sfx": false },
+    { "bbox": [0.480, 0.650, 0.650, 0.620], "original": "讓其結合並提高密度的話", "translated": "...bond and increase the density,", "is_sfx": false, "kind": "bubble" },
+    { "bbox": [0.480, 0.620, 0.660, 0.760], "original": "讓其結合並提高密度的話", "translated": "...bond and increase the density,", "is_sfx": false, "kind": "bubble" },
+    { "bbox": [0.10, 0.55, 0.30, 0.75], "original": "與此類似", "translated": "it's similar to magic power too.", "is_sfx": false, "kind": "bubble" },
+    { "bbox": [0.12, 0.57, 0.37, 0.82], "original": "與此類似", "translated": "it's similar to magic power too.", "is_sfx": false, "kind": "bubble" },
+    { "bbox": [0.75, 0.55, 0.90, 0.70], "original": "與此類似", "translated": "it's similar to magic power too.", "is_sfx": false, "kind": "bubble" }
+  ]
+}

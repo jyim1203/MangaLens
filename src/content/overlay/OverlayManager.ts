@@ -21,7 +21,8 @@ import type { Candidate } from "../scanner";
 import { displayedSizeChanged, regionToPx, type PxRect, type Size } from "./geometry";
 import { readContentBox } from "./contentBox";
 import { filterRegions } from "./regionFilter";
-import { trimOverlaps } from "./overlapTrim";
+import { computeContainedFillSuppression, trimOverlaps } from "./overlapTrim";
+import { computeFallbackCoverRects } from "./coverPad";
 import { errorKindToMessage } from "./errorMessages";
 import { createShadowMeasurer, renderBubbleBox } from "./BubbleBox";
 import { hitTestRegion, peekRepaintTargets, type PeekHover } from "./peek";
@@ -462,8 +463,24 @@ export class OverlayManager {
         translateSfx: this.settings.translateSfx,
       }),
     );
+    // Phase 9.4 §3: a region whose trimmed draw box is fully contained by
+    // another's suppresses its (redundant) fill — the outer fill already covers
+    // it. Parallel to `regions`, indexed by the raw region index below; keeps the
+    // label. Pure/deterministic, so it stays aligned across repaints.
+    const suppressFills = computeContainedFillSuppression(regions);
     const displayedW = contentRect.width;
     const displayedH = contentRect.height;
+    // Overlay-local px rects for every region (one bbox→px map per region, §7.2).
+    // Computed up front so the §3 cover-pad can clamp each snap-failure bubble
+    // against its NEIGHBOURS' rects; snapped/non-bubble entries pass through as-is.
+    const rects = regions.map((r) => regionToPx(r.bbox, displayedW, displayedH));
+    // Phase 9.5 §3: grow a snap-FAILURE bubble's fallback fill outward toward
+    // balloon size, neighbour-clamped so it never spills onto an adjacent region.
+    // Parallel to `regions`/`rects`; every other region returns its own rect.
+    const coverRects = computeFallbackCoverRects(regions, rects, {
+      width: displayedW,
+      height: displayedH,
+    });
     // Record the CONTENT size we're painting against so a later resize re-paints
     // only when the DRAWN bitmap actually changed (item 1, via displayedSizeChanged
     // in syncEntry — a Fit-Both→Fit-Width flip changes the bitmap size even if the
@@ -476,15 +493,21 @@ export class OverlayManager {
     // raw region index) so a skipped region can't desync hit-test vs. repaint.
     const paintedRects: PxRect[] = [];
 
-    for (const region of regions) {
+    for (let i = 0; i < regions.length; i++) {
+      const region = regions[i]!;
       try {
-        const px = regionToPx(region.bbox, displayedW, displayedH);
+        const px = rects[i]!;
+        // The box draws at its cover rect (§3) — identical to `px` for every
+        // snapped/non-bubble region — so peek hit-testing uses that drawn rect too.
+        const drawRect = coverRects[i]!;
         const peek = this.shouldPeek(entry.candidate.id, paintedRects.length);
         const box = renderBubbleBox(region, px, this.settings.font, makeMeasure, {
           peek,
+          suppressFill: suppressFills[i],
+          drawRect,
         });
         entry.container.appendChild(box);
-        paintedRects.push(px);
+        paintedRects.push(drawRect);
       } catch (err) {
         log.warn("failed to render region (skipping)", err);
       }

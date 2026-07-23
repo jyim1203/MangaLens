@@ -8,6 +8,7 @@ vi.mock("webextension-polyfill", () => ({ default: fakeBrowser }));
 
 import {
   callWithRateGate,
+  classifyCancel,
   createTranslateHandlers,
   errorToTranslateResult,
   getTranslationQueue,
@@ -47,6 +48,23 @@ function page(overrides: Partial<PageTranslation>): PageTranslation {
     ...overrides,
   };
 }
+
+describe("translateHandlers — classifyCancel (Phase 9.6 §1 decision table)", () => {
+  it("unknown id → unknown-noop regardless of mode/started", () => {
+    expect(classifyCancel("hard", false, false)).toBe("unknown-noop");
+    expect(classifyCancel("queued-only", false, true)).toBe("unknown-noop");
+  });
+
+  it("hard mode always aborts a registered id (started or queued)", () => {
+    expect(classifyCancel("hard", true, false)).toBe("hard-aborted");
+    expect(classifyCancel("hard", true, true)).toBe("hard-aborted");
+  });
+
+  it("queued-only spares a STARTED id but aborts a QUEUED one", () => {
+    expect(classifyCancel("queued-only", true, true)).toBe("started-spared");
+    expect(classifyCancel("queued-only", true, false)).toBe("queued-aborted");
+  });
+});
 
 describe("translateHandlers — mergeTilePages", () => {
   it("returns a single tile as-is but stamps the page-level hash", () => {

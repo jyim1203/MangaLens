@@ -187,6 +187,80 @@ describe("OpenAiProvider", () => {
     expect(page.regions).toHaveLength(1);
   });
 
+  it("drops temperature after a 400 that names it, then memoizes per model (gpt-5.x/o-series)", async () => {
+    const okBody = () =>
+      jsonResponse({ choices: [{ message: { content: JSON.stringify(VALID_PAGE) } }] });
+    // Reasoning models 400 with: temperature does not support 0.25 ... only the default (1).
+    const firstFetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            error: {
+              message:
+                "Unsupported value: 'temperature' does not support 0.25 with this model. Only the default (1) value is supported.",
+              code: "unsupported_value",
+            },
+          },
+          { status: 400 },
+        ),
+      )
+      .mockResolvedValueOnce(okBody());
+    const page = await run(
+      createOpenAiProvider({ fetchFn: firstFetch }),
+      makeSettings({ provider: "openai" }),
+    );
+    expect(page.regions).toHaveLength(1);
+    expect(firstFetch).toHaveBeenCalledTimes(2);
+    expect(requestBody(firstFetch, 0)).toHaveProperty("temperature", 0.25);
+    expect(requestBody(firstFetch, 1)).not.toHaveProperty("temperature");
+
+    // Memoized per model: a FRESH instance omits temperature up front, no re-paid 400.
+    const secondFetch = vi.fn().mockResolvedValue(okBody());
+    await run(createOpenAiProvider({ fetchFn: secondFetch }), makeSettings({ provider: "openai" }));
+    expect(secondFetch).toHaveBeenCalledTimes(1);
+    expect(requestBody(secondFetch)).not.toHaveProperty("temperature");
+  });
+
+  it("recovers EVERY concurrent request from a temperature-400, not just the learn-race winner", async () => {
+    // The concurrency-N first wave all build with temperature before any sibling
+    // has learned the model rejects it, so all 400 together. The shared memo is
+    // set synchronously by the first to recover; the retry must NOT be gated on
+    // it or the other siblings skip their retry and blank permanently (the live
+    // HAR: 5 of 6 first-wave pages 400'd and never retried). Body-keyed mock: any
+    // request carrying `temperature` 400s; the retry (temperature dropped) succeeds.
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse((init?.body as string) ?? "{}") as Record<string, unknown>;
+      if ("temperature" in body) {
+        return Promise.resolve(
+          jsonResponse(
+            {
+              error: {
+                message:
+                  "Unsupported value: 'temperature' does not support 0.25 with this model. Only the default (1) value is supported.",
+                code: "unsupported_value",
+              },
+            },
+            { status: 400 },
+          ),
+        );
+      }
+      return Promise.resolve(
+        jsonResponse({ choices: [{ message: { content: JSON.stringify(VALID_PAGE) } }] }),
+      );
+    });
+    const provider = createOpenAiProvider({ fetchFn: fetchMock });
+    const results = await Promise.all([
+      run(provider, makeSettings({ provider: "openai" })),
+      run(provider, makeSettings({ provider: "openai" })),
+    ]);
+    // BOTH pages translated (before the fix the second rejected with the raw 400).
+    expect(results[0].regions).toHaveLength(1);
+    expect(results[1].regions).toHaveLength(1);
+    // Each page: one rejected initial send + one temperature-dropped retry.
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
   it("maps an OpenAI structured refusal to a refusal error", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse({ choices: [{ message: { refusal: "I can't help with that." } }] }),
@@ -297,6 +371,36 @@ describe("AnthropicProvider", () => {
     );
     expect(secondFetch).toHaveBeenCalledTimes(1);
     expect(requestBody(secondFetch)).not.toHaveProperty("temperature");
+  });
+
+  it("recovers EVERY concurrent request from a sampling-param 400 (shared memo race)", async () => {
+    // Same race as the OpenAI path: concurrent requests all send temperature and
+    // 400 together; the first to recover flips the shared memo, so the retry must
+    // key off what THIS request sent, not the memo, or the siblings blank.
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse((init?.body as string) ?? "{}") as Record<string, unknown>;
+      if ("temperature" in body) {
+        return Promise.resolve(
+          jsonResponse(
+            { error: { message: "temperature is not supported on this model" } },
+            { status: 400 },
+          ),
+        );
+      }
+      return Promise.resolve(
+        jsonResponse({
+          content: [{ type: "tool_use", name: "emit_translation", input: VALID_PAGE }],
+        }),
+      );
+    });
+    const provider = new AnthropicProvider("anthropic", { fetchFn: fetchMock });
+    const results = await Promise.all([
+      run(provider, makeSettings({ provider: "anthropic" })),
+      run(provider, makeSettings({ provider: "anthropic" })),
+    ]);
+    expect(results[0].regions).toHaveLength(1);
+    expect(results[1].regions).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
   it("honors a sampling rejection persisted by a PREVIOUS event-page lifetime", async () => {

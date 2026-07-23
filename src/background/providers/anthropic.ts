@@ -201,9 +201,15 @@ export class AnthropicProvider extends ProviderBase {
     // A 400 blaming a sampling param means this model rejects them (Claude
     // 4.6+): remember the model and retry once with temperature omitted. Generic
     // over the context so single-page AND batch requests share this downgrade.
-    if (ctx.temperature === undefined || isSamplingRejected(ctx.model)) {
-      return null;
-    }
+    //
+    // WHY gate ONLY on `ctx.temperature` (what THIS request sent) and NOT on
+    // `isSamplingRejected(ctx.model)`: the memo is shared and set synchronously,
+    // so under concurrency the first sibling to process its 400 flips it and the
+    // rest would skip the retry and blank permanently. `ctx.temperature ===
+    // undefined` already covers the already-learned case (buildRequest omits it
+    // once the memo is set) and `allowDowngrade=false` on the retry prevents a
+    // loop — so the memo check was pure harm. (See openai.ts for the full note.)
+    if (ctx.temperature === undefined) return null;
     if (!/temperature|top_p|top_k|sampling/i.test(bodyText)) return null;
     learnSamplingRejected(ctx.model);
     return { ...ctx, temperature: undefined };

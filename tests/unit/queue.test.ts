@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 // queue.ts imports only shared/guards (dependency-free) — no browser mock needed.
 import { PriorityQueue } from "../../src/background/queue";
@@ -154,6 +154,41 @@ describe("PriorityQueue — abort", () => {
     ac.abort();
     const q = new PriorityQueue({ concurrency: 1, signal: ac.signal });
     await expect(q.add(async () => "x")).rejects.toBeInstanceOf(DOMException);
+  });
+
+  it("§3 dead-signal guard: never invokes the task when the merged signal is aborted at start", async () => {
+    // A signal whose `addEventListener` is a NO-OP: the queue's per-job abort
+    // listener is never actually registered, so flipping `aborted` after enqueue
+    // does NOT remove the entry — it stays queued and reaches `start()` with an
+    // aborted parent, reproducing the dequeue→start abort window the guard closes.
+    let aborted = false;
+    const deadSignal = {
+      get aborted() {
+        return aborted;
+      },
+      reason: new DOMException("Aborted", "AbortError"),
+      addEventListener() {},
+      removeEventListener() {},
+      dispatchEvent() {
+        return false;
+      },
+      onabort: null,
+    } as unknown as AbortSignal;
+
+    const q = new PriorityQueue({ concurrency: 1 });
+    const gate = deferred();
+    q.add(() => gate.promise); // occupy the single slot so the next job stays queued
+
+    const task = vi.fn(async () => "ran");
+    const job = q.add(task, 0, deadSignal); // enqueued (aborted still false)
+    expect(q.size).toBe(1);
+
+    aborted = true; // dies while queued — no listener fires to remove it
+    gate.resolve(); // free the slot → the queued job dequeues and reaches start()
+
+    await expect(job).rejects.toBeInstanceOf(DOMException);
+    // The guard threw BEFORE the task — no ghost work (fetch) could ever run.
+    expect(task).not.toHaveBeenCalled();
   });
 });
 

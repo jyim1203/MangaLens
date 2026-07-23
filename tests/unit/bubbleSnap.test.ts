@@ -10,8 +10,10 @@ import {
   RESCUE_MIN_PROVIDER_OVERLAP,
   SHAPE_OUTWARD_OFFSET_PX,
   SHARED_BLOB_IOU,
+  SNAP_CONFINE_EXPAND_LOOSE,
   SNAP_MAX_EDGE,
   SNAP_MIN_SHORT_EDGE,
+  SNAP_VERSION,
   SWALLOW_COVERAGE,
   type SnapBitmap,
 } from "../../src/background/bubbleSnap";
@@ -914,6 +916,77 @@ describe("bubbleSnap — confinement wall-slam (Phase 9.3 §1)", () => {
   it("is deterministic (same leak bitmap → same null)", () => {
     expect(snapRegionToBubble(marginLeak(), LEAK_BOX)).toEqual(
       snapRegionToBubble(marginLeak(), LEAK_BOX),
+    );
+  });
+
+  it("the margin leak STILL returns null at the looser 1.0 wall (leak defense held)", () => {
+    // Phase 9.4 §2 pins the safety property: loosening the wall 0.5 → 1.0 must NOT
+    // reopen the 9.3 cross-panel leak. The far white region sits beyond 3× the box
+    // too, so the fill slams the 1.0 wall exactly as it slammed the 0.5 wall — the
+    // rejection is still the wall's, not a coincidence of the tighter setting.
+    expect(snapRegionToBubble(marginLeak(), LEAK_BOX, { confineExpand: 1.0 })).toBeNull();
+  });
+});
+
+// --- Phase 9.4 §2: bounded confinement cascade (recover real bubbles) --------
+
+describe("bubbleSnap — confinement cascade (Phase 9.4 §2)", () => {
+  /**
+   * An undersized+offset provider box on a real, COMPACT white bubble whose true
+   * extent runs past the 2× wall on the top/left but stays within 3×. The box
+   * center sits off the bubble (on art), but a quarter-point seed lands on it, so
+   * the MAIN path fills — and slams the 2× wall at 0.5. The rescue at 0.5 reaches
+   * the bubble too, but the blob covers only ~25 % of the provider box, so the
+   * ≥40 % rescue guard rejects it → null at 0.5. At the looser 1.0 wall the main
+   * fill no longer slams (the bubble is inside the 3× window) and accepts — no
+   * coverage guard on the main path. This is exactly the bubble §2 recovers.
+   */
+  function undersizedOffset(): SnapBitmap {
+    const bmp = grayBitmap(100, 100, GRAY);
+    fillRect(bmp, 43, 43, 55, 55, WHITE); // compact 13×13 bubble
+    return bmp;
+  }
+  // Box center (57,57) is off the bubble; the quarter seed (55,55) is on it.
+  const OFFSET_BOX: BBox = { x: 0.52, y: 0.52, w: 0.1, h: 0.1 };
+
+  it("returns null at the tight 0.5 wall (main slams, rescue guard rejects)", () => {
+    expect(snapRegionToBubble(undersizedOffset(), OFFSET_BOX)).toBeNull();
+  });
+
+  it("snaps at the looser 1.0 wall (the bubble is inside the 3× window)", () => {
+    const loose = snapRegionToBubble(undersizedOffset(), OFFSET_BOX, {
+      confineExpand: SNAP_CONFINE_EXPAND_LOOSE,
+    });
+    expect(loose).not.toBeNull();
+    // It hugs the real bubble (~[0.42,0.57] after the 1 px pad), not the box.
+    expect(loose!.bbox.x).toBeCloseTo(0.42, 6);
+    expect(loose!.bbox.w).toBeCloseTo(0.15, 6);
+  });
+
+  it("the Stage-1b cascade in snapAllRegions recovers it end-to-end", () => {
+    // Old behaviour (0.5 only) → null → §1 fallback; the cascade retries at 1.0.
+    const [snapped] = snapAllRegions(undersizedOffset(), [bubble(OFFSET_BOX)]);
+    expect(snapped).not.toBeNull();
+    expect(snapped!.bbox.w).toBeCloseTo(0.15, 6);
+  });
+
+  it("a fully-inside bubble is byte-identical at 0.5 and 1.0 (cascade never runs pass 2)", () => {
+    const bmp = grayBitmap(100, 100, GRAY);
+    fillEllipse(bmp, 50, 50, 15, 15, WHITE); // [35,65] — inside the box's 2× window
+    const box: BBox = { x: 0.35, y: 0.35, w: 0.3, h: 0.3 };
+    const tight = snapRegionToBubble(bmp, box); // default 0.5
+    const loose = snapRegionToBubble(bmp, box, { confineExpand: SNAP_CONFINE_EXPAND_LOOSE });
+    expect(tight).not.toBeNull();
+    expect(tight).toEqual(loose); // first pass accepts → identical result
+  });
+
+  it("SNAP_VERSION is 4 (the cascade changes snap output; delivered via free re-snap)", () => {
+    expect(SNAP_VERSION).toBe(4);
+  });
+
+  it("is deterministic (same bitmap → same recovered box)", () => {
+    expect(snapRegionToBubble(undersizedOffset(), OFFSET_BOX, { confineExpand: 1.0 })).toEqual(
+      snapRegionToBubble(undersizedOffset(), OFFSET_BOX, { confineExpand: 1.0 }),
     );
   });
 });

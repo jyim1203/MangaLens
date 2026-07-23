@@ -242,6 +242,60 @@ describe("ProviderBase — auth / abort guards (before any fetch)", () => {
   });
 });
 
+describe("ProviderBase — §3 dead-signal guard at callOnce (never fetch on a dead signal)", () => {
+  /**
+   * A provider whose `buildRequest` aborts a controller — simulating a cancel that
+   * lands AFTER `translatePage`'s entry `throwIfAborted` (the signal was live then)
+   * but BEFORE `callOnce` reaches `fetch`. `onBuild` fires each build so a test can
+   * choose to abort on the primary build or only on the repair re-entry.
+   */
+  class LateAbortProvider extends TestProvider {
+    onBuild: () => void = () => {};
+    protected override buildRequest(ctx: BuildContext): ProviderRequest {
+      this.onBuild();
+      return super.buildRequest(ctx);
+    }
+  }
+
+  it("does not call fetch when the signal aborts between entry and callOnce (primary path)", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(VALID_OUTPUT));
+    const provider = new LateAbortProvider("openai", {
+      fetchFn: fetchMock,
+      sleep: async () => {},
+    });
+    provider.onBuild = () => controller.abort(); // dies just before callOnce's guard
+
+    await expect(
+      provider.translatePage(makeJob(), makeSettings(), controller.signal),
+    ).rejects.toMatchObject({ kind: "aborted" });
+    expect(fetchMock).not.toHaveBeenCalled(); // the guard prevented the ghost request
+  });
+
+  it("does not call fetch on the repair re-entry when the signal aborts after the primary (repair path)", async () => {
+    const controller = new AbortController();
+    // Primary returns malformed text → a repair retry is attempted; the signal
+    // aborts before the repair build, so the repair fetch must never fire.
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ kind: "text", value: "not json at all" }));
+    const provider = new LateAbortProvider("openai", {
+      fetchFn: fetchMock,
+      sleep: async () => {},
+    });
+    let builds = 0;
+    provider.onBuild = () => {
+      builds += 1;
+      if (builds === 2) controller.abort(); // abort just before the repair's fetch
+    };
+
+    await expect(
+      provider.translatePage(makeJob(), makeSettings(), controller.signal),
+    ).rejects.toMatchObject({ kind: "aborted" });
+    expect(fetchMock).toHaveBeenCalledTimes(1); // primary only — no repair fetch
+  });
+});
+
 describe("ProviderBase — HTTP error mapping", () => {
   it("maps 401 to auth and does not retry", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({}, { status: 401 }));

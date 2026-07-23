@@ -94,19 +94,15 @@ describe("providers/ProviderBase — sanitizePage (golden fixtures)", () => {
     expect(regions.find((r) => r.kind === "sign")?.translated).toBe("EXIT");
   });
 
-  it("jointly clamps out-of-range boxes so they stay inside the image (out_of_range_bbox)", () => {
-    // Phase 7.4: the joint edge clamp replaced the old per-component clamp.
-    // Row 1 [1.05,-0.02,0.20,0.10] reads as legacy w/h (corners degenerate); its
-    // x clamps to 1, leaving zero width → dropped. Row 2 [0.30,0.40,1.20,0.10]
-    // also reads as w/h (y_max<y_min); width is capped at 1−x = 0.70 so it can't
-    // spill past the right edge.
+  it("drops out-of-range legacy w/h boxes as noisy corners (Phase 9.5 §2, out_of_range_bbox)", () => {
+    // Both rows have a degenerate corners reading, so they fall to the legacy w/h
+    // reading — but both OVERFLOW the frame there (row 1 x+w = 1.25, row 2
+    // x+w = 1.50). The §2 plausibility guard treats that heavy overflow as the tell
+    // that the row was corners-with-noise, not a genuine w/h box, and drops it
+    // rather than clamping a garbage rectangle onto the panel. (The joint clamp
+    // still applies to overflowing CORNER boxes — see the parseBbox suite.)
     const { regions } = pipeline(goldenJson("out_of_range_bbox.json"));
-    expect(regions).toHaveLength(1);
-    expect(regions[0]?.translated).toBe("Too wide");
-    expect(regions[0]?.bbox.x).toBeCloseTo(0.3, 6);
-    expect(regions[0]?.bbox.w).toBeCloseTo(0.7, 6);
-    // The clamped box's right edge never crosses the image boundary.
-    expect(regions[0]!.bbox.x + regions[0]!.bbox.w).toBeLessThanOrEqual(1);
+    expect(regions).toHaveLength(0);
   });
 
   it("drops a whole-page region but keeps the normal one (whole_page_bbox)", () => {
@@ -164,6 +160,91 @@ describe("providers/ProviderBase — sanitizePage (golden fixtures)", () => {
       ],
     });
     expect(regions).toHaveLength(3); // the empty one dropped, no throw
+  });
+});
+
+describe("providers/ProviderBase — sanitizePage §2 duplicate/degenerate cleanup", () => {
+  /** One raw region; bbox is corner-format unless a w/h object is passed. */
+  function raw(
+    bbox: unknown,
+    original: string,
+    kind?: string,
+    isSfx = false,
+  ): Record<string, unknown> {
+    return { bbox, original, translated: `→${original}`, is_sfx: isSfx, ...(kind ? { kind } : {}) };
+  }
+
+  it("collapses two OVERLAPPING identical-text bubbles to the larger; a DISJOINT copy survives", () => {
+    const { regions } = pipeline({
+      source_lang: "zh",
+      regions: [
+        raw([0.10, 0.10, 0.30, 0.30], "與此類似", "bubble"), // {0.10,0.10,0.20,0.20}
+        raw([0.12, 0.12, 0.37, 0.37], "與此類似", "bubble"), // {0.12,0.12,0.25,0.25} larger, IoU≈0.46
+        raw([0.60, 0.60, 0.80, 0.80], "與此類似", "bubble"), // disjoint {0.60,0.60,0.20,0.20}
+      ],
+    });
+    expect(regions).toHaveLength(2);
+    const byX = [...regions].sort((a, b) => a.bbox.x - b.bbox.x);
+    // The overlapping pair collapsed to the LARGER box (kept x 0.12, w 0.25); the
+    // smaller (w 0.20 at x 0.10) is gone.
+    expect(byX[0]!.bbox.x).toBeCloseTo(0.12, 6);
+    expect(byX[0]!.bbox.w).toBeCloseTo(0.25, 6);
+    // The disjoint copy (x 0.60) intentionally survives.
+    expect(byX[1]!.bbox.x).toBeCloseTo(0.6, 6);
+  });
+
+  it("keeps BOTH overlapping identical-text SFX regions (kind exemption)", () => {
+    // sfx repeats verbatim at different spots; IoU≈0.46 is under the strict 0.85
+    // gate and sfx is off the lower-threshold path, so neither collapses.
+    const { regions } = pipeline({
+      source_lang: "ja",
+      regions: [
+        raw([0.10, 0.10, 0.30, 0.30], "パチ", "sfx", true),
+        raw([0.12, 0.12, 0.37, 0.37], "パチ", "sfx", true),
+      ],
+    });
+    expect(regions).toHaveLength(2);
+  });
+
+  it("keeps two overlapping bubbles with DIFFERENT text (never merges distinct dialogue)", () => {
+    const { regions } = pipeline({
+      source_lang: "zh",
+      regions: [
+        raw([0.10, 0.10, 0.30, 0.30], "與此類似", "bubble"),
+        raw([0.12, 0.12, 0.37, 0.37], "別的對話", "bubble"),
+      ],
+    });
+    expect(regions).toHaveLength(2);
+  });
+
+  it("treats a whitespace-only (newline-wrap) difference as identical text", () => {
+    // The same line OCR'd once with a wrapping newline, once with a space →
+    // normalized equal, so the overlapping bubble pair collapses to the larger.
+    const { regions } = pipeline({
+      source_lang: "zh",
+      regions: [
+        raw([0.10, 0.10, 0.30, 0.30], "與此\n類似", "bubble"),
+        raw([0.12, 0.12, 0.37, 0.37], "與此 類似", "bubble"),
+      ],
+    });
+    expect(regions).toHaveLength(1);
+    expect(regions[0]!.bbox.w).toBeCloseTo(0.25, 6); // the larger box kept
+  });
+
+  it("end-to-end Call-11 fixture: drops the degenerate r12 box, collapses each cluster by one", () => {
+    // 24 raw regions modelled on HAR Call 11: 19 distinct fillers + the degenerate
+    // 讓其結合… box (dropped by the §2 parse guard) + its valid twin + three 與此類似
+    // copies (two overlapping → collapse to larger, one disjoint → survives).
+    const { regions } = pipeline(goldenJson("call11_duplicates.json"));
+    const count = (t: string) => regions.filter((r) => r.original === t).length;
+    expect(regions).toHaveLength(22); // 24 − r12 (degenerate) − one 與此類似 copy
+    // The panel-covering degenerate 讓其結合… box is gone; only its valid twin remains.
+    expect(count("讓其結合並提高密度的話")).toBe(1);
+    // The tripled 與此類似 is down to one merged copy + the disjoint stray.
+    expect(count("與此類似")).toBe(2);
+    const similar = regions.filter((r) => r.original === "與此類似");
+    expect(similar.some((r) => Math.abs(r.bbox.w - 0.25) < 1e-6)).toBe(true); // larger kept
+    expect(similar.some((r) => Math.abs(r.bbox.w - 0.2) < 1e-6)).toBe(false); // smaller gone
   });
 });
 
@@ -241,6 +322,24 @@ describe("providers/ProviderBase — parseBbox (Phase 7.4 corners-first)", () =>
     expect(parseBbox([0.1, 0.2, NaN, 0.4])).toBeNull();
     expect(parseBbox([0.1, 0.2])).toBeNull();
     expect(parseBbox("nope")).toBeNull();
+  });
+
+  it("drops a noisy corner box whose legacy w/h reading overflows the frame (§2 guard)", () => {
+    // The Call-11 r12 vector: corners degenerate (y_max 0.620 < y_min 0.650), so it
+    // falls to legacy w/h = {w:0.65, h:0.62} from x=0.48 → x+w = 1.13 > 1, which no
+    // real w/h box does. The plausibility guard drops it instead of clamping a
+    // quarter-page rectangle onto the panel.
+    expect(parseBbox([0.48, 0.65, 0.65, 0.62])).toBeNull();
+  });
+
+  it("preserves a genuine legacy w/h box that fits the frame (§2 back-compat pin)", () => {
+    // Corners degenerate (y_max 0.15 < y_min 0.2) → legacy w/h; x+w = 0.4 and
+    // y+h = 0.35 both fit, so the half-of-Haiku-emits-w/h case still parses as w/h.
+    expectBbox(parseBbox([0.1, 0.2, 0.3, 0.15]), { x: 0.1, y: 0.2, w: 0.3, h: 0.15 });
+  });
+
+  it("keeps a valid corner box (the guard only gates the legacy w/h fallback)", () => {
+    expectBbox(parseBbox([0.2, 0.2, 0.5, 0.6]), { x: 0.2, y: 0.2, w: 0.3, h: 0.4 });
   });
 });
 

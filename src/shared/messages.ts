@@ -157,8 +157,23 @@ export interface MessageMap {
    * WHY: without this, disabling MangaLens or closing a tab mid-chapter leaves
    * the event page paying the provider for pages nobody will see. Cancelling an
    * unknown/already-settled id is a silent no-op (the normal teardown race).
+   *
+   * `mode` (Phase 9.6 §1) draws the same started/queued line the pause feature
+   * ({@link cancelQueuedTranslations}) already draws:
+   *  - `"hard"` (DEFAULT, so every pre-9.6 caller is byte-compatible) aborts
+   *    unconditionally — teardown (`stop()`), extension-off, explicit drag-select
+   *    cancel. The user is leaving; respect it.
+   *  - `"queued-only"` aborts ONLY if the request has not crossed the started
+   *    boundary. WHY: an already-SENT provider call bills regardless of client
+   *    disconnect, so cancelling it destroys the cache value for ~zero refund —
+   *    finishing it converts sunk cost into a cache entry a recycled element's
+   *    re-send (§2) will hit. The content DOM-reconcile `unregister` path sends
+   *    this so MangaDex's element churn stops killing in-flight tail pages.
    */
-  cancelTranslation: { request: { requestId: string }; response: void };
+  cancelTranslation: {
+    request: { requestId: string; mode?: "hard" | "queued-only" };
+    response: void;
+  };
 
   /**
    * Content → background: raise the priority of an in-flight {@link translatePage}

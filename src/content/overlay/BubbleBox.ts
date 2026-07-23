@@ -18,7 +18,8 @@
  * listeners, no cached px.
  */
 import type { FontSettings } from "../../shared/settings";
-import type { TranslatedRegion } from "../../shared/types";
+import type { RegionKind, TranslatedRegion } from "../../shared/types";
+import { isBubbleKind } from "../../shared/regionKind";
 import type { PxRect } from "./geometry";
 import { longestWord, maxWordFitPx, resolveFontSize, type Measure } from "./textFit";
 import {
@@ -92,6 +93,52 @@ export interface RenderBubbleOptions {
    * CJK and fits differently, so textFit must re-run or it overflows.
    */
   peek?: boolean;
+  /**
+   * Phase 9.4 §3: skip the fill layer entirely (paint the label only). Set by the
+   * overlay when this region's draw box is fully contained by another's (see
+   * {@link import("./overlapTrim").computeContainedFillSuppression}): the OUTER
+   * fill already covers this area, so an inner fill can only double-paint /
+   * patch-fight. The label is unaffected — a suppressed region still renders its
+   * translation. Defaults to drawing the fill.
+   */
+  suppressFill?: boolean;
+  /**
+   * Phase 9.5 §3: the overlay-local px rect to lay the box out at, when it differs
+   * from `rect`. Set by {@link import("./coverPad").computeFallbackCoverRects} for a
+   * snap-FAILURE bubble: the outward-padded cover rect, so the opaque fallback fill
+   * AND the derived inner text rect both grow toward balloon size (giving the
+   * English room and covering the source rim). Defaults to `rect` — every snapped /
+   * shaped / non-bubble region passes its own rect through, so that path is
+   * untouched. The bbox→px mapping ({@link regionToPx}) is still the caller's; this
+   * is purely the box-geometry rect.
+   */
+  drawRect?: PxRect;
+}
+
+/**
+ * Phase 9.4 §1: the fill layer's effective opacity. A snap-FAILURE fallback on a
+ * bubble kind — an {@link isBubbleKind} region whose snap accepted no blob
+ * (`fillColor === undefined`) — paints FULLY OPAQUE (1); everything else keeps the
+ * user's `bubbleFillOpacity`.
+ *
+ * WHY opaque only for the bubble fallback: `fillColor === undefined` on a bubble
+ * means "we could not find the paper here," so the fallback is the raw provider
+ * box — fully hiding the source Chinese under the English is strictly better than
+ * the default 0.92 letting ~8 % of the source ink bleed through. A SUCCESSFULLY
+ * snapped bubble (`fillColor` set) legitimately honors the user's art-peek
+ * translucency, and every non-bubble kind (SFX/narration) must stay translucent
+ * so its artwork shows — so both keep `userOpacity`. Pure/deterministic.
+ *
+ * @param kind the region's classification (undefined counts as non-bubble).
+ * @param fillColor the snapped interior color, or undefined when no blob snapped.
+ * @param userOpacity the user's configured `bubbleFillOpacity`.
+ */
+export function effectiveFillOpacity(
+  kind: RegionKind | undefined,
+  fillColor: string | undefined,
+  userOpacity: number,
+): number {
+  return isBubbleKind(kind) && fillColor === undefined ? 1 : userOpacity;
 }
 
 /**
@@ -111,20 +158,27 @@ export function renderBubbleBox(
   makeMeasure: (boxW: number) => Measure,
   options: RenderBubbleOptions = {},
 ): HTMLElement {
+  // Phase 9.5 §3: lay the box out at the cover rect when the overlay supplied one
+  // (a snap-failure bubble's outward-padded fallback); otherwise the region's own
+  // px rect. All geometry below (box position/size, padded inner rect, widen) reads
+  // this. For every snapped/shaped/non-bubble region `drawRect === rect`, so their
+  // render is byte-identical to before.
+  const drawRect = options.drawRect ?? rect;
+
   // Phase 9 §4/§5: geometry mode. A traced shape yields a clip path for the fill
   // and an inscribed text rect; a shape-less bubble/thought may take the ellipse
   // fallback; everything else keeps the pre-Phase-9 rounded rect + padded box.
   const path = region.shape
-    ? shapeToBoxPath(region.shape, region.bbox, rect.width, rect.height)
+    ? shapeToBoxPath(region.shape, region.bbox, drawRect.width, drawRect.height)
     : null;
   let boxRadius = "8px";
-  let inner: PxRect = paddedInnerRect(rect.width, rect.height);
+  let inner: PxRect = paddedInnerRect(drawRect.width, drawRect.height);
   if (path) {
     // WHY radius 0 with a shape: the box's rounded corners crop children via
     // `overflow: hidden`, and a near-rectangular traced bubble legitimately
     // reaches the box corners — only the shape may sculpt the fill.
     boxRadius = "0px";
-    inner = inscribedInnerRect(region.shape, region.bbox, rect.width, rect.height);
+    inner = inscribedInnerRect(region.shape, region.bbox, drawRect.width, drawRect.height);
   } else if (
     // Phase 9.1 §7: gate the ellipse fallback to SNAPPED regions. `fillColor` is
     // set exactly when the snap accepted a blob, so it is a reliable "this bbox is
@@ -133,7 +187,7 @@ export function renderBubbleBox(
     // boxes keep the pre-Phase-9 8 px rounded rect (small spill, soft corners —
     // strictly less harm than an ellipse on a loose box).
     region.fillColor !== undefined &&
-    fallbackRadius(region.kind, rect.width / rect.height) === "ellipse"
+    fallbackRadius(region.kind, drawRect.width / drawRect.height) === "ellipse"
   ) {
     boxRadius = "50%";
     inner = shrinkCentered(inner, Math.SQRT1_2); // corners of a 1/√2 box touch the ellipse
@@ -149,10 +203,10 @@ export function renderBubbleBox(
   // over an earlier box's text (the clipped-"Ev" bug). Do not.
   Object.assign(box.style, {
     position: "absolute",
-    left: `${rect.left}px`,
-    top: `${rect.top}px`,
-    width: `${rect.width}px`,
-    height: `${rect.height}px`,
+    left: `${drawRect.left}px`,
+    top: `${drawRect.top}px`,
+    width: `${drawRect.width}px`,
+    height: `${drawRect.height}px`,
     overflow: "hidden",
     borderRadius: boxRadius,
     display: "flex",
@@ -170,19 +224,26 @@ export function renderBubbleBox(
   // Fill layer: separate node so opacity doesn't touch the text. Phase 9 §7:
   // a sampled fillColor wins over the user's bubbleFillColor — it IS the
   // bubble's actual paper color (visually identical for the common white
-  // bubble); §4: the shape clips ONLY this layer.
-  const fill = document.createElement("div");
-  Object.assign(fill.style, {
-    position: "absolute",
-    inset: "0",
-    background: region.fillColor ?? font.bubbleFillColor,
-    opacity: String(font.bubbleFillOpacity),
-    borderRadius: "inherit",
-    zIndex: "1", // §6: below EVERY label (which sit at z-index 2) across all boxes
-    pointerEvents: "none",
-  } satisfies Partial<CSSStyleDeclaration>);
-  if (path) fill.style.clipPath = `path("${path}")`;
-  box.appendChild(fill);
+  // bubble); §4: the shape clips ONLY this layer. Phase 9.4 §3: a contained
+  // region skips the fill entirely (the outer fill already covers it), still
+  // painting its label below. Phase 9.4 §1: a snap-failure bubble fallback fills
+  // fully opaque so no source ink bleeds under the English.
+  if (!options.suppressFill) {
+    const fill = document.createElement("div");
+    Object.assign(fill.style, {
+      position: "absolute",
+      inset: "0",
+      background: region.fillColor ?? font.bubbleFillColor,
+      opacity: String(
+        effectiveFillOpacity(region.kind, region.fillColor, font.bubbleFillOpacity),
+      ),
+      borderRadius: "inherit",
+      zIndex: "1", // §6: below EVERY label (which sit at z-index 2) across all boxes
+      pointerEvents: "none",
+    } satisfies Partial<CSSStyleDeclaration>);
+    if (path) fill.style.clipPath = `path("${path}")`;
+    box.appendChild(fill);
+  }
 
   const text = options.peek ? region.original : region.translated;
   if (!text.trim()) return box; // empty/whitespace text: fill only.
@@ -206,7 +267,7 @@ export function renderBubbleBox(
   // widening means fragmentation is unavoidable at minPx, so accept it (undefined
   // cap → today's floor-and-crop). minSizePx stays the legibility floor throughout.
   if (cap === null) {
-    const widened = widenLabelRect(inner, rect.width, rect.height);
+    const widened = widenLabelRect(inner, drawRect.width, drawRect.height);
     if (widened !== inner) {
       inner = widened;
       cap = maxWordFitPx(longest, inner.width, font.minSizePx, font.maxSizePx, probeMeasure);

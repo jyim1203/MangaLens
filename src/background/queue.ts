@@ -333,6 +333,14 @@ export class PriorityQueue {
   private async runWithRetry<T>(task: Task<T>, signal: AbortSignal): Promise<T> {
     let attempt = 0;
     for (;;) {
+      // Phase 9.6 §3 (dead-signal guard): never invoke the task on an already-dead
+      // signal. WHY here and not only in the caller: `start()` builds the merged
+      // signal synchronously, so a parent (per-job or queue-wide) aborted in the
+      // dequeue→start window yields an already-aborted merged signal; without this
+      // the task would still run — the exact path that let a cancelled translate
+      // reach `fetch` and fire a status-0 ghost request. Throwing here surfaces as
+      // an abort (isAbortError → `aborted` kind) for every current + future task.
+      if (signal.aborted) throw abortReason(signal);
       try {
         return await task(signal);
       } catch (err) {

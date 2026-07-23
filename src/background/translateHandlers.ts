@@ -57,6 +57,7 @@ import { dedupeRegions, prepareImage, type PreparedImage } from "./imagePrep";
 import { PriorityQueue } from "./queue";
 import { ProviderError } from "./providers/ProviderBase";
 import { createProvider, resolveEffectiveModel } from "./providers/factory";
+import { loadEndpointModes, loadSamplingMemo } from "./endpointModes";
 import { createRateGate, type RateGate } from "./rateGate";
 import {
   BATCH_LINGER_MS,
@@ -366,6 +367,12 @@ export function startedRequestsHasForTest(requestId: string): boolean {
   return startedRequests.has(requestId);
 }
 
+/** Whether a requestId still has a registered controller — test seam only (§1:
+ *  asserts a `"queued-only"` cancel SPARED a started run rather than aborting it). */
+export function requestControllerHasForTest(requestId: string): boolean {
+  return requestControllers.has(requestId);
+}
+
 /**
  * Register an {@link AbortController} under a `requestId` so a later
  * {@link MessageHandlers.cancelTranslation} aborts it. Exported so region
@@ -492,6 +499,17 @@ async function translateTiles(
 ): Promise<TranslateOutcome> {
   const provider = createProvider(providerSettings);
   const gate = getRateGate();
+  // Phase 9.6 §3 (dead-signal guard): prep (`prepareImage`, upstream in
+  // `translatePrepared`) is the longest in-slot window (~100–500 ms) — a cancel
+  // landing DURING it used to sail straight on to base64 + `fetch`. Check once now
+  // that prep is done and before any `sha256Hex`/provider call, so an abort here
+  // never becomes an HTTP request. ProviderError("aborted") so it maps to the
+  // existing `aborted` kind (silent content handling, no negative-cache).
+  if (signal.aborted) {
+    throw new ProviderError("aborted", "Request aborted", {
+      provider: providerSettings.provider,
+    });
+  }
   // WHY parallel: tiles of one strip are independent requests, and §7.5's
   // latency target dies on a 10-tile strip translated serially. The global
   // concurrency cap (settings.concurrency) is enforced by the queue one level up;
@@ -1113,6 +1131,59 @@ export function errorToTranslateResult(err: unknown): TranslatePageResult {
   };
 }
 
+/** Cancel intent from a {@link MessageHandlers.cancelTranslation}: `"hard"` aborts
+ *  unconditionally; `"queued-only"` spares a started run (Phase 9.6 §1). */
+export type CancelMode = "hard" | "queued-only";
+
+/**
+ * What a cancel actually did, for the §4 disposition log:
+ *  - `hard-aborted` — a hard cancel aborted the controller (started or queued).
+ *  - `queued-aborted` — a queued-only cancel aborted a not-yet-started job.
+ *  - `started-spared` — a queued-only cancel LEFT a started job running (its
+ *    provider call already billed; finishing it caches for the §2 re-send).
+ *  - `unknown-noop` — no controller registered (already settled / lost on an
+ *    event-page death / never sent) — the normal teardown race.
+ */
+export type CancelDisposition =
+  | "hard-aborted"
+  | "queued-aborted"
+  | "started-spared"
+  | "unknown-noop";
+
+/**
+ * The cancel-mode decision table (Phase 9.6 §1), pure so it is unit-tested apart
+ * from the browser-only registries. Draws the SAME started boundary
+ * {@link MessageHandlers.cancelQueuedTranslations} already uses: a `"queued-only"`
+ * cancel of an already-STARTED request is a no-op (spared) because aborting a sent
+ * provider call refunds nothing yet destroys the cache value; everything else
+ * aborts. A disposition ending in `-aborted` means the caller must abort the
+ * controller.
+ *
+ * @param mode the requested cancel mode (default `"hard"` is applied by the caller).
+ * @param hasController whether a controller is registered for the id.
+ * @param started whether the id has crossed the started boundary
+ *   ({@link startedRequests}).
+ */
+export function classifyCancel(
+  mode: CancelMode,
+  hasController: boolean,
+  started: boolean,
+): CancelDisposition {
+  if (!hasController) return "unknown-noop";
+  if (mode === "hard") return "hard-aborted";
+  return started ? "started-spared" : "queued-aborted";
+}
+
+/** Whether a {@link CancelDisposition} means the controller should be aborted. */
+function shouldAbort(disposition: CancelDisposition): boolean {
+  return disposition === "hard-aborted" || disposition === "queued-aborted";
+}
+
+/** First 8 chars of a requestId for a compact, non-noisy §4 log line. */
+function shortId(requestId: string): string {
+  return requestId.slice(0, 8);
+}
+
 /** The translate slice of the background message router. */
 export function createTranslateHandlers(): MessageHandlers {
   return {
@@ -1123,7 +1194,21 @@ export function createTranslateHandlers(): MessageHandlers {
       const controller = new AbortController();
       if (req.requestId) requestControllers.set(req.requestId, controller);
       try {
-        const settings = await loadSettings();
+        // Hydrate the learned request-shape memos (endpoint mode + sampling
+        // rejection) BEFORE the first provider request builds, so a model already
+        // known from a past session to reject `temperature` omits it from the very
+        // first call. WHY here and not only at background startup: that hydrate
+        // (index.ts) is fire-and-forget, so a translate-all burst fired the instant
+        // the event page wakes out-races it and re-pays the whole 400 wave (the
+        // Phase 8 §4 persistence exists precisely to avoid that). Memoized promises
+        // → effectively free after the first await, and parallel with loadSettings
+        // so no added latency. Fail-soft: a storage fault just re-pays one 400 per
+        // model, and the downgrade retry (now race-safe) still recovers every page.
+        const [settings] = await Promise.all([
+          loadSettings(),
+          loadEndpointModes(),
+          loadSamplingMemo(),
+        ]);
         const providerSettings = deriveProviderSettings(settings);
         // A request-level target language (e.g. drag-select) overrides settings.
         if (req.targetLang) providerSettings.targetLang = req.targetLang;
@@ -1185,14 +1270,29 @@ export function createTranslateHandlers(): MessageHandlers {
     },
 
     cancelTranslation: (req) => {
-      // Abort the registered controller; unknown/already-settled ids are a silent
-      // no-op (the normal race — the request may have finished before the cancel
-      // arrived, or the event page was torn down and lost the registry).
+      // §1: honor the started boundary. A `"queued-only"` cancel (the content
+      // DOM-reconcile unregister path) LEAVES a started run going — its provider
+      // call already billed, so finishing it caches the result the recycled
+      // element's §2 re-send will hit, instead of destroying that value for zero
+      // refund. `"hard"` (default) and a not-yet-started `"queued-only"` both
+      // abort. Unknown/already-settled ids are a silent no-op (the normal race).
+      const mode: CancelMode = req.mode ?? "hard";
       const controller = requestControllers.get(req.requestId);
-      if (controller) {
+      const disposition = classifyCancel(
+        mode,
+        controller !== undefined,
+        startedRequests.has(req.requestId),
+      );
+      if (controller && shouldAbort(disposition)) {
         controller.abort(new DOMException("Translation cancelled", "AbortError"));
         requestControllers.delete(req.requestId);
+        // WHY not clear startedRequests here: a spared/aborted id's own
+        // translatePage `finally` owns both registries' cleanup — a started-spared
+        // run must keep its `started` mark until it settles normally.
       }
+      // §4: attribute every cancel so the next live pass reads disposition off the
+      // console instead of re-capturing a HAR.
+      log.debug(`cancelTranslation ${shortId(req.requestId)} mode=${mode} → ${disposition}`);
     },
 
     reprioritizeTranslation: (req) => {
@@ -1227,14 +1327,24 @@ export function createTranslateHandlers(): MessageHandlers {
       // Pause (item 4): abort each id that is registered AND not yet started —
       // let started provider calls finish, stop the rest. Unknown/started ids are
       // silently skipped; that IS the feature. Counts what was actually aborted.
+      // Pause is a `"queued-only"` cancel over a batch of ids, so the §1 decision
+      // table classifies each disposition identically — reused here for the §4 log.
       let cancelled = 0;
       for (const requestId of req.requestIds) {
-        if (startedRequests.has(requestId)) continue;
         const controller = requestControllers.get(requestId);
-        if (!controller) continue;
-        controller.abort(new DOMException("Translation paused", "AbortError"));
-        requestControllers.delete(requestId);
-        cancelled++;
+        const disposition = classifyCancel(
+          "queued-only",
+          controller !== undefined,
+          startedRequests.has(requestId),
+        );
+        if (controller && shouldAbort(disposition)) {
+          controller.abort(new DOMException("Translation paused", "AbortError"));
+          requestControllers.delete(requestId);
+          cancelled++;
+        }
+        // §4: one disposition line per id (started-spared / queued-aborted /
+        // unknown-noop), so a pause is attributable on the console too.
+        log.debug(`cancelQueued ${shortId(requestId)} → ${disposition}`);
       }
       return { cancelled };
     },

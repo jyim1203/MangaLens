@@ -24,6 +24,7 @@
  * internally the core works in snap-bitmap pixels.
  */
 import type { BBox, PageTranslation, RegionKind } from "../shared/types";
+import { isBubbleKind } from "../shared/regionKind";
 
 /**
  * A minimal RGBA bitmap — the shape `getImageData` returns, so the pure core can
@@ -107,6 +108,25 @@ export const MIN_BLOB_BBOX_FILL = 0.3;
 export const SNAP_CONFINE_EXPAND = 0.5;
 
 /**
+ * Phase 9.4 §2: the LOOSER confinement half-margin — the second pass of the
+ * Stage-1b cascade ({@link snapAllRegions}). A lone eligible region that returns
+ * `null` at {@link SNAP_CONFINE_EXPAND} (0.5 ⇒ a 2×-per-axis window) is retried at
+ * this expand (1.0 ⇒ a 3×-per-axis window) before falling back to the provider
+ * box. WHY 1.0 and NOT `Infinity`: keep a hard wall so a cross-panel margin leak
+ * stays bounded — 1.0 merely doubles the reach of the 0.5 window while staying
+ * well inside the 4×-box AREA leak cap ({@link MAX_BLOB_BOX_RATIO}). WHY this
+ * can't reopen the Phase 9.3 leak: a real undersized/offset bubble fills a
+ * COMPACT region (high bbox-fill), so once the wall is loosened the
+ * {@link MIN_BLOB_BBOX_FILL} compactness guard passes and the wall was the only
+ * thing rejecting it; a margin leak is SPINDLY (runs through a thin gutter — big
+ * bounds, small area), so at 1.0 the compactness guard rejects it exactly as it
+ * did at 0.5. Loosening the wall shifts the leak defense onto the guard that was
+ * already catching it (see the §2 tests: the 9.3 margin-leak fixture still
+ * returns `null` at BOTH 0.5 AND 1.0).
+ */
+export const SNAP_CONFINE_EXPAND_LOOSE = 1.0;
+
+/**
  * Long-edge cap for the snap bitmap. WHY 768 (Phase 9.3; was 512): the ≤512
  * downsample self-closed 1–2 px outline gaps, but it paid for that by eroding
  * THIN PANEL BORDERS — which alias away at 512 and are the exact route the §1
@@ -127,9 +147,6 @@ export const SNAP_MAX_EDGE = 768;
  * for extreme aspect ratios the cap is raised so the short edge stays ≥ this.
  */
 export const SNAP_MIN_SHORT_EDGE = 256;
-
-/** Region kinds snap refines — white-interior shapes only (see {@link shouldSnapKind}). */
-const SNAP_KINDS: ReadonlySet<RegionKind> = new Set<RegionKind>(["bubble", "thought"]);
 
 /**
  * Seed offsets as (dy, dx) fractions of the box added to the box CENTER, so the
@@ -372,9 +389,12 @@ export const PAPER_BLACK_LUMA = 12;
  * the 2026-07-19 overshoot pass, plus the {@link MIN_BLOB_BBOX_FILL} sprawl
  * guard); 3 = Phase 9.3 ({@link SNAP_CONFINE_EXPAND} flood-fill confinement +
  * wall-slam rejection, plus {@link SNAP_MAX_EDGE} 512 → 768 — both change snap
- * output for already-cached pages, re-snapped locally at zero provider spend).
+ * output for already-cached pages, re-snapped locally at zero provider spend);
+ * 4 = Phase 9.4 §2 ({@link SNAP_CONFINE_EXPAND_LOOSE} Stage-1b cascade — a lone
+ * region that fails the 0.5 wall is retried at 1.0, recovering undersized/offset
+ * bubbles whose true extent runs just past 2× the box, re-snapped locally).
  */
-export const SNAP_VERSION = 3;
+export const SNAP_VERSION = 4;
 
 /**
  * Dilate a filled mask by 1 px (3×3 max) inside the blob's padded bounds.
@@ -1191,9 +1211,12 @@ export function snapRegionToBubble(
  * the white-interior shapes flood fill was designed for. `caption`/`sfx`/`sign`/
  * `other`/undefined sit on artwork where a fill leaks or lands dark, so they keep
  * the provider box. WHY conservative: a wrong snap is worse than a loose box.
+ * Phase 9.4: delegates to the shared {@link isBubbleKind} — the SAME set that
+ * gates §1's opaque snap-failure fallback, so "snappable" and "gets an opaque
+ * fallback when the snap fails" can never drift apart.
  */
 export function shouldSnapKind(kind?: RegionKind): boolean {
-  return kind !== undefined && SNAP_KINDS.has(kind);
+  return isBubbleKind(kind);
 }
 
 /** The snap-bitmap dimensions for a decoded image (see {@link computeSnapSize}). */
@@ -1522,7 +1545,21 @@ export function snapAllRegions(
   const results: (SnapResult | null)[] = regions.map((r, i) => {
     if (!eligible[i]) return null;
     if (grouped.has(i)) return detect[i] ?? null;
-    return snapRegionToBubble(img, r.bbox, opts);
+    // Phase 9.4 §2 confinement cascade: try the tight 0.5 wall first; only if it
+    // rejects (a genuinely undersized/offset bubble slammed the 2× wall, OR its
+    // rescue was blocked) retry at the looser 1.0 wall (3× per axis). First
+    // non-null wins; still-null keeps the provider box (→ §1 opaque fallback). The
+    // looser pass stays gated by the UNCHANGED leak caps + compactness guard, so a
+    // margin leak still rejects at 1.0 (see SNAP_CONFINE_EXPAND_LOOSE). Only the
+    // lone-region final result cascades — the un-confined detection pass (Stage 1a)
+    // and grouped/lobe fills are untouched. A first-pass accept never runs the
+    // second call, so a fully-inside bubble is byte-identical to pre-9.4.
+    const tight = snapRegionToBubble(img, r.bbox, opts);
+    if (tight) return tight;
+    return snapRegionToBubble(img, r.bbox, {
+      ...opts,
+      confineExpand: SNAP_CONFINE_EXPAND_LOOSE,
+    });
   });
 
   // Stage 3: split each group into per-lobe boxes (all-or-nothing per group). The

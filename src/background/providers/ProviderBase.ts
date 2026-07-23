@@ -328,6 +328,13 @@ function clamp01(value: number): number {
 }
 
 /**
+ * Phase 9.5 §2: slack allowed on the legacy-`w/h` plausibility check (a real box
+ * may round a hair past the edge, e.g. `x + w = 1.01`). Past this the row can't
+ * be a genuine w/h box and is treated as corners-with-noise (dropped).
+ */
+const PLAUSIBLE_WH_EPS = 0.02;
+
+/**
  * Parse a bbox into the internal `{x, y, w, h}` shape (PROMPTS.md §2/§6.3),
  * format-defensive so a model that ignores the schema still degrades to a
  * dropped region rather than garbage:
@@ -339,7 +346,9 @@ function clamp01(value: number): number {
  *    corners is the compliant reading and the ambiguous case must trust the
  *    schema. If the corners reading is degenerate (`w ≤ 0` or `h ≤ 0`) the row
  *    can't be corners, so fall back to the legacy `[x, y, width, height]` reading
- *    (`w=c, h=d`) for any third-party endpoint still emitting w/h.
+ *    (`w=c, h=d`) for any third-party endpoint still emitting w/h — but only when
+ *    that reading plausibly fits the image (Phase 9.5 §2 guard, `PLAUSIBLE_WH_EPS`);
+ *    a legacy reading that overflows the frame was a noisy corner box and is dropped.
  *  - **Object `{x, y, w, h}`** — unchanged back-compat for models emitting the
  *    object form.
  *
@@ -373,6 +382,18 @@ export function parseBbox(raw: unknown): BBox | null {
       w = cw;
       h = ch;
     } else {
+      // Phase 9.5 §2 plausibility guard: the corners reading is degenerate, so
+      // read the row as a legacy [x, y, width, height] box — but ACCEPT that
+      // reading only if it plausibly IS one, i.e. the box fits the image
+      // (x + w ≤ 1, y + h ≤ 1, within ε). WHY: a real third-party w/h box fits
+      // the frame; a noisy CORNER box (the Call-11 r12 `[0.480,0.650,0.650,0.620]`,
+      // reinterpreted as w = 0.65 from x = 0.48 → x + w = 1.13) does NOT, and that
+      // heavy overflow is the tell it was corners-with-noise, not w/h. Dropping it
+      // beats clamping a quarter-page rectangle onto the panel, while the fitting
+      // case preserves w/h back-compat (half of Haiku still emits w/h).
+      if (!(c > 0 && d > 0 && x + c <= 1 + PLAUSIBLE_WH_EPS && y + d <= 1 + PLAUSIBLE_WH_EPS)) {
+        return null;
+      }
       w = c;
       h = d;
     }
@@ -407,6 +428,28 @@ const MIN_REGION_AREA = 0.0001;
 const MAX_REGION_AREA = 0.9;
 /** Regions this similar with identical `original` are the same detection (PROMPTS.md §6.3). */
 const IDENTICAL_DEDUPE_IOU = 0.85;
+/**
+ * Phase 9.5 §2: the LOWER overlap threshold at which two identical-`original`
+ * BALLOON detections (bubble/thought/caption) are collapsed. WHY 0.3 (far below
+ * {@link IDENTICAL_DEDUPE_IOU}): the Call-11 evidence showed the model emitting the
+ * same bubble two/three times at IoU ≈ 0.32 — well under the strict 0.85 gate — yet
+ * still clearly the same detection. Kept conservative + kind-scoped (see
+ * {@link dedupeIdentical}) so genuinely repeated dialogue in SEPARATE, non-overlapping
+ * balloons (IoU ≈ 0) is never merged.
+ */
+const IDENTICAL_OVERLAP_IOU = 0.3;
+/**
+ * Phase 9.5 §2: kinds eligible for the lower-threshold identical-text collapse —
+ * balloon-ish text that a model realistically double-detects in the SAME spot.
+ * `sfx`/`sign`/`other` are excluded: `sfx` legitimately repeats verbatim (パチ/ドズ)
+ * at DIFFERENT, disjoint spots, and those must survive, so they stay on the strict
+ * IoU>0.85 path only.
+ */
+const OVERLAP_DEDUPE_KINDS: ReadonlySet<RegionKind> = new Set<RegionKind>([
+  "bubble",
+  "thought",
+  "caption",
+]);
 /** Fraction of empty-translation regions above which the whole response is malformed. */
 const NEEDS_RETRY_FRACTION = 0.3;
 
@@ -425,8 +468,9 @@ export interface SanitizedPage {
  *  - count regions whose `translated` is empty (but `original` isn't) and drop
  *    them; if they exceed 30% of otherwise-valid regions, throw `malformed` so
  *    the caller runs the repair pass;
- *  - dedupe near-identical detections (IoU > 0.85 AND identical `original`),
- *    keeping the first;
+ *  - dedupe duplicate detections ({@link dedupeIdentical}): IoU > 0.85 + identical
+ *    `original` for every kind, plus a lower-threshold (IoU > 0.3) collapse of
+ *    overlapping balloon kinds with the same text, keeping the larger (Phase 9.5 §2);
  *  - normalize `source_lang`.
  *
  * SFX regions are KEPT (with `isSfx: true`) regardless of the user's skip-SFX
@@ -483,16 +527,70 @@ export function sanitizePage(page: RawPage): SanitizedPage {
   };
 }
 
-/** Drop later regions that overlap a kept one by IoU > 0.85 with identical text. */
+/** Trim + collapse internal whitespace so newline-wrapped OCR of the same line
+ *  compares equal (Phase 9.5 §2). `original` is already trimmed by sanitizePage. */
+function normalizeOriginal(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
+/** Is this kind eligible for the lower-threshold identical-text collapse (§2)? */
+function isOverlapDedupeKind(kind: RegionKind | undefined): boolean {
+  return kind !== undefined && OVERLAP_DEDUPE_KINDS.has(kind);
+}
+
+/** Bbox area (normalized units). */
+function bboxArea(bbox: BBox): number {
+  return bbox.w * bbox.h;
+}
+
+/**
+ * Collapse duplicate detections of the SAME text, keeping one region per cluster
+ * (PROMPTS.md §6.3, extended Phase 9.5 §2). Two complementary rules, evaluated per
+ * already-kept region in reading order:
+ *
+ *  - **General (all kinds):** exact-`original` + IoU > {@link IDENTICAL_DEDUPE_IOU}
+ *    (0.85) → the later region is the same detection; drop it, keep the first. The
+ *    pre-9.5 behaviour, unchanged for `sfx`/`sign`/`other`/untyped regions.
+ *  - **Overlap-gated balloon collapse (§2, `bubble`/`thought`/`caption` only):**
+ *    NORMALIZED-identical `original` (so newline-wrapped OCR matches) + IoU >
+ *    {@link IDENTICAL_OVERLAP_IOU} (0.3) → the same balloon detected twice; keep the
+ *    LARGER-area region (the bigger box is likelier the real balloon; the smaller is
+ *    the spurious echo), dropping the other.
+ *
+ * WHY overlap-gated + kind-scoped (the user's explicit steer): repeated dialogue
+ * across a real conversation lives in SEPARATE, non-overlapping balloons (IoU ≈ 0)
+ * — never collapse those; two detections of the SAME balloon overlap. A disjoint
+ * third copy (Call-11 r18) intentionally SURVIVES — one stray copy is far less harm
+ * than risking a genuinely repeated line. Pure and order-deterministic.
+ */
 function dedupeIdentical(regions: TranslatedRegion[]): TranslatedRegion[] {
   const out: TranslatedRegion[] = [];
   for (const region of regions) {
-    const dup = out.some(
-      (existing) =>
+    let merged = false;
+    for (let i = 0; i < out.length; i++) {
+      const existing = out[i] as TranslatedRegion;
+      if (
+        isOverlapDedupeKind(existing.kind) &&
+        isOverlapDedupeKind(region.kind) &&
+        normalizeOriginal(existing.original) === normalizeOriginal(region.original) &&
+        iou(existing.bbox, region.bbox) > IDENTICAL_OVERLAP_IOU
+      ) {
+        // Same balloon detected twice → keep the larger; replace the kept region
+        // when the incoming one is bigger. Either way the incoming isn't appended.
+        if (bboxArea(region.bbox) > bboxArea(existing.bbox)) out[i] = region;
+        merged = true;
+        break;
+      }
+      // General strict path (every kind): exact text + high overlap → keep first.
+      if (
         existing.original === region.original &&
-        iou(existing.bbox, region.bbox) > IDENTICAL_DEDUPE_IOU,
-    );
-    if (!dup) out.push(region);
+        iou(existing.bbox, region.bbox) > IDENTICAL_DEDUPE_IOU
+      ) {
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) out.push(region);
   }
   return out;
 }
@@ -797,6 +895,11 @@ export abstract class ProviderBase implements Translator {
   ): Promise<unknown> {
     const req = buildReq(ctx);
     let response: Response;
+    // Phase 9.6 §3 (dead-signal guard): the hard guarantee — an aborted signal must
+    // mean `fetchFn` is NEVER invoked, so a cancel that lands anywhere in the
+    // dequeue→fetch window can no longer create a status-0 ghost request. Covers the
+    // repair-retry and 400-downgrade re-entries for free (both re-enter here).
+    this.throwIfAborted(signal);
     try {
       response = await this.fetchFn(req.url, {
         method: "POST",

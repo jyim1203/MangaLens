@@ -18,6 +18,7 @@ vi.mock("../../src/background/imagePrep", async (importActual) => {
 
 import {
   createTranslateHandlers,
+  requestControllerHasForTest,
   resetInflightForTest,
   resetRequestControllersForTest,
   resetSharedAbortsForTest,
@@ -140,5 +141,100 @@ describe("translateHandlers — cancelQueuedTranslations (Phase 7.4 pause)", () 
     );
     // Started → not cancellable by pause; that's the feature.
     expect(res).toEqual({ cancelled: 0 });
+  });
+});
+
+describe("translateHandlers — cancelTranslation soft-cancel (Phase 9.6 §1)", () => {
+  beforeEach(() => {
+    fakeBrowser.reset();
+    resetRequestControllersForTest();
+    resetSharedAbortsForTest();
+    resetInflightForTest();
+    resetTranslationQueueForTest();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** A fetch that hangs at the IMAGE fetch (rejecting on abort) → the request is
+   *  registered (controller) but its provider call never starts (queued state). */
+  function hangUnstarted(onReached: () => void): void {
+    vi.stubGlobal("fetch", (_url: string, init?: { signal?: AbortSignal }) => {
+      onReached();
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject(new DOMException("Aborted", "AbortError")),
+        );
+      });
+    });
+  }
+
+  /** Drive a request past the started boundary (mocked prepareImage hangs after
+   *  onStarted fires) and return once `startedRequests` records it. */
+  async function startAndWait(handlers: ReturnType<typeof createTranslateHandlers>, id: string) {
+    vi.stubGlobal("fetch", () => Promise.resolve(imageResponse()));
+    const pending = handlers.translatePage!(
+      { imageUrl: "https://x/y.jpg", priority: 0, requestId: id },
+      SENDER,
+    );
+    void pending; // never settles (prepareImage hangs) — we only probe the registries
+    for (let i = 0; i < 100 && !startedRequestsHasForTest(id); i++) await tick();
+    expect(startedRequestsHasForTest(id)).toBe(true);
+  }
+
+  it("queued-only aborts a not-yet-started job and deregisters it", async () => {
+    const handlers = createTranslateHandlers();
+    let reached!: () => void;
+    const atFetch = new Promise<void>((r) => (reached = r));
+    hangUnstarted(reached);
+
+    const pending = handlers.translatePage!(
+      { imageUrl: "https://x/y.jpg", priority: 0, requestId: "q1" },
+      SENDER,
+    );
+    await atFetch; // controller registered, still queued (image fetch pending)
+    expect(startedRequestsHasForTest("q1")).toBe(false);
+
+    handlers.cancelTranslation!({ requestId: "q1", mode: "queued-only" }, SENDER);
+    await expect(pending).resolves.toMatchObject({ ok: false, errorKind: "aborted" });
+    expect(requestControllerHasForTest("q1")).toBe(false); // deregistered on abort
+  });
+
+  it("queued-only SPARES a started job — controller retained, not aborted", async () => {
+    const handlers = createTranslateHandlers();
+    await startAndWait(handlers, "s1");
+
+    handlers.cancelTranslation!({ requestId: "s1", mode: "queued-only" }, SENDER);
+
+    // Spared: the started run keeps going (its provider call already billed) so it
+    // finishes + caches. Controller + started mark both retained until it settles.
+    expect(requestControllerHasForTest("s1")).toBe(true);
+    expect(startedRequestsHasForTest("s1")).toBe(true);
+  });
+
+  it("hard aborts a started job (teardown path), deregistering it", async () => {
+    const handlers = createTranslateHandlers();
+    await startAndWait(handlers, "s2");
+
+    handlers.cancelTranslation!({ requestId: "s2", mode: "hard" }, SENDER);
+    expect(requestControllerHasForTest("s2")).toBe(false); // aborted + removed
+  });
+
+  it("mode-absent defaults to hard (aborts a started job — byte-compatible caller)", async () => {
+    const handlers = createTranslateHandlers();
+    await startAndWait(handlers, "s3");
+
+    handlers.cancelTranslation!({ requestId: "s3" }, SENDER); // no mode field
+    expect(requestControllerHasForTest("s3")).toBe(false);
+  });
+
+  it("unknown id is a silent no-op in both modes", () => {
+    const handlers = createTranslateHandlers();
+    expect(() =>
+      handlers.cancelTranslation!({ requestId: "nope", mode: "queued-only" }, SENDER),
+    ).not.toThrow();
+    expect(() =>
+      handlers.cancelTranslation!({ requestId: "nope", mode: "hard" }, SENDER),
+    ).not.toThrow();
   });
 });

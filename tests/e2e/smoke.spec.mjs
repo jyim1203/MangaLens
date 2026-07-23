@@ -231,6 +231,11 @@ before(async () => {
   // Auto-accept optional-permission prompts so the grant click doesn't hang.
   options.setPreference("extensions.webextensions.prompts", false);
   options.setPreference("xpinstall.signatures.required", false);
+  // WHY: Firefox 153+ Marionette refuses WebDriver navigation to privileged URLs
+  // (moz-extension://…, which seedSettings/translateAll drive) unless system
+  // access is granted. The flag exists since ~Firefox 138 and is inert on older
+  // versions, so the harness runs on both the 152 baseline and 153+.
+  options.addArguments("--remote-allow-system-access");
 
   driver = await new Builder()
     .forBrowser("firefox")
