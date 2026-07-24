@@ -278,3 +278,46 @@ describe("BubbleBox — §7 ellipse gate (snapped regions only)", () => {
     expect(box.style.borderRadius).toBe("0px");
   });
 });
+
+describe("BubbleBox — Phase 10 §1 peek (reveal the art)", () => {
+  it("renders ZERO children — no fill, no label — even with non-empty text", () => {
+    const box = renderBubbleBox(region(), RECT, FONT, makeMeasure, { peek: true });
+    expect(box.children.length).toBe(0);
+    expect(box.textContent).toBe(""); // nothing painted; the raw <img> shows through
+  });
+
+  it("carries only a 1px dashed hairline cue at outlineOffset -1px", () => {
+    const box = renderBubbleBox(region(), RECT, FONT, makeMeasure, { peek: true });
+    expect(box.style.outline).toBe("1px dashed rgba(90, 90, 90, 0.65)");
+    expect(box.style.outlineOffset).toBe("-1px");
+  });
+
+  it("leaves the box zIndex/opacity unset (the §6 stacking-context contract)", () => {
+    const box = renderBubbleBox(region(), RECT, FONT, makeMeasure, { peek: true });
+    expect(box.style.zIndex).toBe(""); // no stacking context from the peeked box
+    expect(box.style.opacity).toBe(""); // transparency is ABSENT CHILDREN, not opacity
+  });
+
+  it("lays the box out at the supplied cover rect (hover hit-test geometry intact)", () => {
+    const drawRect: PxRect = { left: 10, top: 20, width: 150, height: 160 };
+    const box = renderBubbleBox(region(), RECT, FONT, makeMeasure, { peek: true, drawRect });
+    expect(box.style.left).toBe("10px");
+    expect(box.style.top).toBe("20px");
+    expect(box.style.width).toBe("150px");
+    expect(box.style.height).toBe("160px");
+  });
+
+  it("never invokes the measurer under peek (textFit pipeline fully skipped)", () => {
+    // A measure FACTORY that throws the moment it is called: renderBubbleBox reaches
+    // `makeMeasure(WORD_PROBE_WIDTH)` only past the peek early-return, so a peek render
+    // must never call it — proving the whole word-probe/fit/label path is skipped.
+    const throwingFactory = (): never => {
+      throw new Error("measurer must not run under peek");
+    };
+    expect(() =>
+      renderBubbleBox(region({ translated: "Hello there" }), RECT, FONT, throwingFactory, {
+        peek: true,
+      }),
+    ).not.toThrow();
+  });
+});

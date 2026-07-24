@@ -76,7 +76,12 @@ export interface BBox {
  */
 export interface TranslatedRegion {
   bbox: BBox;
-  /** Text as it appears in the source image (for the "peek original" feature, F14). */
+  /**
+   * Text as it appears in the source image. Still load-bearing for the watermark
+   * filter (`regionFilter.ts`) and provider dedupe (`ProviderBase.ts`); no longer
+   * rendered by peek (Phase 10 §1 reveals the raw page `<img>` instead of
+   * re-rendering the source text).
+   */
   original: string;
   /** Text rendered into the overlay, in the user's target language. */
   translated: string;

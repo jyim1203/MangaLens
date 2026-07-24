@@ -183,7 +183,7 @@ export interface Translator {
 - Rules embedded: preserve honorifics per user setting; translate to `{targetLang}`; keep line breaks natural for bubbles; mark onomatopoeia `is_sfx: true`; if no text found return empty regions array.
 - Use provider-native structured output where available (Gemini `responseSchema`, OpenAI `response_format: json_schema`, Anthropic tool-use forcing) — this is the single biggest reliability win. Fall back to a JSON repair pass (strip fences, retry once with "fix this JSON" using a text-only cheap call).
 
-**Batching (F12):** settings option "pages per request" (1–4). Multi-image requests amortize the prompt tokens across pages; response schema gains a `page_index` per region. Default 1 (lowest latency); "translate all" mode defaults to 2–3.
+**Batching (F12):** settings option "pages per request" (1–4). Multi-image requests amortize the prompt tokens across pages; the response wraps the single-page schema in a required top-level `pages` array, `pages[i]` ↔ image `i` (PROMPTS §4.2). Default 1 (lowest latency); "translate all" mode defaults to 2–3.
 
 ---
 

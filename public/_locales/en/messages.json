@@ -16,8 +16,8 @@
     "description": "Keyboard shortcut description for the region-select fallback (F10)."
   },
   "commandPeekOriginalDescription": {
-    "message": "Peek at the original (untranslated) text",
-    "description": "Keyboard shortcut description for the peek-original toggle (F14)."
+    "message": "Peek at the original page (hide translation overlays)",
+    "description": "Keyboard shortcut description for the peek toggle (F14)."
   },
   "errorAuth": {
     "message": "MangaLens: check your API key",

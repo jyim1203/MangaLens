@@ -26,7 +26,7 @@ import { computeFallbackCoverRects } from "./coverPad";
 import { errorKindToMessage } from "./errorMessages";
 import { createSpinnerBadge } from "./spinnerWolf";
 import { createShadowMeasurer, renderBubbleBox } from "./BubbleBox";
-import { hitTestRegion, peekRepaintTargets, type PeekHover } from "./peek";
+import { expandPeeked, hitTestRegion, peekRepaintTargets, type PeekHover } from "./peek";
 import type { ProviderErrorKind } from "../../shared/types";
 
 const log = createLogger("overlay");
@@ -61,7 +61,10 @@ interface OverlayEntry {
   /** Overlay-local pixel rects of the regions drawn at the last paint (post-filter),
    *  in draw order, for peek hover hit-testing (F14). Rebuilt each paint; a peek
    *  index is into THIS array, and paint() re-derives the same order deterministically
-   *  (filterRegions is pure), so hit-test and repaint stay aligned. */
+   *  (filterRegions is pure), so hit-test and repaint stay aligned. Phase 10 §1:
+   *  index-aligned with the raw region arrays — a render failure STILL records its
+   *  rect (the push is unconditional), so {@link expandPeeked}'s co-peek runs on the
+   *  same index space the hit-test uses. */
   paintedRects?: PxRect[];
 }
 
@@ -81,8 +84,9 @@ export class OverlayManager {
   private syncScheduled = false;
   private rafHandle: number | undefined;
 
-  /** Peek-original (F14) state. `peekAll` (hotkey/command) shows every bubble's
-   *  original; `peekHover` shows just the hovered one; peekAll dominates. */
+  /** Peek (F14) state. `peekAll` (hotkey/command) reveals the raw art under EVERY
+   *  bubble; `peekHover` reveals just the hovered one (plus its co-peeked
+   *  neighbours); peekAll dominates. */
   private peekAll = false;
   private peekHover: PeekHover | null = null;
   private lastMouse: { x: number; y: number } | undefined;
@@ -215,9 +219,10 @@ export class OverlayManager {
   }
 
   /**
-   * Toggle "peek original" on every done overlay (F14 hotkey / `peek-original`
-   * command → `togglePeekOriginal` message). Flips the global flag and repaints
-   * every done entry so each bubble swaps to its source text (and back).
+   * Toggle "peek" on every done overlay (F14 hotkey / `peek-original` command →
+   * `togglePeekOriginal` message) — view the raw page / hide all translation
+   * overlays. Flips the global flag and repaints every done entry so each bubble
+   * goes transparent, revealing the untouched art beneath (and back).
    */
   togglePeekAll(): void {
     this.peekAll = !this.peekAll;
@@ -225,23 +230,13 @@ export class OverlayManager {
     // (processPeek early-returns, so peekHover is frozen at whatever bubble the
     // pointer was over when peek-all engaged). Toggling peek-all OFF then repaints
     // every done entry consulting that STALE hover — a bubble the pointer left long
-    // ago would stay stuck showing its original for a keyboard-only user until the
-    // next mousemove happens to re-run the hit-test. Clearing it (both directions is
+    // ago would stay stuck transparent (revealing its art) for a keyboard-only user
+    // until the next mousemove happens to re-run the hit-test. Clearing it (both directions is
     // simplest) lets the next real mousemove re-establish a live hover.
     this.peekHover = null;
     for (const entry of this.entries.values()) {
       if (entry.state === "done" && entry.page) this.paint(entry);
     }
-  }
-
-  /** Whether a region should render its ORIGINAL text for the given entry (F14). */
-  private shouldPeek(entryId: string, regionIndex: number): boolean {
-    if (this.peekAll) return true;
-    return (
-      this.peekHover !== null &&
-      this.peekHover.entryId === entryId &&
-      this.peekHover.regionIndex === regionIndex
-    );
   }
 
   /** Mark the hover peek dirty; hit-test once on the next frame. */
@@ -263,9 +258,8 @@ export class OverlayManager {
   /**
    * Hit-test the last pointer position against every done overlay's painted
    * bubbles and repaint only the entries whose hovered bubble changed
-   * ({@link peekRepaintTargets}). A no-op while `peekAll` is on (everything is
-   * already showing its original) or when the pointer is over no bubble and
-   * wasn't before.
+   * ({@link peekRepaintTargets}). A no-op while `peekAll` is on (every bubble is
+   * already revealed) or when the pointer is over no bubble and wasn't before.
    */
   private processPeek(): void {
     if (this.peekAll) return; // toggle-all wins; hover would just fight it
@@ -499,26 +493,42 @@ export class OverlayManager {
     entry.lastPaintedSize = { w: displayedW, h: displayedH };
     const makeMeasure = createShadowMeasurer(entry.measureEl, this.settings.font);
 
-    // Record the painted rects so a peek hover hit-tests and indexes the SAME
-    // regions it will repaint (F14). The peek index is the PAINTED index (not the
-    // raw region index) so a skipped region can't desync hit-test vs. repaint.
+    // Phase 10 §1: which regions render transparent (reveal the art). peekAll (the
+    // hotkey) reveals every bubble; otherwise expandPeeked resolves the single
+    // hovered region PLUS any contained/containing neighbour whose fill would else be
+    // left covering the revealed art (co-peek), run on the RAW coverRects so its
+    // indices line up with the loop below.
+    const hoverIdx =
+      !this.peekAll && this.peekHover !== null && this.peekHover.entryId === entry.candidate.id
+        ? this.peekHover.regionIndex
+        : null;
+    const peeked = expandPeeked(hoverIdx, coverRects);
+
+    // Record the painted rects so a peek hover hit-tests and indexes the SAME regions
+    // it will repaint (F14). Painted index === raw region index BY CONSTRUCTION: every
+    // region pushes its cover rect UNCONDITIONALLY (even one whose render throws), so
+    // the hit-test can index straight into this array and expandPeeked's co-peek runs
+    // on the same index space.
     const paintedRects: PxRect[] = [];
 
     for (let i = 0; i < regions.length; i++) {
       const region = regions[i]!;
+      const px = rects[i]!;
+      // The box draws at its cover rect (§3) — identical to `px` for every
+      // snapped/non-bubble region — so peek hit-testing uses that drawn rect too.
+      const drawRect = coverRects[i]!;
+      // Push BEFORE the render attempt: a thrown region still records its hit-test
+      // geometry (the index-alignment invariant), just appends no box — hovering it
+      // re-throws the same deterministic skip, fail-soft.
+      paintedRects.push(drawRect);
+      const peek = this.peekAll || peeked[i] === true;
       try {
-        const px = rects[i]!;
-        // The box draws at its cover rect (§3) — identical to `px` for every
-        // snapped/non-bubble region — so peek hit-testing uses that drawn rect too.
-        const drawRect = coverRects[i]!;
-        const peek = this.shouldPeek(entry.candidate.id, paintedRects.length);
         const box = renderBubbleBox(region, px, this.settings.font, makeMeasure, {
           peek,
           suppressFill: suppressFills[i],
           drawRect,
         });
         entry.container.appendChild(box);
-        paintedRects.push(drawRect);
       } catch (err) {
         log.warn("failed to render region (skipping)", err);
       }

@@ -18,6 +18,7 @@ import {
   planTranslateAllWindow,
   requestAllTimeoutMs,
   sameChapterHref,
+  sameChapterSearch,
   type OverlaySink,
 } from "../../src/content/viewportQueue";
 import { sendToBackground } from "../../src/shared/messages";
@@ -1332,11 +1333,21 @@ describe("viewportQueue — sameChapterHref (§1 chapter-identity comparison)", 
     expect(sameChapterHref(base, "https://evil.org/chapter/abc-uuid/4")).toBe(false);
   });
 
-  it("search change → false (query page-drift is NOT tolerated this phase)", () => {
+  it("§2 (Phase 10): a numeric query drift is now TOLERATED; a non-numeric search change still disarms", () => {
+    // Pre-10 this asserted `false` (query page-drift NOT tolerated); Phase 10 §2 lifts
+    // that limitation via sameChapterSearch — a numeric `?page=` counter drift is same
+    // chapter. The full search truth table lives in the sameChapterSearch suite below.
     expect(
       sameChapterHref(
         "https://mangadex.org/chapter/abc-uuid?page=4",
         "https://mangadex.org/chapter/abc-uuid?page=9",
+      ),
+    ).toBe(true);
+    // A non-numeric query value change is still a real chapter change → disarm.
+    expect(
+      sameChapterHref(
+        "https://mangadex.org/chapter/abc-uuid?vol=a",
+        "https://mangadex.org/chapter/abc-uuid?vol=b",
       ),
     ).toBe(false);
   });
@@ -1358,6 +1369,67 @@ describe("viewportQueue — sameChapterHref (§1 chapter-identity comparison)", 
     const origin = "http://127.0.0.1:8785";
     expect(sameChapterHref(origin + "/chapter-long.html/1", origin + "/chapter-long.html/7")).toBe(true);
     expect(sameChapterHref(origin + "/chapter-long.html", origin + "/chapter-long.html/1")).toBe(true);
+  });
+});
+
+describe("viewportQueue — sameChapterSearch (§2 query-string page drift)", () => {
+  it("identical searches → true, including two empty strings", () => {
+    expect(sameChapterSearch("?page=4", "?page=4")).toBe(true);
+    expect(sameChapterSearch("", "")).toBe(true);
+  });
+
+  it("same-key digit drift ?page=4 → ?page=9 → true", () => {
+    expect(sameChapterSearch("?page=4", "?page=9")).toBe(true);
+  });
+
+  it("a single digit-valued param added and removed → true (both directions, incl. from empty)", () => {
+    expect(sameChapterSearch("", "?page=2")).toBe(true); // reader adds the tracker on first scroll
+    expect(sameChapterSearch("?page=2", "")).toBe(true); // and the reverse
+    expect(sameChapterSearch("?a=1", "?a=1&page=2")).toBe(true); // added alongside an unchanged param
+  });
+
+  it("a non-digit value change → false", () => {
+    expect(sameChapterSearch("?chapter=abc", "?chapter=xyz")).toBe(false);
+  });
+
+  it("a key rename (?page= → ?p=) → false", () => {
+    expect(sameChapterSearch("?page=4", "?p=4")).toBe(false);
+  });
+
+  it("two drifted keys → false", () => {
+    expect(sameChapterSearch("?page=1&x=2", "?page=3&x=4")).toBe(false);
+  });
+
+  it("an extra NON-digit param → false", () => {
+    expect(sameChapterSearch("?page=4", "?page=4&mode=strip")).toBe(false);
+  });
+
+  it("order-insensitive (params reserialized in a different order) → true", () => {
+    expect(sameChapterSearch("?a=1&b=2", "?b=2&a=1")).toBe(true);
+  });
+
+  it("a repeated-key multiset mismatch (?a=1&a=2) → false", () => {
+    expect(sameChapterSearch("?a=1&a=2", "?a=1&a=3")).toBe(false);
+  });
+
+  it("digit drift combined with tolerated numeric PATH drift → true (compose independently)", () => {
+    // sameChapterHref threads the search through sameChapterSearch: a numeric path
+    // segment AND a numeric query value may BOTH drift and still name one chapter.
+    expect(
+      sameChapterHref(
+        "https://mangadex.org/chapter/abc-uuid/4?page=1",
+        "https://mangadex.org/chapter/abc-uuid/9?page=2",
+      ),
+    ).toBe(true);
+  });
+
+  it("digit query drift on a DIFFERENT origin → false (the origin gate still dominates)", () => {
+    expect(
+      sameChapterHref(
+        "https://mangadex.org/chapter/abc-uuid?page=1",
+        "https://evil.org/chapter/abc-uuid?page=2",
+      ),
+    ).toBe(false);
   });
 });
 
@@ -1565,6 +1637,43 @@ describe("viewportQueue — translate-all persistence across recycling (§2 shel
       imageUrl: late.url,
       priority: TRANSLATE_ALL_PRIORITY,
     });
+    queue.stop();
+  });
+
+  it("§2: the reader's numeric QUERY page drift keeps the intent armed → later pages still auto-send", async () => {
+    // A reader that tracks the page in the query string (`?page=N`) rewrites it as the
+    // user scrolls; Phase 10 §2 tolerates that drift so later pages still auto-send.
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    let href = "https://mangadex.org/reader?page=1";
+    const queue = makeQueue(fakeOverlay(), () => href);
+    queue.register(cand("a"));
+    queue.requestAll(); // arm on ?page=1 + send a
+    expect(translateCalls()).toHaveLength(1);
+
+    href = "https://mangadex.org/reader?page=7"; // query counter drifted
+    const late = cand("b");
+    queue.register(late);
+    await tick();
+    expect(translateCalls()).toHaveLength(2);
+    expect(translateCalls()[1]![1]).toMatchObject({
+      imageUrl: late.url,
+      priority: TRANSLATE_ALL_PRIORITY,
+    });
+    queue.stop();
+  });
+
+  it("§2: a non-numeric query change disarms (a real chapter change via the query string)", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    let href = "https://mangadex.org/reader?chapter=abc";
+    const queue = makeQueue(fakeOverlay(), () => href);
+    queue.register(cand("a"));
+    queue.requestAll(); // arm on ?chapter=abc + send a
+    expect(translateCalls()).toHaveLength(1);
+
+    href = "https://mangadex.org/reader?chapter=xyz"; // non-numeric query drift = new chapter
+    queue.register(cand("b"));
+    await tick();
+    expect(translateCalls()).toHaveLength(1); // disarmed → no auto-send
     queue.stop();
   });
 });

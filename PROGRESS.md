@@ -3564,3 +3564,155 @@ is no blank tail; navigating to a DIFFERENT chapter (SPA nav) mid-burst logs **o
 chapter changed` line and the new chapter buys nothing until Translate all is clicked there;
 the wolf badge appears on pending pages throughout (unchanged 9.8 behavior).
 
+## Phase 10 summary (transparent hover-peek + query-string chapter drift + doc fix)
+
+Two small user-requested features (2026-07-24) and a doc correction, per
+`docs/PHASE-10-HANDOFF.md`. **§1** rebuilds hover-peek (F14): instead of swapping the hovered
+bubble back to `region.original` ON TOP of the still-painted fill, hover now makes the bubble
+**fully transparent** — no fill, no label — so the untouched page `<img>` beneath (original art
+AND source text) shows through under the cursor. **§2** lifts the recorded 9.9 limitation: a
+reader that tracks pages as `?page=N` no longer permanently disarms the translate-all intent on
+the first scroll. **§3** corrects an ARCHITECTURE.md sentence.
+
+**Context correction carried forward (the handoff's, restated honestly).** Multi-page batching
+(F12) is **already fully implemented** (Phase 8 §1: the `background/batch.ts` collector,
+`ProviderBase.translateBatch`, per-adapter `buildBatchRequest`, the split-on-failure ladder,
+per-member cache stores, e2e Scenario B). It is dormant ONLY because
+`DEFAULT_SETTINGS.pagesPerRequest` is 1 — **activation is a user settings flip, not code**. This
+phase built **nothing** batching-related beyond §3's one doc sentence.
+
+**§1 — transparent peek (`overlay/peek.ts`, `overlay/BubbleBox.ts`, `overlay/OverlayManager.ts`).**
+A new pure, unit-tested `expandPeeked(hoverIndex, rects): boolean[]` (peek.ts) is the new third
+decision alongside `hitTestRegion`/`peekRepaintTargets`: the parallel boolean array of which
+painted bubbles a hover reveals — the hovered index PLUS every OTHER index whose rect fully
+CONTAINS or IS fully CONTAINED BY the hovered rect (a private `rectContains`, inclusive edges).
+`renderBubbleBox` gains a peek early-return: when `options.peek`, it sets a hairline cue and
+returns the **childless** box, skipping the fill layer AND the entire textFit pipeline.
+`OverlayManager.paint` computes `expandPeeked` on the raw `coverRects` and passes `peek` per
+region; the pure `shouldPeek` method is deleted (its two halves are the peekAll check + the
+expand call).
+
+**Deliberate call — transparency from ABSENT CHILDREN, never `opacity`/`visibility` on the box
+(flagged).** An empty box carrying only an `outline` creates no stacking context, so the §6
+layering contract (box stays `z-index: auto`, no transform/filter/opacity) is preserved and
+peeking one bubble can never re-order another's fill/label. Pinned in a test (peek box leaves
+`zIndex`/`opacity` unset).
+
+**Deliberate call — co-peek is CONTAINMENT, not intersection (flagged, with its recorded
+limitation).** A containment pair is a duplicate detection under `overlapTrim`'s own doctrine:
+the inner region's fill is already SUPPRESSED (`computeContainedFillSuppression`) because the
+outer fill covers it, so peeking only the inner would leave the outer's paint over the revealed
+art — and hovering the OUTER must likewise vanish the inner's floating label. Partial overlaps
+after `trimOverlaps` are slivers; blanking a whole neighbour for a sliver would float ITS label
+on raw art, worse than a sliver of fill overhanging a corner. Containment is transitive, so one
+pass against the hovered rect catches an A ⊇ B ⊇ C chain from any link. **Known limitation
+recorded in the JSDoc:** a DIAGONAL neighbour's grown cover rect (`coverPad` clamps a fallback
+fill's growth only against span-sharing neighbours, not diagonal ones) can overlap the peeked
+rect WITHOUT containing it and stays painted over a corner — the upgrade path is one line (swap
+the predicate to an intersection test), deliberately deferred.
+
+**Deliberate call — the unconditional `paintedRects` push = the painted-index === raw-index
+invariant (load-bearing, flagged).** `paint()` now pushes each region's `drawRect` into
+`paintedRects` **BEFORE** the render try, so a region whose `renderBubbleBox` throws still records
+its hit-test geometry (it just appends no box). Previously a thrown region silently desynced the
+painted-index space from the raw-region space; peek only worked because the two were never
+coupled. Coupling them (so `expandPeeked` runs on the raw `coverRects` and the hover hit-test
+indexes straight into `paintedRects`) REQUIRES the push be unconditional — dropping a thrown
+region's rect would flicker-loop the hover hit-test. A thrown region re-throws the same
+deterministic skip on hover; fail-soft.
+
+**Deliberate call — peekAll is now "view the raw page" (flagged).** The Alt+Shift+O hotkey /
+`togglePeekOriginal` command reverts the whole page to raw art (hide all translation overlays),
+not "show every bubble's source text." Message name/shape unchanged (protocol stability); the
+JSDoc on `messages.ts`, `types.ts` (`original` is still load-bearing for the watermark filter +
+provider dedupe, just no longer rendered by peek), and `messages.json`
+(`commandPeekOriginalDescription`) were reworded. The softened cue: `1px dashed rgba(90,90,90,
+0.65)` at `outlineOffset -1px` (was 2px/0.9) — thinner and fainter because it now sits over
+revealed art, not our own fill; hugs the balloon's inked rim and obscures near-nothing. WHY keep
+a cue at all: with zero affordance the vanish reads as a rendering glitch.
+
+**§2 — `sameChapterSearch` (`viewportQueue.ts`).** A new pure, exported, unit-tested
+`sameChapterSearch(searchA, searchB)` replaces the strict `a.search !== b.search` guard inside
+`sameChapterHref`. Both searches are parsed with `URLSearchParams` and compared as SORTED
+`[key, value]` multisets (order-insensitive — frameworks reserialize params arbitrarily) via a
+two-pointer merge. Tolerated drift, and nothing else: exact equality (fast path, covers two
+empties); all pairs equal in any order; all equal except EXACTLY ONE shared key — present once
+on each side — whose value differs and is all-digits on BOTH sides (`?page=4` → `?page=9`); one
+multiset is the other plus EXACTLY ONE extra all-digits param (`/reader` ↔ `/reader?page=2`,
+both directions). **Still intolerated (→ disarm):** key renames (`?page=` → `?p=`), non-digit
+value changes, ≥ 2 drifted keys, a non-digit param added/removed, and repeated-key multiset
+mismatches (`?a=1&a=2`). **WHY digits-only again and NO param-name allowlist:** same
+numeric-counter identity heuristic as the 9.9 path rule — the only thing readers rewrite while
+scrolling is a numeric counter, and a hardcoded `page`/`p` list goes stale (the endpointModes
+learn-don't-list philosophy). **The path and search rules compose INDEPENDENTLY** — a URL
+drifting a numeric path segment AND a numeric query value passes both, each tolerance still a
+single counter (noted in the JSDoc, pinned in a test). Fails toward DISARM (rule 4), identical
+to the 9.9 path rule. `noteHrefDrift`/disarm logging at both call sites is unchanged — a
+tolerated search drift logs the same single `href drift tolerated` line.
+
+**§3 — ARCHITECTURE.md batching-schema correction.** The "Batching (F12)" line said the batch
+response schema "gains a `page_index` per region." The implementation (verified in
+`providers/prompt.ts` `toBatchSchema`, and PROMPTS §4.2) instead wraps the single-page schema in
+a **required top-level `pages` array, `pages[i]` ↔ image `i`.** Corrected the sentence;
+doc-only, PROMPTS.md untouched (already correct).
+
+**No version bumps** (`PROMPT_VERSION` 3 / `SNAP_VERSION` 4 / `CACHE_VERSION` 2 untouched) — §1 is
+render-time only (cached pages pick it up on the next repaint) and §2 is content-scope logic. A
+**free** phase.
+
+**Surface changes (flagged, all within the sanctioned list — NO manifest/message-shape/
+`shared/types.ts`-shape/styles.css change):** (a) `overlay/peek.ts`: `expandPeeked` + private
+`rectContains` + module-header update (two decisions → three; the stale "original text is often
+CJK" rationale replaced — the repaint requirement now comes from restoring textFit on UN-peek
+and the co-peek expansion). (b) `overlay/BubbleBox.ts`: the peek early-return branch (replacing
+the old outline block), `RenderBubbleOptions.peek` JSDoc, module-header wording; the
+`options.peek ? region.original :` branch collapsed to `region.translated`. (c)
+`overlay/OverlayManager.ts`: the `paint()` peek wiring + unconditional push, `shouldPeek`
+deletion, and the paintedRects/peek-state/`togglePeekAll`/`processPeek` comment updates. (d)
+`content/viewportQueue.ts`: `sameChapterSearch` + its `sameChapterHref` wiring + JSDoc (the
+lifted-limitation block). (e) `shared/messages.ts`: `togglePeekOriginal` DOC comment only. (f)
+`shared/types.ts`: the `original` field DOC comment only. (g) `public/_locales/en/messages.json`:
+`commandPeekOriginalDescription` wording (the optional `optionsPagesPerRequestHint` description
+tag was left untouched — its "Phase 8 batching" note is accurate, not stale). (h)
+`docs/ARCHITECTURE.md`: the §3 sentence. (i) tests below.
+
+**Deviation from the handoff (one, flagged).** The handoff's §1 tests list an OPTIONAL jsdom
+OverlayManager round-trip and says "The pure tests above carry the weight; do not fight jsdom for
+this one." It was **skipped** as sanctioned — the pure `expandPeeked` suite + the BubbleBox DOM
+peek suite carry the coverage. One pre-existing 9.9 test ("search change → false") asserted the
+now-lifted limitation; it was **mechanically re-pointed** to assert the new semantics (numeric
+query drift → true, a non-numeric search change → false), exactly as 9.9 re-pointed four tests
+when it changed the scope.
+
+**Tests: 901 unit (+27 net over the 874 baseline; 1 existing test mechanically updated).** Pure:
+`expandPeeked` (null → all-false; empty → `[]`; no containment → only hover; outer-contains-hover
+and hover-contains-inner → both; exact-equal → both, inclusive; PARTIAL overlap → NOT expanded;
+A ⊇ B ⊇ C chain → all three from any link; out-of-range/negative → all-false).
+`sameChapterSearch` truth table (identical incl. two empty; same-key digit drift; digit param
+added/removed both directions incl. from empty; non-digit value → false; key rename → false; two
+drifted keys → false; extra non-digit → false; order-insensitive → true; repeated-key mismatch →
+false; digit drift + tolerated numeric PATH drift → true, the compose-independently case; digit
+query drift on a DIFFERENT origin → false, origin gate dominates). DOM (`BubbleBox.test.ts`):
+`peek: true` → ZERO children with non-empty text; the `1px dashed …`/`outlineOffset -1px` cue;
+box `zIndex`/`opacity` stay unset (stacking contract); layout at the supplied cover rect
+(hit-test geometry intact); a measure factory that THROWS is never invoked under peek (textFit
+fully skipped). Shell (`viewportQueue.test.ts`, non-auto seam): a numeric QUERY page drift keeps
+the intent armed and later pages auto-send; a non-numeric query change disarms. `npm run check`
+green (typecheck + ESLint + 901 tests); `npm run build` clean (background 58.85 kB);
+`npm run lint:ext` **0/0/0**.
+
+**`npm run test:e2e` 5/5 green on this machine** — Scenario bodies A–E **untouched** (A 9.2 s,
+B 7.7 s, C 3.6 s, D 18.6 s, E 49.5 s) on Firefox with the carried-over
+`--remote-allow-system-access` harness flag. No e2e change this phase: no peek scenario exists
+(hover simulation isn't trivially cheap and the pure/DOM peek tests carry it), and Scenario E
+already proves both §2 call sites route through `sameChapterHref` — the search predicate is
+carried by the unit truth table.
+
+**Manual verification (live key + MangaDex): NOT run.** Expected: hovering a translated bubble
+makes its paint vanish under a 1px dashed hairline so the original art + source text show through,
+and moving off re-fits the translation; hovering an inner bubble of a nested pair vanishes the
+outer's covering fill too (no white sheet left over the art); Alt+Shift+O reverts the whole page
+to raw art and toggling back restores every translation. On a query-string reader (`?page=N`):
+Translate all then scroll shows — with debug on — one `href drift tolerated` line, zero `disarm`
+lines, and the window keeps refilling; on MangaDex (path drift) the 9.9 behavior is unchanged.
+

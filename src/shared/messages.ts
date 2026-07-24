@@ -255,8 +255,9 @@ export interface MessageMap {
   startRegionSelect: { request: void; response: { started: boolean } };
 
   /**
-   * Background command fan-out → content: flip "peek original" on every done
-   * overlay (F14 toggle-all). No-op while inert.
+   * Background command fan-out → content: flip "peek" on every done overlay (F14
+   * toggle-all) — hide every translation overlay so the raw page shows through
+   * (Phase 10 §1; the message name is kept for protocol stability). No-op while inert.
    */
   togglePeekOriginal: { request: void; response: void };
 

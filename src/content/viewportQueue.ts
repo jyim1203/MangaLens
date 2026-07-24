@@ -197,10 +197,14 @@ export type RegisterIntentAction = "send" | "disarm" | "ignore";
  *    string-equal, and unparseable ⇒ unjudgeable ⇒ disarm).
  *  - different `origin` → `false`.
  *  - `hash` is ignored entirely — a fragment (`#page-5`) can never change the chapter.
- *  - `search` must be EXACTLY equal — query-string page drift (`?page=5`) is NOT
- *    tolerated this phase (a deliberate, recorded limitation). // WHY: MangaDex (the
- *    evidence) drifts the PATH; loosening the query multiplies the false-"same"
- *    surface for zero observed benefit.
+ *  - `search` compared by {@link sameChapterSearch} (Phase 10 §2): tolerates a single
+ *    numeric query drift (`?page=4` → `?page=9`) or one extra numeric param
+ *    (`/reader` ↔ `/reader?page=2`) — the same numeric-counter identity heuristic as
+ *    the path rule, so a reader that tracks pages via the query string no longer
+ *    disarms on the first scroll (the pre-9.9 bug class, one layer over). Non-numeric
+ *    query drift, key renames, and multi-key drift still disarm. The path and search
+ *    rules compose INDEPENDENTLY — a URL drifting a numeric path segment AND a numeric
+ *    query value passes both (each tolerance is still a single numeric counter).
  *  - pathname segments (split on `/`, empty dropped):
  *      · equal lists → `true`;
  *      · same length, all equal except the LAST, and BOTH last segments all-digits
@@ -227,7 +231,8 @@ export function sameChapterHref(armedHref: string, currentHref: string): boolean
     return false; // unparseable ⇒ unjudgeable ⇒ disarm (rule 4)
   }
   if (a.origin !== b.origin) return false;
-  if (a.search !== b.search) return false; // query page-drift NOT tolerated (deliberate)
+  // Phase 10 §2: tolerate a single numeric query-counter drift, disarm otherwise.
+  if (!sameChapterSearch(a.search, b.search)) return false;
   // hash is ignored entirely — a fragment can never change the chapter.
   const isDigits = (s: string): boolean => /^\d+$/.test(s);
   const segsA = a.pathname.split("/").filter((s) => s.length > 0);
@@ -255,6 +260,103 @@ export function sameChapterHref(armedHref: string, currentHref: string): boolean
   }
   const tail = longer[longer.length - 1];
   return tail !== undefined && isDigits(tail);
+}
+
+/**
+ * Phase 10 §2 (pure): does query string `searchA` name the SAME CHAPTER as `searchB`,
+ * tolerating ONLY the numeric page-counter drift a reader performs while scrolling?
+ * The sibling of {@link sameChapterHref}'s path rule, for readers that track the page
+ * in the query string (`?page=N`) rather than the path — the pre-10 exact-`search`
+ * compare disarmed the translate-all intent on the first such scroll (the pre-9.9 bug
+ * class, one layer over). Mirrors the path rule's narrowness and fails toward DISARM
+ * (rule 4): every ambiguous comparison resolves to `false`.
+ *
+ * Both searches are parsed with `URLSearchParams` and compared as SORTED
+ * `[key, value]` multisets (order-insensitive — reader frameworks reserialize params
+ * in arbitrary order, so `?a=1&b=2` ≡ `?b=2&a=1`). Tolerated drift, and nothing else:
+ *  - exact string equality → `true` (fast path; also two empty searches);
+ *  - all pairs equal in any order → `true`;
+ *  - all equal except EXACTLY ONE shared key — present once on EACH side — whose value
+ *    differs and is all-digits (`/^\d+$/`) on BOTH sides → `true` (`?page=4` → `?page=9`);
+ *  - one multiset is the other plus EXACTLY ONE extra param whose value is all-digits →
+ *    `true` (`/reader` ↔ `/reader?page=2`, both directions — the reader adding the
+ *    tracker on first scroll);
+ *  - anything else → `false`: key renames (`?page=` → `?p=`), non-digit value changes,
+ *    ≥ 2 drifted keys, a non-digit param added/removed, and repeated-key multiset
+ *    mismatches (`?a=1&a=2` — any mismatch beyond the single tolerated drift is a
+ *    chapter change).
+ *
+ * // WHY digits-only again, and NO param-name allowlist (`page`/`p`/…): the identity
+ * heuristic is the path rule's — the only thing readers rewrite while scrolling is a
+ * numeric counter, and a hardcoded name list goes stale (the endpointModes
+ * learn-don't-list philosophy). // WHY it composes INDEPENDENTLY with the path rule:
+ * {@link sameChapterHref} applies each narrowly, so a URL drifting a numeric path
+ * segment AND a numeric query value passes both — each tolerance is still one counter.
+ *
+ * @param searchA the armed href's query string (`URL.search`; a leading `?` is
+ *   optional — `URLSearchParams` strips it).
+ * @param searchB the current href's query string.
+ */
+export function sameChapterSearch(searchA: string, searchB: string): boolean {
+  if (searchA === searchB) return true; // fast path (covers two empty searches)
+
+  const isDigits = (s: string): boolean => /^\d+$/.test(s);
+  const cmpPair = (x: [string, string], y: [string, string]): number =>
+    x[0] === y[0] ? (x[1] < y[1] ? -1 : x[1] > y[1] ? 1 : 0) : x[0] < y[0] ? -1 : 1;
+  const entries = (s: string): [string, string][] => {
+    const out: [string, string][] = [];
+    new URLSearchParams(s).forEach((value, key) => out.push([key, value]));
+    return out.sort(cmpPair);
+  };
+  const a = entries(searchA);
+  const b = entries(searchB);
+
+  // Two-pointer merge over the sorted pair lists → the unmatched remainder on each
+  // side (equal pairs cancel; this is a multiset difference).
+  const onlyA: [string, string][] = [];
+  const onlyB: [string, string][] = [];
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    const c = cmpPair(a[i]!, b[j]!);
+    if (c === 0) {
+      i++;
+      j++;
+    } else if (c < 0) {
+      onlyA.push(a[i]!);
+      i++;
+    } else {
+      onlyB.push(b[j]!);
+      j++;
+    }
+  }
+  while (i < a.length) onlyA.push(a[i++]!);
+  while (j < b.length) onlyB.push(b[j++]!);
+
+  // All pairs matched (differing only in serialization order) → same chapter.
+  if (onlyA.length === 0 && onlyB.length === 0) return true;
+
+  // Exactly one extra digit-valued param on ONE side (`/reader` ↔ `/reader?page=2`).
+  if (onlyA.length === 0 && onlyB.length === 1 && isDigits(onlyB[0]![1])) return true;
+  if (onlyB.length === 0 && onlyA.length === 1 && isDigits(onlyA[0]![1])) return true;
+
+  // Exactly one shared key whose digit value drifted (`?page=4` → `?page=9`), that key
+  // present exactly ONCE on each side — a repeated-key multiset mismatch (`?a=1&a=2`)
+  // is a chapter change, never tolerated drift.
+  if (
+    onlyA.length === 1 &&
+    onlyB.length === 1 &&
+    onlyA[0]![0] === onlyB[0]![0] &&
+    isDigits(onlyA[0]![1]) &&
+    isDigits(onlyB[0]![1])
+  ) {
+    const key = onlyA[0]![0];
+    const countKey = (list: readonly [string, string][]): number =>
+      list.reduce((n, e) => (e[0] === key ? n + 1 : n), 0);
+    if (countKey(a) === 1 && countKey(b) === 1) return true;
+  }
+
+  return false; // key renames, non-digit drift, ≥ 2 drifted keys, repeated-key → disarm
 }
 
 /**

@@ -5,8 +5,8 @@
  * size to {@link resolveFontSize}, and (Phase 9) the shaped fill's clip path,
  * inscribed text rect, ellipse fallback, and dark-fill text flip to
  * `shapePath.ts`. Horizontal text regardless of source direction (§7.7 normal
- * case). `pointer-events: none` throughout — F14 peek-original swaps the text
- * via a REPAINT (see {@link RenderBubbleOptions.peek}), not interactivity, so
+ * case). `pointer-events: none` throughout — F14 peek REVEALS THE ART via a
+ * REPAINT (see {@link RenderBubbleOptions.peek}), not interactivity, so
  * page-forward-on-click still reaches the reader (§7.2).
  *
  * WHY a separate fill layer instead of an rgba background: it renders the fill
@@ -87,10 +87,15 @@ export function createShadowMeasurer(
 /** Options for {@link renderBubbleBox}. */
 export interface RenderBubbleOptions {
   /**
-   * Peek-original (F14): show `region.original` instead of `region.translated`,
-   * with a dashed outline cue so users know it's the source text. WHY a repaint
-   * (this whole function) rather than a `textContent` swap: the original is often
-   * CJK and fits differently, so textFit must re-run or it overflows.
+   * Peek (F14 v2, Phase 10 §1): REVEAL THE ART — paint no fill and no label so the
+   * untouched page `<img>` underneath (original art AND source text) shows through;
+   * a hairline dashed outline is the only cue. WHY the transparency comes from ABSENT
+   * CHILDREN, never `opacity`/`visibility` on the box: the §6 stacking-context
+   * contract (the layering comment above `Object.assign(box.style, …)`) forbids
+   * giving this box its own opacity/transform, and an empty box carrying only an
+   * `outline` creates no stacking context — so peeking one bubble can never re-order
+   * another's fill/label. A repaint (this whole function) is still how peek toggles;
+   * see {@link import("./peek").peekRepaintTargets}.
    */
   peek?: boolean;
   /**
@@ -215,10 +220,16 @@ export function renderBubbleBox(
     pointerEvents: "none",
   } satisfies Partial<CSSStyleDeclaration>);
   if (options.peek) {
-    // Dashed outline cue (outline doesn't affect layout, unlike border). Peek
-    // keeps the shaped fill (§4) — the cue lives on the box, not the shape.
-    box.style.outline = "2px dashed rgba(80, 80, 80, 0.9)";
-    box.style.outlineOffset = "-2px";
+    // Phase 10 §1: peek REVEALS THE ART. Return the bare box now — no fill layer, no
+    // textFit pipeline, no label — carrying only a hairline dashed cue, so the
+    // untouched page `<img>` (original art + source text) shows through while the box
+    // still lays out at the draw rect for hover hit-testing. WHY a cue at all: with
+    // zero affordance the vanish reads as a rendering glitch; a 1px dashed line hugs
+    // the balloon's own inked rim and obscures near-nothing. WHY thinner/fainter than
+    // the old 2px cue: it now sits over revealed art, not over our own fill.
+    box.style.outline = "1px dashed rgba(90, 90, 90, 0.65)";
+    box.style.outlineOffset = "-1px";
+    return box;
   }
 
   // Fill layer: separate node so opacity doesn't touch the text. Phase 9 §7:
@@ -245,7 +256,7 @@ export function renderBubbleBox(
     box.appendChild(fill);
   }
 
-  const text = options.peek ? region.original : region.translated;
+  const text = region.translated;
   if (!text.trim()) return box; // empty/whitespace text: fill only.
 
   // Phase 9.3 word-integrity cap-then-widen (replaces the 9.2 probe-after-fit):
