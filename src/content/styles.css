@@ -49,6 +49,47 @@
   }
 }
 
+/*
+ * Pending "actively translating" indicator (Phase 9.8 §2): a spinning wolf badge in
+ * the TOP-LEFT corner of a pending overlay. Top-left mirrors the .mangalens-badge
+ * precedent (the error badge is also top-left, but pending and error are mutually
+ * exclusive states, so they never collide). The disc is static; only the wolf inside
+ * spins, and reduced-motion freezes it to a still, still-legible badge.
+ */
+.mangalens-spinner {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  user-select: none;
+}
+
+.mangalens-spinner svg {
+  width: 22px;
+  height: 22px;
+  animation: mangalens-spin 1.6s linear infinite;
+}
+
+@keyframes mangalens-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mangalens-spinner svg {
+    animation: none;
+  }
+}
+
 /* Error state (§7.2): a small ⚠ badge; its title carries the user message. */
 .mangalens-badge {
   position: absolute;

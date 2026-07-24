@@ -24,6 +24,7 @@ import { filterRegions } from "./regionFilter";
 import { computeContainedFillSuppression, trimOverlaps } from "./overlapTrim";
 import { computeFallbackCoverRects } from "./coverPad";
 import { errorKindToMessage } from "./errorMessages";
+import { createSpinnerBadge } from "./spinnerWolf";
 import { createShadowMeasurer, renderBubbleBox } from "./BubbleBox";
 import { hitTestRegion, peekRepaintTargets, type PeekHover } from "./peek";
 import type { ProviderErrorKind } from "../../shared/types";
@@ -137,6 +138,16 @@ export class OverlayManager {
     const skeleton = document.createElement("div");
     skeleton.className = "mangalens-skeleton";
     entry.container.appendChild(skeleton);
+    // Phase 9.8 §2: the spinning wolf badge marks "actively translating" (top-left),
+    // distinct from the skeleton's "this page area" shimmer — both stay while pending
+    // (deliberate; flagged in PROGRESS). `render`/`setError`/`clear` all rebuild the
+    // container via clearContent, so removal is free. Wrapped so a parse failure can
+    // never throw out of setPending (rule 5) — the skeleton alone still reads.
+    try {
+      entry.container.appendChild(createSpinnerBadge(document));
+    } catch (err) {
+      log.warn("failed to build spinner badge", err);
+    }
     this.positionEntry(entry);
   }
 

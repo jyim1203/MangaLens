@@ -327,6 +327,20 @@ const server = createServer(async (req, res) => {
       /* fall through to 404 */
     }
   }
+  // Phase 9.8 §3: the 30-page long-chapter fixture (Scenario E — staged translate-all
+  // window). Served straight from the static file; its /pages/N.png images reuse the
+  // generator above (it scales to any N).
+  if (req.method === "GET" && path === "/chapter-long.html") {
+    try {
+      const html = await readFile(join(HERE, "chapter-long.html"), "utf8");
+      cors(res);
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.end(html);
+      return;
+    } catch {
+      /* fall through to 404 */
+    }
+  }
 
   cors(res);
   res.statusCode = 404;

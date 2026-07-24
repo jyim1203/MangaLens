@@ -3261,3 +3261,306 @@ logged once per new model. **No-code lever for the user (independent of this fix
 can leave `temperature` at the default the model accepts — the extension now handles the
 mismatch either way.
 
+## Phase 9.8 summary (staged translate-all dispatch + per-page wolf spinner)
+
+Driven by the **fifteenth live-pass report** (2026-07-23, MangaDex) — "still some pages
+not translated after Translate all" — and its handoff (`docs/PHASE-9.8-HANDOFF.md`).
+**Evidence status (honest):** the exported HAR was **0 bytes**, so unlike 9.6/9.7 there
+is **no request-level evidence** this time and **no diagnosed root cause is claimed**.
+What code reading DOES establish (a **code-derived**, NOT HAR-proven, structural hole):
+the 9.6 persistence intent re-sends only on candidate *registration*
+(`maybeAutoSendForIntent`), and a job whose `sendTranslate` times out or resolves
+`aborted` has its record reset **in place** (`requested = false`, re-observe); on a
+**non-auto site the re-observe never sends** (observers aren't attached; visibility never
+dispatches). If that element is not later recycled, **nothing ever re-sends it** — a
+permanently blank page with zero HAR trace. Two fronts: **§1** converts translate-all
+from a fire-everything burst into a **sliding dispatch window** whose refill pump doubles
+as a **sweeper** that structurally closes that class; **§2** adds a per-page spinning-wolf
+"translating" badge so "being worked on" is visible.
+
+**§1 — staged dispatch (`viewportQueue.ts`).** A real `requestAll` now arms the intent
+and dispatches an initial **`TRANSLATE_ALL_BATCH = 12`**-page wave, then keeps a constant
+~12-page lead ahead of the user's confirmed reading position, refilled as they scroll.
+Two pure, unit-tested helpers carry the policy: `maxConfirmedIndex(confirmed)` → the
+confirmed frontier, and `planTranslateAllWindow({count, anchor, batch, requested})` → the
+exact not-yet-requested index list at/below `limit = max(0, anchor) + batch` (clamped to
+`count`). Everything BEHIND the anchor is always in the window — translate-all is a
+whole-chapter promise — so a behind-anchor hole left by a reset send is always re-planned:
+**that is what makes the pump a sweeper.** The thin shell adds `pumpTranslateAllWindow`
+(armed + href-matches + not-paused → dispatch the plan at `TRANSLATE_ALL_PRIORITY` with
+the arm-time budget), a `computeSeedIndex` viewport seam, `attachTranslateAllObservers`,
+`disarmTranslateAll`, and an extended `classifyRegisterIntent(intent, href, paused,
+horizon?)` (the pre-9.8 3-arg call is unchanged; the new `{index, limit}` gate returns
+`"send"` only within the horizon, else `"ignore"` — a beyond-horizon registration stays
+armed and DEFERRED for the pump). Pump call sites: the initial wave in `requestAll` (seeded)
+and every successful `runConfirm` (the anchor just advanced).
+
+**Deliberate call — continuous horizon over the user's chunked proposal (flagged).** The
+user proposed "send 12, then after ~6 pages scrolled send the next 12." I implemented the
+equivalent-but-simpler **continuous sliding horizon** (`horizon = maxConfirmedIndex +
+TRANSLATE_ALL_BATCH`, derived fresh per check) instead. **WHY:** the chunked scheme lets
+the dispatched lead sag to 6 before refilling (worse pacing, same total spend) AND needs a
+**stored frontier index** that goes stale under the register/unregister churn a live
+chapter sees — the exact staleness trap the derived-cursor design (Phase 9 §1) already
+avoids. Same spend, steadier lead, no stored-index bug.
+
+**Deliberate call — the viewport seed.** The initial wave anchors on
+`max(computeSeedIndex(), maxConfirmedIndex(...))`. **WHY:** a mid-chapter translate-all on
+a non-auto site has NO confirmed anchors yet, so without a seed the initial window would
+ignore where the user actually is and dispatch from the top of the chapter. The seed is
+the lowest registered candidate whose element intersects the viewport, every
+`getBoundingClientRect` wrapped in try/catch and failing soft to index 0 (rule 5). It is
+NOT stored — refill pumps re-derive the anchor from the confirmed frontier alone, keeping
+the no-stale-frontier property.
+
+**Deliberate call — non-auto observer attach/detach (the piece that makes the horizon move
+there).** Today observers attach only when `autoEnqueue`. Now, arming a translate-all on a
+`!autoEnqueue` site attaches the **VISIBLE** observer to every registered candidate (and
+`register` while armed observes the fresh element) so tier-0 confirmations can advance the
+staged horizon as the user scrolls; the **near** observer stays auto-only (it can't
+anchor). `onTier0Event`'s immediate within-window plan and `runConfirm`'s
+`onTierChange`+`slideWindow` are both **gated on `autoEnqueue`** (a non-auto site must
+never visibility-plan) — both modes then call the pump. Disarm (`setPaused(true)`, href
+mismatch via `disarmTranslateAll`) detaches those visible observers + cancels pending
+confirms on a non-auto site; `stop()` disarms via its own full teardown.
+
+**Deliberate call — return-count contract kept.** `requestAll` still returns the **TOTAL**
+not-yet-requested count (`pending.length`), NOT the initial wave, so the popup's "Translate
+N pages?" confirm and the dry-run/real-run symmetry keep meaning "what this click buys
+overall." JSDoc updated in `messages.ts` (`translateAll` doc), `contentRouter.ts`, and the
+`ViewportQueue.requestAll` interface doc (all doc-only).
+
+**Deliberate call — the per-wave budget rule (flagged).** The per-send timeout is now a
+flat `requestAllTimeoutMs(2 × TRANSLATE_ALL_BATCH, concurrency, requestTimeoutMs)` rather
+than the old whole-chapter `pending.length`-scaled value: staging keeps the real backlog a
+wave sits behind near `2×batch`, so a 200-page tail no longer inflates every send's budget.
+Pinned in a unit test (the arithmetic + the "not the flat visibility timeout" behavioural
+test); fail-cheap since a bigger budget only delays a reset, never adds spend.
+
+**Fail-soft (cost direction) everywhere (rule 5):** a non-finite/negative `batch` clamps to
+0 (dispatch the minimum, never a burst — the `anchoredWindowAllows` NaN precedent); a NaN
+`index`/`limit` in the register gate defers rather than sends; the seed pass fails to index
+0; the pump/attach steps are `safe()`-wrapped. Every new decision degrades to "dispatch
+less / later," never a burst beyond today's behaviour.
+
+**§2 — per-page wolf spinner (`overlay/spinnerWolf.ts` + `OverlayManager` + `styles.css`).**
+NEW `spinnerWolf.ts` exports the handoff's SVG **verbatim** as `WOLF_SPINNER_SVG` (not
+redrawn) plus `createSpinnerBadge(doc)` — a `div.mangalens-spinner` (`aria-hidden`) wrapping
+the SVG parsed via `DOMParser`/`importNode` (NOT `innerHTML` — `web-ext lint` flags
+innerHTML sinks); a parse failure or a `DOMParser`-less runtime returns the bare badge div
+(fail-soft — the CSS disc still reads "working"), exercised through the exported
+`parseSpinnerSvg` seam. `OverlayManager.setPending` appends the badge after the skeleton,
+wrapped so a parse throw never escapes `setPending`. **Deliberate call — the skeleton
+STAYS** (both shimmer and badge while pending): the shimmer communicates "this page area,"
+the badge communicates "actively translating." `render`/`setError`/`clear` rebuild the
+container via `clearContent`, so removal is free; hydrate probes never call `setPending`, so
+cache probes stay invisible. `styles.css` adds `.mangalens-spinner` (top-LEFT per the user's
+request; mutually exclusive with the error badge), an inner-`svg` `mangalens-spin` 1.6 s
+linear rotation, and a `prefers-reduced-motion: reduce` arm that freezes the wolf to a
+still, still-legible badge.
+
+**§4 — dispatch logging (`viewportQueue.ts`).** One `log.debug` per wave
+(`translate-all wave: n=<sent> range=<lo>..<hi> horizon=<limit> total=<count>`) in the pump,
+plus one per beyond-horizon register deferral (`translate-all defer: index=… horizon=…`).
+**WHY:** the 9.8 evidence was an EMPTY HAR — the next report must be attributable from the
+console alone. No new flags, no UI.
+
+**Surface changes (flagged, all within the sanctioned list — NO version bumps, no manifest
+change, no new/changed message shapes, no `shared/types.ts` change, no options/popup UI):**
+(a) `content/viewportQueue.ts`: the §1 staged machinery (`TRANSLATE_ALL_BATCH`, pure
+`maxConfirmedIndex`/`planTranslateAllWindow`, `pumpTranslateAllWindow`, `computeSeedIndex`,
+`attachTranslateAllObservers`, `disarmTranslateAll`, the extended `classifyRegisterIntent`,
+the `autoEnqueue` gates in `onTier0Event`/`runConfirm`, the register-while-armed observe, the
+2×batch budget, §4 logging). (b) `content/overlay/OverlayManager.ts`: `setPending` grows the
+spinner badge. (c) `content/styles.css`: `.mangalens-spinner` + keyframes + reduced-motion.
+(d) NEW `content/overlay/spinnerWolf.ts`. (e) `tests/e2e/`: NEW `chapter-long.html` (30
+pages) + Scenario E + a `/chapter-long.html` mock route + `translateAllOnChapter(urlNeedle)`
+gaining an optional arg (default `/chapter.html`, so **A–D bodies stay byte-identical**) +
+README note. (f) JSDoc-only: `messages.ts` `translateAll`, `contentRouter.ts`. `PROMPT_VERSION`
+3 / `SNAP_VERSION` 4 / `CACHE_VERSION` 2 **untouched** — a **free** phase (no prompt, cache-key,
+or cached-shape change, no forced re-translation).
+
+**Considered and rejected:** storing the dispatch frontier index (the staleness trap above);
+seeding refill pumps with the viewport position (only the initial wave needs the seed — a
+stored seed would re-introduce staleness); a chunked refill (worse pacing); options/popup
+plumbing for the batch size (constant-only, out of scope); theming the spinner or replacing
+the skeleton (out of scope).
+
+**Tests: 858 unit (+30 net over the 828 baseline; 1 existing test mechanically updated).**
+Pure: `maxConfirmedIndex` (empty/none/some/last), `planTranslateAllWindow` truth table
+(no-anchor first batch = indices 0..batch **pinned**; advancing anchor slides;
+behind-anchor hole re-planned = the sweeper property; requested skipped; count clamp;
+batch 0/non-finite ⇒ minimum; count 0 ⇒ empty; the 2×batch budget arithmetic),
+`classifyRegisterIntent` horizon cases (within/beyond/NaN, href+pause precedence). Shell
+(`viewportQueue.test.ts`, non-auto seam): a 30-candidate `requestAll` dispatches EXACTLY the
+13-page initial wave; a small chapter (≤ batch) dispatches everything at once (A/B parity);
+a confirm advances the horizon (pump fills up to k+batch); a timeout/abort-reset candidate
+re-sends on the next confirm-pump (the SWEEPER); a beyond-horizon late registration defers
+then dispatches once a confirm reaches it; non-auto arming attaches the visible observer +
+disarm detaches; the pump disarms with no dispatch on an href change; the pump is a no-op
+while paused. The pre-existing "reobserve is a no-op" non-auto test was updated to expect the
+new visible-observer attach. §2: `spinnerWolf.test.ts` (verbatim viewBox + stroke markers;
+`createSpinnerBadge` returns the classed, aria-hidden div with an `<svg>` child; the
+`DOMParser`-absent + malformed-input fallbacks return a bare div/null) and `overlaySpinner.test.ts`
+(`setPending` appends BOTH skeleton + spinner; `render`/`setError` remove them). Typecheck +
+ESLint clean; `vite build` clean (background 58.85 kB); `web-ext lint` **0/0/0**.
+
+**`npm run test:e2e` 5/5 green on this machine** — Scenarios A–D **UNMODIFIED** (A 9.4 s,
+B 7.7 s, C 3.6 s, D 18.6 s) plus the new **Scenario E** (49.5 s) on Firefox 153 with the
+carried-over harness flag `--remote-allow-system-access` (`before()` only). **What E pins vs.
+tolerates (honest):** the 30-page fixture is all-plain http pages (NO blob — the blob/bytes
+path is already covered by A/B, and dropping it removes a revocation-timing flake from a
+scroll-heavy run; flagged). Because the scanner registers an image only once it has LOADED
+(`naturalWidth ≥ 400`), only the loaded subset (~13) is registered at a top-of-chapter click,
+so E asserts the click `count` is a positive subset (not a hardcoded 30) and that the **initial
+provider burst is BOUNDED** (≤ 18), **grows** on stepped scroll, **all 30 eventually paint**,
+and the **total stays ≈ 30** (no runaway). E is the end-to-end smoke that a long-chapter click
+stays bounded and still completes; the staging planner/pump/horizon is proved **precisely** in
+the unit suite (E can't by itself separate "staging capped it" from "lazy-load capped it").
+Fixture size 30 held without the §3 24-page fallback.
+
+**Manual verification (live key + MangaDex): NOT run.** Expected: a long chapter (≥ 25 pages)
+translate-all from the top shows ~12 initial provider requests (not the whole chapter) and a
+steady ~12-page translated lead as the reader scrolls, reaching the end with **zero blank
+pages**; a mid-chapter click dispatches the visible page + ~12 ahead first, earlier pages fill
+in, scrolling back shows no blanks; a killed mid-flight request eventually paints after later
+confirms (the sweeper) instead of staying blank; every pending page shows the wolf badge
+top-left spinning (static under `prefers-reduced-motion`), gone the moment the fill paints;
+pause mid-burst still stops queued sends and disarms persistence (unchanged 9.6). With debug
+on, each wave logs `translate-all wave: …` and each beyond-horizon deferral logs
+`translate-all defer: …`.
+
+## Phase 9.9 summary (chapter-scoped translate-all intent: survive reader URL drift)
+
+Driven by the **fifteenth live-pass evidence** (2026-07-23 HAR `devtools_Archive
+[26-07-23 01-28-59].har`, MangaDex, OpenAI `gpt-5.6-luna`, captured on the **Phase 9.7**
+build BEFORE 9.8 landed) and its handoff (`docs/PHASE-9.9-HANDOFF.md`). The user clicked
+**Translate all** shortly after opening a chapter, read on, and later-loading pages were
+never translated. A single surgical fix: the translate-all persistent intent was scoped
+to the exact `location.href`, and a long-strip reader rewrites the page-number path
+segment while scrolling — which permanently disarmed the intent.
+
+**Evidence established (not re-litigated).** 5 provider calls, all dispatched together at
+t=22.4 s, **all HTTP 200** (14.8–28.4 s each). `temperature` was **absent from the very
+first request** (the 9.7 memo-hydrate fix confirmed working **live**) and there were
+**zero status-0 ghosts and zero 4xx/5xx** (the 9.6 dead-signal guards confirmed working
+**live**) — the failure is not request-shaped, not a race, not provider-side. The capture
+starts on the TITLE page; the chapter opens ~t=20; the click lands t=22.4 with only the
+first few pages registered (blob-page cache hits are invisible in a background-toolbox
+HAR). At **t=70.9 s** the background fetched `https://mangadex.org/img/miku.jpg` —
+MangaDex's placeholder graphic — with **no provider call**: a fresh candidate REGISTERING
+~48 s after the click that produced only an invisible cache probe, and **no provider
+traffic of any kind after t=50.8 s** despite the session continuing. That is the
+register-time translate-all auto-send (9.6 §2) NOT firing for a late page. The only
+condition that kills the armed intent without a pause/teardown is the **exact-href
+scope**: `classifyRegisterIntent` (and, worse on the 9.8 build, `pumpTranslateAllWindow`)
+disarmed on ANY `location.href` change, and MangaDex's reader rewrites `/chapter/<uuid>/<n>`
+via `history.replaceState` (no navigation, same document) as the user scrolls. One page
+boundary crossed → permanent disarm → every later-registering page stays blank. **Why
+e2e never caught it:** the fixtures never rewrote their URL, so Scenarios A–E all held the
+armed href constant for the whole run.
+
+**The fix (§1 — `sameChapterHref`, `viewportQueue.ts`).** A pure, exported, unit-tested
+`sameChapterHref(armedHref, currentHref)` replaces the two exact-string href guards. The
+intent's scope becomes "same chapter", not "same URL string": exact equality → `true`
+(fast path, also the location-less `""` test runtime); any `new URL(...)` parse failure →
+`false`; different `origin` → `false`; **hash ignored entirely** (a `#page-5` fragment can
+never change the chapter); **`search` must be exactly equal**; pathname segments (split on
+`/`, empty dropped) match when the lists are equal, OR same-length differing only in an
+all-digits LAST segment (page 4 → page 9), OR one list is the other plus exactly one extra
+TRAILING all-digits segment (`/chapter/<uuid>` ↔ `/chapter/<uuid>/4`, the reader adding the
+page segment on the first scroll); anything else → `false`. Wired at BOTH existing checks
+(signatures unchanged): `classifyRegisterIntent`'s `intent.href !== currentHref` and
+`pumpTranslateAllWindow`'s `translateAllIntent.href !== getHref()`.
+
+**Deliberate call — fail toward DISARM (the cost direction).** Every ambiguous comparison
+resolves to "different chapter". A false disarm costs one re-click; a false "same chapter"
+auto-buys pages of a chapter the user never clicked. The ONLY tolerated drift is the
+narrow numeric-trailing-segment rule above. **WHY digits-only:** a chapter's identity on
+every known reader is a slug/uuid segment; the only thing long-strip readers rewrite while
+scrolling is a numeric page counter — a drifted uuid IS a chapter change and must disarm.
+
+**Deliberate call — query-string page drift NOT tolerated (a recorded limitation).**
+`?page=N` query-string page tracking is out of scope: `search` must be exactly equal.
+**WHY:** MangaDex (the evidence) drifts the PATH; loosening the query comparison multiplies
+the false-"same" surface for zero observed benefit. A reader that tracks pages via the
+query string would re-disarm on 9.9 exactly as on 9.6 (recorded, deliberate).
+
+**Deliberate call — no re-anchoring.** The armed `href` stays the fixed anchor; drift is
+tolerated per comparison and the intent's `href` is NEVER rewritten to the drifted value.
+**WHY:** re-anchoring on every drift would let a slow multi-step mutation (uuid → uuid) walk
+the scope arbitrarily far and defeat the disarm-on-chapter-change guarantee.
+
+**§2 — disarm + drift logging (`viewportQueue.ts`).** Both call sites now emit one
+`log.debug` on a real chapter-change disarm (`translate-all disarm: chapter changed
+<armedHref> -> <current>`), and a `noteHrefDrift` helper emits one
+`translate-all href drift tolerated: <armedHref> -> <current>` on the **first** tolerated
+drift per armed intent (guarded by a `driftLogged` boolean on the intent so per-scroll
+rewrites don't spam the console). **WHY:** this root cause hid for three phases because
+nothing logged the intent's lifecycle; the next live pass must show drift-tolerated vs.
+disarmed from the console alone.
+
+**§3 — MangaDex-style URL drift in the long-chapter fixture (`tests/e2e/chapter-long.html`).**
+The fixture gained a small inline script that mimics the reader: on load
+`history.replaceState(null, "", "/chapter-long.html/1")`, and on scroll (rAF-throttled)
+`replaceState` to `/chapter-long.html/<n>` for the topmost visible page. Asset URLs are
+absolute (`/pages/N.png`) so the path rewrite can't break image loading; `replaceState`
+never hits the mock server (no new route); `/chapter-long.html` stays a substring of the
+URL so the Scenario E tab-finder needle (`translateAllOnChapter("/chapter-long.html")`)
+still matches. **With the rewriting fixture, Scenario E as it stands is the regression
+test:** on the pre-9.9 build the first pump/registration after a rewrite disarms the intent,
+the staged window freezes at the initial wave, and E's "all 30 pages paint" assertion fails;
+with §1 it passes. Scenario E's body was left **untouched** — the fixture change alone
+exercises the fix; Scenarios A–D are byte-identical.
+
+**Incidental observation (recorded, NOT fixed).** The scanner registers the `miku.jpg`
+placeholder itself as a candidate (http URL, large enough). Cost is bounded (one
+cached/paid mascot translation ever) and the src-swap re-registration path already handles
+the real page arriving — so this is recorded as observed, not built on (out of scope this
+phase, per the handoff).
+
+**Surface changes (flagged, all within the sanctioned list — NO version bumps, no
+`shared/types.ts` change, no message change, no manifest change):** (a)
+`content/viewportQueue.ts`: the pure `sameChapterHref` helper, its use at both intent href
+checks, the `driftLogged` field on `TranslateAllIntent`, the `noteHrefDrift` shell helper,
+and the §2 disarm/drift `log.debug` lines at both call sites (+ JSDoc updates on
+`classifyRegisterIntent`, `maybeAutoSendForIntent`, `pumpTranslateAllWindow`, and the
+`translateAllIntent` state comment where the "same URL" semantics changed to "same
+chapter"). (b) `tests/unit/viewportQueue.test.ts`: the `sameChapterHref` truth table + shell
+drift cases. (c) `tests/e2e/chapter-long.html`: the replaceState drift script (Scenario E
+untouched). (d) `tests/e2e/README.md` note. `PROMPT_VERSION` 3 / `SNAP_VERSION` 4 /
+`CACHE_VERSION` 2 **untouched** — a **free** phase (no prompt, cache-key, or cached-shape
+change, no forced re-translation).
+
+**Tests: 874 unit (+16 net over the 858 baseline; 4 existing tests mechanically updated).**
+The mechanical updates were forced by the new semantics: the pre-9.9 suite used `/ch/1` →
+`/ch/2` as a stand-in for "different chapter", which is now **tolerated numeric page drift**
+— those four assertions (two `classifyRegisterIntent` unit cases + two non-auto shell tests)
+were re-pointed at a genuine chapter change (a non-numeric leading-segment drift,
+`/ch/1` → `/other/1`) so they still test disarm. New pure suite: `sameChapterHref` truth
+table (identical strings incl. two empty; hash-only drift; numeric last-segment drift;
+appended trailing numeric segment both directions; non-numeric last-segment / appended
+non-numeric → false; uuid/slug segment change → false; origin change → false; search change
+→ false; length differing by ≥ 2 → false; unparseable → equality only; the exact e2e-fixture
+drift shape → true). New shell cases (non-auto seam): a `classifyRegisterIntent` numeric-drift
+→ send; the register path keeps the intent armed across a `/chapter-long.html/1` →
+`/chapter-long.html/7` drift and still auto-sends a later page; the pump TOLERATES the drift
+and keeps refilling on a confirm (13 → 23 dispatched past the URL rewrite, then sweeps in a
+beyond-horizon late page) while still disarming on a real chapter change. `npm run check`
+green (typecheck + ESLint + 874 tests); `npm run build` clean (background 58.85 kB);
+`npm run lint:ext` **0/0/0**.
+
+**`npm run test:e2e` 5/5 green on this machine** — Scenarios A–D **byte-identical** (A 8.8 s,
+B 7.7 s, C 3.7 s, D 18.6 s) plus **Scenario E green over the now-rewriting fixture** (49.5 s)
+on Firefox 153 with the carried-over harness flag `--remote-allow-system-access` (`before()`
+only; no scenario body touched this phase). E is now the structural regression for the drift
+class: it paints all 30 pages while the fixture's URL page-number climbs on every scroll step.
+
+**Manual verification (live key + MangaDex): NOT run.** Expected: a long chapter with
+Translate all near the top, scrolled the whole way at reading pace — the URL's page number
+visibly climbs, and with debug on there is exactly **one** `href drift tolerated` line and
+**zero** `disarm` lines, the staged window keeps refilling past every URL rewrite, and there
+is no blank tail; navigating to a DIFFERENT chapter (SPA nav) mid-burst logs **one** `disarm:
+chapter changed` line and the new chapter buys nothing until Translate all is clicked there;
+the wolf badge appears on pending pages throughout (unchanged 9.8 behavior).
+

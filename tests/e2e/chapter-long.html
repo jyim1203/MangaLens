@@ -1,0 +1,102 @@
+<!doctype html>
+<!--
+  30-page fixture chapter for the e2e smoke suite (Phase 9.8 §3, Scenario E — the
+  staged translate-all window). Same shape as chapter.html but long enough that a
+  translate-all's INITIAL wave (TRANSLATE_ALL_BATCH = 12) is a strict subset of the
+  chapter, so the sliding-window pacing is observable. Served by mockProvider.mjs at
+  /chapter-long.html; page images are the same server-generated /pages/N.png the
+  10-page fixture uses (they scale to any N).
+
+  DELIBERATE: all pages are plain http <img> (NO blob page). The blob/bytes path is
+  already exercised by Scenarios A–B on chapter.html; keeping the 30-page staged test
+  all-plain removes a blob-revocation-timing flake source from a scroll-heavy run.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Mock chapter (long)</title>
+    <style>
+      body { margin: 0; background: #111; }
+      img.page { display: block; margin: 0 auto 8px; max-width: 100%; }
+    </style>
+  </head>
+  <body>
+    <main id="reader">
+      <img class="page" src="/pages/1.png" alt="page 1" width="800" height="1200" />
+      <img class="page" src="/pages/2.png" alt="page 2" width="800" height="1200" />
+      <img class="page" src="/pages/3.png" alt="page 3" width="800" height="1200" />
+      <img class="page" src="/pages/4.png" alt="page 4" width="800" height="1200" />
+      <img class="page" src="/pages/5.png" alt="page 5" width="800" height="1200" />
+      <img class="page" src="/pages/6.png" alt="page 6" width="800" height="1200" />
+      <img class="page" src="/pages/7.png" alt="page 7" width="800" height="1200" />
+      <img class="page" src="/pages/8.png" alt="page 8" width="800" height="1200" />
+      <img class="page" src="/pages/9.png" alt="page 9" width="800" height="1200" />
+      <img class="page" src="/pages/10.png" alt="page 10" width="800" height="1200" />
+      <img class="page" src="/pages/11.png" alt="page 11" width="800" height="1200" />
+      <img class="page" src="/pages/12.png" alt="page 12" width="800" height="1200" />
+      <img class="page" src="/pages/13.png" alt="page 13" width="800" height="1200" />
+      <img class="page" src="/pages/14.png" alt="page 14" width="800" height="1200" />
+      <img class="page" src="/pages/15.png" alt="page 15" width="800" height="1200" />
+      <img class="page" src="/pages/16.png" alt="page 16" width="800" height="1200" />
+      <img class="page" src="/pages/17.png" alt="page 17" width="800" height="1200" />
+      <img class="page" src="/pages/18.png" alt="page 18" width="800" height="1200" />
+      <img class="page" src="/pages/19.png" alt="page 19" width="800" height="1200" />
+      <img class="page" src="/pages/20.png" alt="page 20" width="800" height="1200" />
+      <img class="page" src="/pages/21.png" alt="page 21" width="800" height="1200" />
+      <img class="page" src="/pages/22.png" alt="page 22" width="800" height="1200" />
+      <img class="page" src="/pages/23.png" alt="page 23" width="800" height="1200" />
+      <img class="page" src="/pages/24.png" alt="page 24" width="800" height="1200" />
+      <img class="page" src="/pages/25.png" alt="page 25" width="800" height="1200" />
+      <img class="page" src="/pages/26.png" alt="page 26" width="800" height="1200" />
+      <img class="page" src="/pages/27.png" alt="page 27" width="800" height="1200" />
+      <img class="page" src="/pages/28.png" alt="page 28" width="800" height="1200" />
+      <img class="page" src="/pages/29.png" alt="page 29" width="800" height="1200" />
+      <img class="page" src="/pages/30.png" alt="page 30" width="800" height="1200" />
+    </main>
+    <script>
+      // Phase 9.9 §3: mimic MangaDex's long-strip reader, which rewrites the
+      // page-number segment of the URL via history.replaceState as the reader scrolls
+      // (no navigation, same document). This is the EXACT drift sameChapterHref must
+      // tolerate: on the pre-9.9 exact-href scope the first rewrite permanently
+      // disarms the translate-all intent, the staged window freezes at the initial
+      // wave, and the chapter's tail stays blank — so with this fixture Scenario E IS
+      // the regression test (it already asserts all 30 pages paint). The page asset
+      // URLs are absolute (/pages/N.png), so the path rewrite never affects image
+      // loading; replaceState never hits the mock server, so no new route is needed;
+      // and "/chapter-long.html" stays a substring of the URL so the Scenario E
+      // tab-finder needle (translateAllOnChapter("/chapter-long.html")) still matches.
+      (function () {
+        var pages = Array.prototype.slice.call(document.querySelectorAll("img.page"));
+        var setPage = function (n) {
+          try {
+            history.replaceState(null, "", "/chapter-long.html/" + n);
+          } catch (e) {
+            /* a fixture URL rewrite must never break the page */
+          }
+        };
+        // Land on page 1 immediately, like the reader does after the first layout.
+        setPage(1);
+        // 1-based index of the topmost page still crossing/below the viewport top.
+        var topmostVisiblePage = function () {
+          for (var i = 0; i < pages.length; i++) {
+            if (pages[i].getBoundingClientRect().bottom > 0) return i + 1;
+          }
+          return pages.length;
+        };
+        var ticking = false;
+        window.addEventListener(
+          "scroll",
+          function () {
+            if (ticking) return;
+            ticking = true;
+            requestAnimationFrame(function () {
+              ticking = false;
+              setPage(topmostVisiblePage());
+            });
+          },
+          { passive: true }
+        );
+      })();
+    </script>
+  </body>
+</html>

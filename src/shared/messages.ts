@@ -219,10 +219,14 @@ export interface MessageMap {
   resetCostStats: { request: void; response: void };
 
   /**
-   * Popup → content: queue every detected image for translation (F8
-   * "translate all"). `dryRun: true` only counts what would be queued, so the
-   * popup can confirm-first when the count is large (Risks: confirm dialog on
-   * "translate all" > 30 pages) without paying for anything.
+   * Popup → content: translate every detected image (F8 "translate all").
+   * Phase 9.8 §1: the content side dispatches this as a SLIDING window (an initial
+   * ~12-page wave, refilled as the reader scrolls) rather than firing the whole
+   * chapter at once, but `count` remains the TOTAL number of pages the click buys
+   * overall — not the initial wave — so the popup's confirm/report stays "the whole
+   * chapter". `dryRun: true` only counts what would be queued, so the popup can
+   * confirm-first when the count is large (Risks: confirm dialog on "translate all"
+   * > 30 pages) without paying for anything.
    */
   translateAll: {
     request: { dryRun?: boolean };

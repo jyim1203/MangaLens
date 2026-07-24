@@ -40,6 +40,9 @@ export interface ContentRouterDeps {
  */
 export function buildContentRouterHandlers(deps: ContentRouterDeps): MessageHandlers {
   return {
+    // Phase 9.8 §1: `requestAll` now stages the dispatch (an initial ~12-page wave +
+    // scroll-driven refills) but still returns the TOTAL pending count, so this
+    // handler's contract ("count = pages this click buys overall") is unchanged.
     translateAll: (req) => ({
       count: deps.getQueue()?.requestAll(req?.dryRun ?? false) ?? 0,
     }),

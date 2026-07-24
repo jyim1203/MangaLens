@@ -8,12 +8,16 @@ vi.mock("webextension-polyfill", () => ({ default: fakeBrowser }));
 vi.mock("../../src/shared/messages", () => ({ sendToBackground: vi.fn() }));
 
 import {
+  TRANSLATE_ALL_BATCH,
   TRANSLATE_ALL_MAX_TIMEOUT_MS,
   TRANSLATE_ALL_PRIORITY,
   classifyRegisterIntent,
   createViewportQueue,
+  maxConfirmedIndex,
   planEnqueues,
+  planTranslateAllWindow,
   requestAllTimeoutMs,
+  sameChapterHref,
   type OverlaySink,
 } from "../../src/content/viewportQueue";
 import { sendToBackground } from "../../src/shared/messages";
@@ -124,6 +128,105 @@ describe("viewportQueue — planEnqueues (§7.5 priority planner + §2 upgrades)
         sentPriority: new Map([[4, 1]]),
       }),
     ).toEqual([]);
+  });
+});
+
+describe("viewportQueue — §1 maxConfirmedIndex (pure)", () => {
+  it("returns -1 for an empty array and an all-false array", () => {
+    expect(maxConfirmedIndex([])).toBe(-1);
+    expect(maxConfirmedIndex([false, false, false])).toBe(-1);
+  });
+
+  it("returns the HIGHEST true index (not the first)", () => {
+    expect(maxConfirmedIndex([true, false, true, false])).toBe(2);
+    expect(maxConfirmedIndex([false, false, false, true])).toBe(3);
+    expect(maxConfirmedIndex([true])).toBe(0);
+  });
+});
+
+describe("viewportQueue — §1 planTranslateAllWindow (pure)", () => {
+  const requested = (count: number, ...set: number[]): boolean[] =>
+    Array.from({ length: count }, (_, i) => set.includes(i));
+
+  it("no anchor (-1) ⇒ the first batch, indices 0..batch (one page beyond batch — pinned)", () => {
+    // limit = max(0,-1) + 12 = 12 ⇒ 13 indices (0..12) when nothing is confirmed.
+    const plan = planTranslateAllWindow({
+      count: 30,
+      anchor: -1,
+      batch: TRANSLATE_ALL_BATCH,
+      requested: requested(30),
+    });
+    expect(plan).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    expect(plan).toHaveLength(TRANSLATE_ALL_BATCH + 1);
+  });
+
+  it("an advancing anchor slides the window forward (max(0,anchor)+batch)", () => {
+    // anchor 10, batch 12 ⇒ limit 22 ⇒ indices 0..22 minus the requested 0..12.
+    const plan = planTranslateAllWindow({
+      count: 30,
+      anchor: 10,
+      batch: 12,
+      requested: requested(30, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12),
+    });
+    expect(plan).toEqual([13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
+  });
+
+  it("re-plans a behind-anchor hole (a reset send) — the sweeper property", () => {
+    // Anchor is 20, but page 3 (behind it) was reset to unrequested; it must re-plan.
+    const req = requested(30, ...Array.from({ length: 30 }, (_, i) => i)); // all requested
+    req[3] = false; // page 3's send reset
+    const plan = planTranslateAllWindow({ count: 30, anchor: 20, batch: 12, requested: req });
+    expect(plan).toEqual([3]);
+  });
+
+  it("skips already-requested indices", () => {
+    const plan = planTranslateAllWindow({
+      count: 6,
+      anchor: -1,
+      batch: 12,
+      requested: requested(6, 0, 2, 4),
+    });
+    expect(plan).toEqual([1, 3, 5]);
+  });
+
+  it("clamps to the candidate count (never dispatches past the end)", () => {
+    const plan = planTranslateAllWindow({
+      count: 4,
+      anchor: 0,
+      batch: 12,
+      requested: requested(4),
+    });
+    expect(plan).toEqual([0, 1, 2, 3]);
+  });
+
+  it("batch 0 ⇒ only the window up to the anchor (fail-cheap); with anchor -1 that is index 0", () => {
+    expect(
+      planTranslateAllWindow({ count: 30, anchor: -1, batch: 0, requested: requested(30) }),
+    ).toEqual([0]);
+    // anchor 5, batch 0 ⇒ limit 5 ⇒ everything behind/at the anchor (0..5).
+    expect(
+      planTranslateAllWindow({ count: 30, anchor: 5, batch: 0, requested: requested(30) }),
+    ).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
+  it("a non-finite/negative batch clamps to 0 (never a burst, rule 5)", () => {
+    for (const bad of [NaN, Infinity, -5]) {
+      expect(
+        planTranslateAllWindow({ count: 30, anchor: -1, batch: bad, requested: requested(30) }),
+      ).toEqual([0]); // same as batch 0 with anchor -1
+    }
+  });
+
+  it("count 0 ⇒ empty", () => {
+    expect(
+      planTranslateAllWindow({ count: 0, anchor: -1, batch: 12, requested: [] }),
+    ).toEqual([]);
+  });
+
+  it("pins the 2×batch per-wave budget arithmetic (flagged budget rule)", () => {
+    // The shell arms with requestAllTimeoutMs(2*batch, concurrency, base); 2×12=24
+    // pages at concurrency 6 = 4 waves ⇒ base + 4×30 s (independent of chapter size).
+    expect(requestAllTimeoutMs(2 * TRANSLATE_ALL_BATCH, 6, 120_000)).toBe(120_000 + 4 * 30_000);
   });
 });
 
@@ -1169,15 +1272,92 @@ describe("viewportQueue — autoEnqueue=false (per-site opt-in, item 3)", () => 
 
     queue.requestAll(); // sends candA at the translate-all priority
     expect(mockSend).toHaveBeenCalledTimes(1);
+    const [visible, near] = FakeIO.instances;
+    // Phase 9.8 §1: arming a non-auto translate-all attaches the VISIBLE observer
+    // (so confirmed anchors can advance the staged horizon) but never the NEAR one.
+    expect(visible!.observeLog).toEqual([candA.el]);
+    expect(near!.observeLog).toEqual([]);
 
     await tick(30); // the 10 ms timeout fires → catch path calls reobserve
 
-    // autoEnqueue=false → reobserve returns early, touching neither observer.
-    for (const io of FakeIO.instances) {
-      expect(io.observeLog).toEqual([]);
-      expect(io.unobserveLog).toEqual([]);
-    }
+    // reobserve still early-returns on a non-auto site: NO extra observe (the log
+    // stays length 1, not 2) and NO unobserve — the pump is the retry path here.
+    expect(visible!.observeLog).toEqual([candA.el]);
+    expect(visible!.unobserveLog).toEqual([]);
+    expect(near!.observeLog).toEqual([]);
+    expect(near!.unobserveLog).toEqual([]);
     queue.stop();
+  });
+});
+
+describe("viewportQueue — sameChapterHref (§1 chapter-identity comparison)", () => {
+  const base = "https://mangadex.org/chapter/abc-uuid/4";
+
+  it("identical strings → true (fast path)", () => {
+    expect(sameChapterHref(base, base)).toBe(true);
+  });
+
+  it("two empty strings → true (the location-less test runtime, new URL('') would throw)", () => {
+    expect(sameChapterHref("", "")).toBe(true);
+  });
+
+  it("hash-only drift → true (a fragment can never change the chapter)", () => {
+    expect(sameChapterHref(base, base + "#page-9")).toBe(true);
+  });
+
+  it("numeric last-segment drift → true (page 4 → page 9)", () => {
+    expect(sameChapterHref(base, "https://mangadex.org/chapter/abc-uuid/9")).toBe(true);
+  });
+
+  it("appended trailing numeric segment → true (both directions)", () => {
+    const bare = "https://mangadex.org/chapter/abc-uuid";
+    expect(sameChapterHref(bare, bare + "/1")).toBe(true); // reader adds /<page> on scroll
+    expect(sameChapterHref(bare + "/1", bare)).toBe(true); // and the reverse
+  });
+
+  it("non-numeric last-segment change → false", () => {
+    expect(sameChapterHref(base, "https://mangadex.org/chapter/abc-uuid/foo")).toBe(false);
+  });
+
+  it("appended NON-numeric trailing segment → false", () => {
+    const bare = "https://mangadex.org/chapter/abc-uuid";
+    expect(sameChapterHref(bare, bare + "/foo")).toBe(false);
+  });
+
+  it("uuid/slug (non-last) segment change → false (a real chapter change)", () => {
+    expect(sameChapterHref(base, "https://mangadex.org/chapter/xyz-uuid/4")).toBe(false);
+  });
+
+  it("origin change → false", () => {
+    expect(sameChapterHref(base, "https://evil.org/chapter/abc-uuid/4")).toBe(false);
+  });
+
+  it("search change → false (query page-drift is NOT tolerated this phase)", () => {
+    expect(
+      sameChapterHref(
+        "https://mangadex.org/chapter/abc-uuid?page=4",
+        "https://mangadex.org/chapter/abc-uuid?page=9",
+      ),
+    ).toBe(false);
+  });
+
+  it("path length differing by ≥ 2 → false", () => {
+    expect(sameChapterHref("https://mangadex.org/chapter/abc-uuid", "https://mangadex.org/chapter/abc-uuid/1/2")).toBe(
+      false,
+    );
+  });
+
+  it("unparseable input → false unless the strings are exactly equal", () => {
+    expect(sameChapterHref("not a url", "also not a url")).toBe(false);
+    expect(sameChapterHref("not a url", "not a url")).toBe(true); // exact-equality fast path
+  });
+
+  it("the e2e-fixture drift shape → true (the MangaDex reader path rewrite)", () => {
+    // What Scenario E's rewriting fixture produces: armed on /chapter-long.html/1,
+    // then the page segment climbs as the reader scrolls.
+    const origin = "http://127.0.0.1:8785";
+    expect(sameChapterHref(origin + "/chapter-long.html/1", origin + "/chapter-long.html/7")).toBe(true);
+    expect(sameChapterHref(origin + "/chapter-long.html", origin + "/chapter-long.html/1")).toBe(true);
   });
 });
 
@@ -1198,9 +1378,45 @@ describe("viewportQueue — classifyRegisterIntent (§2 persistence predicate)",
     expect(classifyRegisterIntent(intent, "https://mangadex.org/ch/1", true)).toBe("ignore");
   });
 
-  it("armed + different href → disarm (SPA chapter change), regardless of pause", () => {
-    expect(classifyRegisterIntent(intent, "https://mangadex.org/ch/2", false)).toBe("disarm");
-    expect(classifyRegisterIntent(intent, "https://mangadex.org/ch/2", true)).toBe("disarm");
+  it("armed + a DIFFERENT chapter → disarm (SPA chapter change), regardless of pause", () => {
+    // Phase 9.9 §1: a genuine chapter change is a non-numeric (slug/uuid) segment
+    // drift — here the leading path segment changes, page number held constant, so it
+    // is unambiguously a new chapter and NOT tolerated page drift.
+    expect(classifyRegisterIntent(intent, "https://mangadex.org/other/1", false)).toBe("disarm");
+    expect(classifyRegisterIntent(intent, "https://mangadex.org/other/1", true)).toBe("disarm");
+  });
+
+  it("§1: armed + same chapter, numeric page-segment drift → send (not disarm)", () => {
+    // The 9.9 fix: /ch/1 → /ch/2 is the reader's page rewrite, NOT a chapter change,
+    // so a later registration still auto-sends instead of permanently disarming.
+    expect(classifyRegisterIntent(intent, "https://mangadex.org/ch/2", false)).toBe("send");
+    expect(classifyRegisterIntent(intent, "https://mangadex.org/ch/9", true)).toBe("ignore"); // paused, but NOT disarmed
+  });
+
+  it("§1: within the horizon (index ≤ limit) → send", () => {
+    expect(
+      classifyRegisterIntent(intent, "https://mangadex.org/ch/1", false, { index: 5, limit: 12 }),
+    ).toBe("send");
+    expect(
+      classifyRegisterIntent(intent, "https://mangadex.org/ch/1", false, { index: 12, limit: 12 }),
+    ).toBe("send");
+  });
+
+  it("§1: beyond the horizon (index > limit) → ignore (stay armed, defer to the pump)", () => {
+    expect(
+      classifyRegisterIntent(intent, "https://mangadex.org/ch/1", false, { index: 13, limit: 12 }),
+    ).toBe("ignore");
+  });
+
+  it("§1: a NaN index/limit defers (fail-cheap), and href/pause still take precedence", () => {
+    expect(
+      classifyRegisterIntent(intent, "https://mangadex.org/ch/1", false, { index: NaN, limit: 12 }),
+    ).toBe("ignore");
+    // A chapter change beats the horizon; a within-horizon registration on a NEW
+    // chapter (non-numeric segment drift, §1) still disarms rather than sending.
+    expect(
+      classifyRegisterIntent(intent, "https://mangadex.org/other/2", false, { index: 3, limit: 12 }),
+    ).toBe("disarm");
   });
 });
 
@@ -1306,7 +1522,7 @@ describe("viewportQueue — translate-all persistence across recycling (§2 shel
     expect(translateCalls()).toHaveLength(1);
   });
 
-  it("an href mismatch at register time disarms and does not send (SPA chapter change)", async () => {
+  it("a chapter change at register time disarms and does not send (SPA chapter change)", async () => {
     mockSend.mockReturnValue(new Promise<never>(() => {}));
     let href = "https://mangadex.org/ch/1";
     const queue = makeQueue(fakeOverlay(), () => href);
@@ -1314,7 +1530,9 @@ describe("viewportQueue — translate-all persistence across recycling (§2 shel
     queue.requestAll(); // arm on ch/1 + send a
     expect(translateCalls()).toHaveLength(1);
 
-    href = "https://mangadex.org/ch/2"; // SPA navigated to a new chapter
+    // §1: a REAL chapter change (non-numeric segment drift) — a numeric /ch/2 drift
+    // would be tolerated (covered below); this leading-segment change must disarm.
+    href = "https://mangadex.org/other/1"; // SPA navigated to a new chapter
     queue.register(cand("b")); // a new chapter's image must NOT inherit the intent
     await tick();
     expect(translateCalls()).toHaveLength(1);
@@ -1324,6 +1542,272 @@ describe("viewportQueue — translate-all persistence across recycling (§2 shel
     queue.register(cand("c"));
     await tick();
     expect(translateCalls()).toHaveLength(1);
+    queue.stop();
+  });
+
+  it("§1: the reader's numeric page-segment drift keeps the intent armed → later pages still auto-send", async () => {
+    // The 9.9 regression: a long-strip reader rewrites the page-number path segment as
+    // the user scrolls. On the pre-9.9 exact-href scope the first rewrite permanently
+    // disarmed the intent and every later-registering page stayed blank.
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    let href = "https://mangadex.org/chapter-long.html/1";
+    const queue = makeQueue(fakeOverlay(), () => href);
+    queue.register(cand("a"));
+    queue.requestAll(); // arm on /chapter-long.html/1 + send a
+    expect(translateCalls()).toHaveLength(1);
+
+    href = "https://mangadex.org/chapter-long.html/7"; // reader scrolled — page segment drifted
+    const late = cand("b");
+    queue.register(late); // a page registering after the drift must STILL auto-send
+    await tick();
+    expect(translateCalls()).toHaveLength(2);
+    expect(translateCalls()[1]![1]).toMatchObject({
+      imageUrl: late.url,
+      priority: TRANSLATE_ALL_PRIORITY,
+    });
+    queue.stop();
+  });
+});
+
+describe("viewportQueue — staged translate-all dispatch (§1 shell)", () => {
+  beforeEach(() => {
+    FakeIO.instances = [];
+    mockSend.mockReset();
+    vi.stubGlobal("Node", { DOCUMENT_POSITION_FOLLOWING: 4 });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  const fakeEl = (): Element =>
+    ({
+      compareDocumentPosition: () => 2, // never FOLLOWING → append-order = doc order
+      getBoundingClientRect: () => VISIBLE_RECT,
+    }) as unknown as Element;
+  const cand = (id: string): Candidate => ({ id, el: fakeEl(), url: `https://x/${id}.jpg` });
+
+  /** A NON-auto site (the §1-critical case): translate-all works, but visibility
+   *  never sends, so the staged window + pump are the only dispatch path. */
+  function makeQueue(overlay: OverlaySink, href = "https://x/ch/1", requestTimeoutMs?: number) {
+    return createViewportQueue({
+      overlay,
+      prefetchAhead: 0,
+      concurrency: 6,
+      autoEnqueue: false,
+      hydrate: false,
+      makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
+      requestTimeoutMs,
+      getHref: () => href,
+      createObserver: (cb, options) =>
+        new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+  }
+
+  const translateCalls = () => mockSend.mock.calls.filter((c) => c[0] === "translatePage");
+  const sentUrls = () => translateCalls().map((c) => (c[1] as { imageUrl: string }).imageUrl);
+
+  it("a real requestAll on a 30-candidate queue dispatches EXACTLY the initial wave", () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const queue = makeQueue(fakeOverlay());
+    const cands = Array.from({ length: 30 }, (_, i) => cand(`c${i}`));
+    for (const c of cands) queue.register(c);
+
+    // Return value is the TOTAL pending (30), not the initial wave.
+    expect(queue.requestAll()).toBe(30);
+    // seed 0 (top), nothing confirmed ⇒ anchor 0, limit 12 ⇒ indices 0..12 = 13 pages.
+    expect(translateCalls()).toHaveLength(TRANSLATE_ALL_BATCH + 1);
+    expect(sentUrls()).toEqual(cands.slice(0, 13).map((c) => c.url));
+    queue.stop();
+  });
+
+  it("a small chapter (≤ batch) dispatches every page in the initial wave (A/B parity)", () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const queue = makeQueue(fakeOverlay());
+    const cands = Array.from({ length: 5 }, (_, i) => cand(`c${i}`));
+    for (const c of cands) queue.register(c);
+    expect(queue.requestAll()).toBe(5);
+    expect(translateCalls()).toHaveLength(5); // all dispatched at once — like today
+    queue.stop();
+  });
+
+  it("a confirm advances the staged horizon (the pump dispatches up to k + batch)", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const queue = makeQueue(fakeOverlay());
+    const cands = Array.from({ length: 30 }, (_, i) => cand(`c${i}`));
+    for (const c of cands) queue.register(c);
+    queue.requestAll(); // initial wave: indices 0..12
+    expect(translateCalls()).toHaveLength(13);
+
+    // Confirm index 10 → maxConfirmed 10 → horizon 22 → pump fills 13..22.
+    const [visible] = FakeIO.instances;
+    visible!.fire(cands[10]!.el, true);
+    await tick(); // confirm (0 ms delay) runs → pump
+    expect(translateCalls()).toHaveLength(23);
+    expect(sentUrls().slice(13)).toEqual(cands.slice(13, 23).map((c) => c.url));
+    queue.stop();
+  });
+
+  it("re-sends a window-covered candidate whose earlier send reset — the SWEEPER", async () => {
+    // c3's send resolves aborted → sendTranslate resets requested=false in place; the
+    // other in-window pages hang (stay requested). A later confirm-driven pump must
+    // re-dispatch c3 (it is behind the horizon and now unrequested).
+    mockSend.mockImplementation((type: string, payload?: unknown) => {
+      if (type === "cancelTranslation") return Promise.resolve(undefined);
+      if (type === "translatePage" && (payload as { imageUrl?: string }).imageUrl?.includes("/c3.")) {
+        return Promise.resolve({ ok: false, errorKind: "aborted" });
+      }
+      return new Promise<never>(() => {}); // everything else hangs
+    });
+    const queue = makeQueue(fakeOverlay());
+    const cands = Array.from({ length: 30 }, (_, i) => cand(`c${i}`));
+    for (const c of cands) queue.register(c);
+    queue.requestAll(); // dispatch 0..12; c3's send will reset
+    await tick();
+    const beforeSweep = translateCalls().length; // 13 initial sends (c3 among them)
+
+    // Confirm index 0 (in window) → pump re-plans 0..12; only c3 is now unrequested.
+    const [visible] = FakeIO.instances;
+    visible!.fire(cands[0]!.el, true);
+    await tick();
+    expect(translateCalls()).toHaveLength(beforeSweep + 1); // exactly c3 re-sent
+    expect(sentUrls()[sentUrls().length - 1]).toBe(cands[3]!.url);
+    queue.stop();
+  });
+
+  it("a beyond-horizon late registration defers, then dispatches once a confirm reaches it", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    const queue = makeQueue(fakeOverlay());
+    const cands = Array.from({ length: 15 }, (_, i) => cand(`c${i}`));
+    queue.register(cands[0]!);
+    queue.requestAll(); // arms; only c0 exists so far → dispatches c0
+    expect(translateCalls()).toHaveLength(1);
+
+    // Register the rest AFTER arming (late lazy-loaded pages). Indices 1..12 are within
+    // the horizon (12) → auto-send; 13,14 are beyond → deferred, not dropped.
+    for (let i = 1; i < 15; i++) queue.register(cands[i]!);
+    await tick();
+    expect(translateCalls()).toHaveLength(13); // c0..c12, NOT c13/c14
+
+    // A confirm at index 5 advances maxConfirmed → horizon 17 → the pump sweeps in the
+    // two deferred tail pages.
+    const [visible] = FakeIO.instances;
+    visible!.fire(cands[5]!.el, true);
+    await tick();
+    expect(translateCalls()).toHaveLength(15);
+    queue.stop();
+  });
+
+  it("non-auto arming attaches the visible observer to every candidate; disarm detaches", async () => {
+    mockSend.mockImplementation((type: string) =>
+      type === "cancelQueuedTranslations"
+        ? Promise.resolve({ cancelled: 0 })
+        : new Promise<never>(() => {}),
+    );
+    const queue = makeQueue(fakeOverlay());
+    const a = cand("a");
+    const b = cand("b");
+    queue.register(a);
+    queue.register(b);
+    const [visible, near] = FakeIO.instances;
+    expect(visible!.observeLog).toEqual([]); // nothing observed until a translate-all arms
+
+    queue.requestAll();
+    expect(visible!.observeLog).toEqual([a.el, b.el]);
+    expect(near!.observeLog).toEqual([]); // near stays auto-only
+
+    await queue.setPaused(true); // disarm → detach the visible observers
+    expect(visible!.unobserveLog).toEqual(expect.arrayContaining([a.el, b.el]));
+    queue.stop();
+  });
+
+  it("the pump disarms with NO dispatch when the CHAPTER changed under it (SPA nav)", async () => {
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    let href = "https://x/ch/1";
+    const queue = createViewportQueue({
+      overlay: fakeOverlay(),
+      prefetchAhead: 0,
+      autoEnqueue: false,
+      hydrate: false,
+      makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
+      getHref: () => href,
+      createObserver: (cb, options) => new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+    const cands = Array.from({ length: 20 }, (_, i) => cand(`c${i}`));
+    for (const c of cands) queue.register(c);
+    queue.requestAll(); // dispatches 0..12 on ch/1
+    const dispatched = translateCalls().length;
+    expect(dispatched).toBe(13);
+
+    href = "https://x/other/1"; // §1: a REAL chapter change (non-numeric segment drift)
+    const [visible] = FakeIO.instances;
+    visible!.fire(cands[15]!.el, true); // confirm → pump, but a chapter change disarms
+    await tick();
+    expect(translateCalls()).toHaveLength(dispatched); // no new dispatch
+
+    // Disarmed permanently: a later registration does not auto-send even back on ch/1.
+    href = "https://x/ch/1";
+    queue.register(cand("late"));
+    await tick();
+    expect(translateCalls()).toHaveLength(dispatched);
+    queue.stop();
+  });
+
+  it("§1: the pump TOLERATES numeric page drift and keeps refilling on a confirm (the 9.9 fix)", async () => {
+    // The regression proper: the reader scrolls, the reader's page-number path segment
+    // drifts, and the pump must NOT disarm — a confirm still advances the horizon and
+    // the staged window keeps refilling past the URL rewrite (no frozen initial wave).
+    mockSend.mockReturnValue(new Promise<never>(() => {}));
+    let href = "https://x/chapter-long.html/1";
+    const queue = createViewportQueue({
+      overlay: fakeOverlay(),
+      prefetchAhead: 0,
+      autoEnqueue: false,
+      hydrate: false,
+      makeRequestId: () => "rq",
+      ...CONFIRM_SEAMS,
+      getHref: () => href,
+      createObserver: (cb, options) => new FakeIO(cb, options) as unknown as IntersectionObserver,
+    });
+    const cands = Array.from({ length: 30 }, (_, i) => cand(`c${i}`));
+    for (const c of cands) queue.register(c);
+    queue.requestAll(); // initial wave: indices 0..12 on /chapter-long.html/1
+    expect(translateCalls()).toHaveLength(13);
+
+    href = "https://x/chapter-long.html/11"; // reader scrolled — page segment drifted
+    const [visible] = FakeIO.instances;
+    visible!.fire(cands[10]!.el, true); // confirm index 10 → horizon 22 → pump fills 13..22
+    await tick();
+    expect(translateCalls()).toHaveLength(23);
+    expect(sentUrls().slice(13)).toEqual(cands.slice(13, 23).map((c) => c.url));
+
+    // And a page registering after the drift still auto-sends (register-path tolerance).
+    href = "https://x/chapter-long.html/12";
+    const late = cand("late");
+    queue.register(late); // index 30, beyond horizon 22 → deferred, not disarmed
+    await tick();
+    expect(translateCalls()).toHaveLength(23); // deferred (beyond horizon), NOT dropped/disarmed
+    visible!.fire(cands[25]!.el, true); // confirm 25 → horizon 37 → sweeps in 23..29 + late
+    await tick();
+    // `.includes(...)` not `toContain`: `Node` is stubbed to a non-constructor here and
+    // vitest's `toContain` does an internal `instanceof Node` that would throw on it.
+    expect(sentUrls().includes(late.url)).toBe(true);
+    queue.stop();
+  });
+
+  it("makes the pump a no-op while paused (arming happens, dispatch does not)", async () => {
+    mockSend.mockImplementation((type: string) =>
+      type === "cancelQueuedTranslations"
+        ? Promise.resolve({ cancelled: 0 })
+        : new Promise<never>(() => {}),
+    );
+    const queue = makeQueue(fakeOverlay());
+    const cands = Array.from({ length: 20 }, (_, i) => cand(`c${i}`));
+    for (const c of cands) queue.register(c);
+    await queue.setPaused(true);
+
+    // requestAll is a no-op while paused (nothing armed, nothing dispatched).
+    expect(queue.requestAll()).toBe(0);
+    expect(translateCalls()).toHaveLength(0);
     queue.stop();
   });
 });

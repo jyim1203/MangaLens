@@ -163,20 +163,20 @@ async function grantHostPermission() {
  * can't reach pages that don't exist in the list when page 1 first intersects.
  * Translate-all enqueues ALL 10 at once → the intended ~two concurrency-6 waves.
  */
-async function translateAllOnChapter() {
+async function translateAllOnChapter(urlNeedle = "/chapter.html") {
   const chapterHandle = await driver.getWindowHandle();
   await driver.switchTo().newWindow("tab");
   await driver.get(extUrl("src/options/index.html"));
   const res = await driver.executeAsyncScript(
-    `const [chapterUrl, done] = arguments;
+    `const [needle, done] = arguments;
      browser.tabs.query({}).then((tabs) => {
-       const tab = tabs.find((t) => t.url && t.url.includes('/chapter.html'));
+       const tab = tabs.find((t) => t.url && t.url.includes(needle));
        if (!tab) { done('NO TAB'); return; }   // fail fast, don't hang the script
        return browser.tabs
          .sendMessage(tab.id, { type: 'translateAll', payload: { dryRun: false } })
          .then((r) => done('SENT:' + JSON.stringify(r)), (e) => done('SEND ERR:' + e));
      }, (e) => done('QUERY ERR:' + e));`,
-    `${mock.baseUrl}/chapter.html`,
+    urlNeedle,
   );
   await driver.close();
   await driver.switchTo().window(chapterHandle);
@@ -393,5 +393,85 @@ test("Scenario D — auto-visibility budget: opening a chapter never bursts the 
   assert.ok(
     painted !== Infinity,
     `only ${await paintedOverlayCount()} of ${PAGE_COUNT} pages painted after scrolling to the bottom — a page wedged outside the window`,
+  );
+});
+
+test("Scenario E — staged translate-all on a 30-page chapter: initial window, then fills on scroll (Phase 9.8 §1)", async () => {
+  const LONG_PAGES = 30;
+  const BATCH = 12; // TRANSLATE_ALL_BATCH — mirrored here (assert-only, not imported)
+  const settle = Number(process.env.MOCK_LATENCY_MS ?? 2000) + 6000;
+  // NON-auto site (like Scenario B): the content script scans + registers all 30 and
+  // Translate all works, but nothing auto-sends on load — so every provider request
+  // is attributable to the staged dispatch, and the §1 sweeper hole (non-auto) is the
+  // exact case under test. Deterministic viewport for the seed/scroll arithmetic.
+  await seedSettings({ pagesPerRequest: 1, autoSite: false, prefetchAhead: 3 });
+  await driver.manage().window().setRect({ width: 1366, height: 768 });
+  await clearTranslationCache();
+  await resetMockStats();
+
+  // (1) Open the long chapter at the TOP and Translate all (same two-tab flow as A/B).
+  await driver.get(`${mock.baseUrl}/chapter-long.html`);
+  await new Promise((r) => setTimeout(r, 2000)); // scan + register the loaded pages
+  const sent = await translateAllOnChapter("/chapter-long.html");
+  assert.match(String(sent), /^SENT:/, `translateAll not delivered: ${sent}`);
+  // `count` is the TOTAL registered-pending at click time — NOT the initial staged
+  // wave. The scanner only registers an image once it has LOADED (naturalWidth ≥ 400),
+  // so at the top of a 30-page chapter only the above/near-fold pages are registered
+  // yet (the rest register as they load in on scroll — the exact lazy-load flow §1's
+  // register-path + pump handle). Assert a real, subset count, not a hardcoded 30.
+  const clickCount = Number((/"count":(\d+)/.exec(String(sent)) ?? [])[1] ?? 0);
+  assert.ok(
+    clickCount >= 5 && clickCount <= LONG_PAGES,
+    `unexpected translate-all count at the top: ${clickCount} (want 5..${LONG_PAGES})`,
+  );
+
+  // (2) The initial provider burst is BOUNDED — translate-all did not blast the whole
+  // chapter. Planner at the top: seed 0, nothing confirmed → anchor 0, horizon 0 + 12
+  // = 12 → indices 0..12 (13 pages); with lazy-load, ~the loaded subset. Either way the
+  // bound ≤ 18 proves no big burst; ≥ 5 proves a real wave went out. First pages paint.
+  // (The staging planner/pump/horizon is proved precisely in the unit suite; this is
+  // the end-to-end smoke that the long-chapter click stays bounded and still completes.)
+  await new Promise((r) => setTimeout(r, settle));
+  const initial = await mockStats();
+  assert.ok(initial.chatRequests >= 5, `expected a real initial wave, got ${initial.chatRequests}`);
+  assert.ok(
+    initial.chatRequests <= BATCH + 6,
+    `initial burst too large (${initial.chatRequests} > ${BATCH + 6}) — the long-chapter click was not bounded`,
+  );
+  const firstPainted = await waitForCount(paintedOverlayCount, 5, PERF_BUDGET_MS);
+  assert.ok(firstPainted !== Infinity, `first staged wave never painted enough pages`);
+
+  // (3) Stepped-scroll toward mid-chapter (Scenario D's stepping; each pause > the
+  // 300 ms confirm delay). Confirmed anchors advance → the pump refills the window →
+  // the request count grows past the initial wave and mid pages paint.
+  const totalHeight = await driver.executeScript("return document.body.scrollHeight;");
+  const mid = Math.floor(totalHeight / 2);
+  for (let y = 600; y <= mid; y += 600) {
+    await driver.executeScript(`window.scrollTo(0, ${y});`);
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  await new Promise((r) => setTimeout(r, settle));
+  const midStats = await mockStats();
+  assert.ok(
+    midStats.chatRequests > initial.chatRequests,
+    `mid-scroll did not advance the staged window (${initial.chatRequests} → ${midStats.chatRequests})`,
+  );
+
+  // (4) Stepped-scroll to the bottom → ALL 30 paint (no page left blank) and the total
+  // stays ≈ 30 (coalesce/cache keep re-sends unpaid; no runaway duplicates).
+  for (let y = mid; y < totalHeight; y += 600) {
+    await driver.executeScript(`window.scrollTo(0, ${y});`);
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  await driver.executeScript("window.scrollTo(0, document.body.scrollHeight);");
+  const paintedAll = await waitForCount(paintedOverlayCount, LONG_PAGES, 45000);
+  assert.ok(
+    paintedAll !== Infinity,
+    `only ${await paintedOverlayCount()} of ${LONG_PAGES} pages painted after scrolling to the bottom — a page wedged (staged window / sweeper failed)`,
+  );
+  const finalStats = await mockStats();
+  assert.ok(
+    finalStats.chatRequests <= LONG_PAGES + 10,
+    `runaway provider traffic: ${finalStats.chatRequests} requests for ${LONG_PAGES} pages (expected ≈ 30)`,
   );
 });

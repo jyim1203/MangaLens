@@ -79,6 +79,75 @@ export function requestAllTimeoutMs(
 }
 
 /**
+ * Phase 9.8 §1: the sliding translate-all dispatch window size — THE tuning knob.
+ * A real translate-all dispatches an initial batch of this many pages ahead of the
+ * user's confirmed reading position, then keeps a constant ~this-many-page lead as
+ * the window refills on scroll (see {@link planTranslateAllWindow} + the pump).
+ * WHY 12: ~2 concurrency-6 waves of lead — enough that the next pages are usually
+ * ready by the time the reader arrives, without the deep backlog a fire-everything
+ * `requestAll` builds (the exact environment the 9.6 recycle-cancel and per-send
+ * timeout classes feed on). Not user-configurable yet (constant-only, out of scope).
+ */
+export const TRANSLATE_ALL_BATCH = 12;
+
+/**
+ * Phase 9.8 §1 (pure): the highest index flagged `true` in `confirmed`, or `-1` when
+ * none is. The translate-all dispatch horizon is derived fresh from this on each
+ * check (`horizon = maxConfirmedIndex + TRANSLATE_ALL_BATCH`) rather than stored — a
+ * stored frontier index goes stale under the register/unregister churn a live chapter
+ * sees (the Phase 9 §1 staleness note). Unit-tested.
+ */
+export function maxConfirmedIndex(confirmed: readonly boolean[]): number {
+  for (let i = confirmed.length - 1; i >= 0; i--) {
+    if (confirmed[i]) return i;
+  }
+  return -1;
+}
+
+/** Inputs to {@link planTranslateAllWindow}. All indices are into the doc-ordered list. */
+export interface TranslateAllWindowInput {
+  /** Total number of registered candidates. */
+  count: number;
+  /**
+   * The dispatch anchor: the confirmed reading frontier ({@link maxConfirmedIndex}),
+   * or `max(seedIndex, maxConfirmedIndex)` for the initial wave. `-1` (nothing
+   * confirmed) yields a first-batch window of indices `0..batch`.
+   */
+  anchor: number;
+  /** The dispatch lead ({@link TRANSLATE_ALL_BATCH}); a non-finite/negative value clamps to 0. */
+  batch: number;
+  /** Per-candidate "already requested" flags in doc order; a requested index is skipped. */
+  requested: readonly boolean[];
+}
+
+/**
+ * Phase 9.8 §1 (pure): the exact index list a translate-all should dispatch this
+ * check — every not-yet-requested index at or below the horizon
+ * `limit = max(0, anchor) + batch`, clamped to the candidate count. Everything
+ * BEHIND the anchor is always inside the window (translate-all is a whole-chapter
+ * promise — a page the user scrolled back to must never stay blank), so a
+ * behind-anchor hole left by a reset send is always re-planned. THAT is what makes
+ * the pump double as a sweeper. WHY clamp a non-finite/negative `batch` to 0
+ * (fail-cheap, rule 5): a NaN horizon must dispatch the minimum (`0..anchor`), never
+ * a runaway burst. Unit-tested.
+ *
+ * The `anchor = -1 ⇒ limit = batch ⇒ indices 0..batch` choice (one page beyond the
+ * batch size when nothing is confirmed) is deliberate and pinned in a test.
+ */
+export function planTranslateAllWindow(input: TranslateAllWindowInput): number[] {
+  const { count, anchor, batch, requested } = input;
+  const boundedAnchor = Math.max(0, anchor);
+  // Fail-cheap (rule 5): only a finite, positive batch widens the window.
+  const safeBatch = Number.isFinite(batch) && batch > 0 ? Math.floor(batch) : 0;
+  const limit = Math.min(count - 1, boundedAnchor + safeBatch);
+  const out: number[] = [];
+  for (let i = 0; i <= limit; i++) {
+    if (!requested[i]) out.push(i);
+  }
+  return out;
+}
+
+/**
  * Phase 9.6 §2 persistent translate-all intent. Armed by a real `requestAll`,
  * scoped to the page URL it was clicked on (`href`) and carrying the same
  * backlog-scaled per-send `budgetMs` the burst used. While armed, a candidate
@@ -86,43 +155,154 @@ export function requestAllTimeoutMs(
  * blank.
  */
 export interface TranslateAllIntent {
-  /** The page URL the intent was armed on — the scope of "this chapter". */
+  /**
+   * The page URL the intent was armed on — the anchor of "this chapter". Compared
+   * via {@link sameChapterHref} (Phase 9.9 §1), which tolerates the numeric
+   * page-segment drift a long-strip reader performs while scrolling, so a MangaDex
+   * `history.replaceState` page rewrite no longer disarms the intent. NEVER
+   * re-anchored to a drifted value (drift is tolerated per comparison).
+   */
   href: string;
   /** The per-send timeout budget to reuse for auto-sends ({@link requestAllTimeoutMs}). */
   budgetMs: number;
+  /**
+   * Phase 9.9 §2: set once the FIRST tolerated href drift for this armed intent has
+   * been logged, so per-scroll page-segment rewrites don't spam the console. A
+   * one-shot log guard only — not part of the intent's identity.
+   */
+  driftLogged?: boolean;
 }
 
 /** What {@link classifyRegisterIntent} says to do with a fresh registration. */
 export type RegisterIntentAction = "send" | "disarm" | "ignore";
 
 /**
+ * Phase 9.9 §1 (pure): does `currentHref` name the SAME CHAPTER as the intent's armed
+ * `armedHref`, tolerating ONLY the numeric page-segment drift a long-strip reader
+ * performs while scrolling? MangaDex's reader rewrites `/chapter/<uuid>/<n>` via
+ * `history.replaceState` as the reader scrolls (no navigation, same document); the
+ * 9.6 exact-`href` scope treated that as an SPA chapter change and PERMANENTLY
+ * disarmed the translate-all intent, leaving every later-registering page blank (the
+ * fifteenth-live-pass root cause). This widens the scope from "same URL string" to
+ * "same chapter" while still disarming on a real chapter/site change.
+ *
+ * Fails toward DISARM (rule 4): every ambiguous comparison resolves to `false`
+ * ("different chapter"). A false disarm only costs one re-click; a false "same
+ * chapter" auto-buys pages of a chapter the user never clicked. The ONLY tolerated
+ * drift is a numeric trailing path segment:
+ *  - exact string equality → `true` (fast path; also the only match in the
+ *    location-less `""` test runtime, where both sides are `""` and `new URL("")`
+ *    would throw).
+ *  - either input unparseable by `new URL(...)` → `false` (they were not
+ *    string-equal, and unparseable ⇒ unjudgeable ⇒ disarm).
+ *  - different `origin` → `false`.
+ *  - `hash` is ignored entirely — a fragment (`#page-5`) can never change the chapter.
+ *  - `search` must be EXACTLY equal — query-string page drift (`?page=5`) is NOT
+ *    tolerated this phase (a deliberate, recorded limitation). // WHY: MangaDex (the
+ *    evidence) drifts the PATH; loosening the query multiplies the false-"same"
+ *    surface for zero observed benefit.
+ *  - pathname segments (split on `/`, empty dropped):
+ *      · equal lists → `true`;
+ *      · same length, all equal except the LAST, and BOTH last segments all-digits
+ *        (`/^\d+$/`) → `true` (page 4 → page 9);
+ *      · one list is the other plus exactly ONE extra TRAILING all-digits segment →
+ *        `true` (`/chapter/<uuid>` ↔ `/chapter/<uuid>/4`, the reader adding the page
+ *        segment on the first scroll);
+ *      · anything else → `false`. // WHY digits-only: a chapter's identity on every
+ *        known reader is a slug/uuid segment; the only thing long-strip readers
+ *        rewrite while scrolling is a numeric page counter — a drifted uuid IS a
+ *        chapter change and must disarm.
+ *
+ * @param armedHref the intent's armed href (the fixed anchor — never re-anchored).
+ * @param currentHref the page URL at comparison time.
+ */
+export function sameChapterHref(armedHref: string, currentHref: string): boolean {
+  if (armedHref === currentHref) return true; // fast path (+ the "" test runtime)
+  let a: URL;
+  let b: URL;
+  try {
+    a = new URL(armedHref);
+    b = new URL(currentHref);
+  } catch {
+    return false; // unparseable ⇒ unjudgeable ⇒ disarm (rule 4)
+  }
+  if (a.origin !== b.origin) return false;
+  if (a.search !== b.search) return false; // query page-drift NOT tolerated (deliberate)
+  // hash is ignored entirely — a fragment can never change the chapter.
+  const isDigits = (s: string): boolean => /^\d+$/.test(s);
+  const segsA = a.pathname.split("/").filter((s) => s.length > 0);
+  const segsB = b.pathname.split("/").filter((s) => s.length > 0);
+
+  if (segsA.length === segsB.length) {
+    // Same depth: every segment but the last must match; the last may drift only
+    // between two all-digits page counters.
+    for (let i = 0; i < segsA.length - 1; i++) {
+      if (segsA[i] !== segsB[i]) return false;
+    }
+    const lastA = segsA[segsA.length - 1];
+    const lastB = segsB[segsB.length - 1];
+    if (lastA === lastB) return true; // identical lists (incl. two empty paths)
+    return lastA !== undefined && lastB !== undefined && isDigits(lastA) && isDigits(lastB);
+  }
+
+  // Different depth: tolerate ONLY the shorter list plus exactly one extra TRAILING
+  // all-digits segment (the reader appending `/<page>` after the first scroll).
+  if (Math.abs(segsA.length - segsB.length) !== 1) return false;
+  const shorter = segsA.length < segsB.length ? segsA : segsB;
+  const longer = segsA.length < segsB.length ? segsB : segsA;
+  for (let i = 0; i < shorter.length; i++) {
+    if (shorter[i] !== longer[i]) return false;
+  }
+  const tail = longer[longer.length - 1];
+  return tail !== undefined && isDigits(tail);
+}
+
+/**
  * Phase 9.6 §2 — decide what a freshly-registered candidate should do against the
  * armed translate-all intent. Pure so the persistence policy is unit-tested apart
  * from the DOM shell:
  *  - `"ignore"` — no intent armed (nothing to persist).
- *  - `"disarm"` — the page URL no longer matches the intent's: MangaDex is an SPA,
- *    so a chapter change re-registers a whole new chapter's images; auto-sending
- *    THOSE would be spend the user never clicked for. The href is the cheapest
- *    precise scope for "this chapter", and a mismatch lapses the intent.
- *  - `"send"` — armed, same page, not paused → auto-send this candidate (a recycled
- *    element's fresh candidate re-sends → the background coalesces onto the
- *    §1-spared in-flight run or cache-hits the finished one; a late lazy-loaded
- *    page finally sends). NOT gated on the anchored reading window: translate-all
- *    is explicit intent and bypasses the window by existing doctrine.
+ *  - `"disarm"` — the current URL is a DIFFERENT CHAPTER than the intent's
+ *    ({@link sameChapterHref} false): MangaDex is an SPA, so a chapter change
+ *    re-registers a whole new chapter's images; auto-sending THOSE would be spend
+ *    the user never clicked for. Phase 9.9 §1: the comparison is chapter-scoped, not
+ *    exact-string — the reader's numeric page-segment drift while scrolling is
+ *    tolerated (it does NOT disarm); a real chapter/site change lapses the intent.
+ *  - `"send"` — armed, same page, not paused, AND (Phase 9.8 §1) at or below the
+ *    live dispatch horizon → auto-send this candidate (a recycled element's fresh
+ *    candidate re-sends → the background coalesces onto the §1-spared in-flight run
+ *    or cache-hits the finished one; a late lazy-loaded page within the staged
+ *    window finally sends). NOT gated on the anchored reading window: translate-all
+ *    is explicit intent and bypasses that window by existing doctrine — the staged
+ *    horizon is the SEPARATE, much wider explicit-intent window §1 layers on top.
+ *  - `"ignore"` (Phase 9.8 §1) — armed + same page + not paused but the candidate is
+ *    BEYOND the staged horizon: stay armed and defer. The pump dispatches it once a
+ *    confirmed anchor advances the horizon over it (so a late tail page can't jump
+ *    the staged queue). Fail-cheap: a non-finite `index`/`limit` (`!(index <= limit)`)
+ *    also defers rather than bursts (rule 5).
  *
  * @param intent the armed intent, or `undefined` when none.
  * @param currentHref the page URL at registration time.
  * @param paused whether the queue is paused (a paused queue never auto-sends;
  *   `setPaused(true)` also disarms, so this is belt-and-braces).
+ * @param horizon Phase 9.8 §1: the candidate's `index` and the live dispatch `limit`.
+ *   Omitted (the pre-9.8 3-arg call) ⇒ no horizon gate (always within window).
  */
 export function classifyRegisterIntent(
   intent: TranslateAllIntent | undefined,
   currentHref: string,
   paused: boolean,
+  horizon?: { index: number; limit: number },
 ): RegisterIntentAction {
   if (!intent) return "ignore";
-  if (intent.href !== currentHref) return "disarm";
+  // Phase 9.9 §1: chapter-scoped, not exact-string — tolerate the reader's numeric
+  // page-segment drift (`history.replaceState` while scrolling), disarm on a real
+  // chapter/site change.
+  if (!sameChapterHref(intent.href, currentHref)) return "disarm";
   if (paused) return "ignore";
+  // §1: defer a beyond-horizon (or degenerate) registration; `!(index <= limit)`
+  // treats a NaN index/limit as beyond-horizon → defer, never burst (rule 5).
+  if (horizon && !(horizon.index <= horizon.limit)) return "ignore";
   return "send";
 }
 
@@ -440,14 +620,19 @@ export interface ViewportQueue {
   /** Unregister a candidate: unobserve, cancel any in-flight request, clear overlay. */
   unregister(candidate: Candidate): void;
   /**
-   * Request translation of every registered, not-yet-requested candidate at
-   * {@link TRANSLATE_ALL_PRIORITY} (F8 "translate all" from the popup).
-   * Visible pages that were already requested keep their better priority —
-   * this only fills in the rest.
+   * Translate-all (F8 "translate all" from the popup). Phase 9.8 §1: dispatches a
+   * SLIDING window — an initial {@link TRANSLATE_ALL_BATCH}-page wave seeded on the
+   * user's viewport position, then a constant ~batch-page lead that refills as they
+   * scroll (the internal pump, driven by confirmed reading anchors; it also sweeps in
+   * any window-covered page whose earlier send reset). A chapter with
+   * `≤ TRANSLATE_ALL_BATCH` pending pages dispatches everything in the initial wave.
+   * Already-requested (e.g. visible) pages keep their better priority — this only
+   * fills in the rest.
    *
    * @param dryRun count what would be sent without sending (the popup's
    *   confirm-first flow for large chapters).
-   * @returns how many candidates were (or would be) requested.
+   * @returns the TOTAL number of not-yet-requested candidates the click buys overall
+   *   (not just the initial wave) — the popup's confirm/report count.
    */
   requestAll(dryRun?: boolean): number;
   /**
@@ -557,10 +742,11 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
   /**
    * Phase 9.6 §2: the armed translate-all intent, or `undefined` when disarmed.
    * Queue-lifetime state (a fresh queue per activation starts disarmed). Set by a
-   * real `requestAll`; disarmed by `setPaused(true)`, `stop()`, and lazily on an
-   * href mismatch at register time — so persistence only ever spends under the
-   * exact intent the user bought (translate-all on this page URL) and stops the
-   * moment that intent lapses.
+   * real `requestAll`; disarmed by `setPaused(true)`, `stop()`, and lazily on a
+   * CHAPTER change at register/pump time ({@link sameChapterHref}, Phase 9.9 §1 —
+   * the reader's numeric page-segment drift is tolerated, a real chapter change is
+   * not) — so persistence only ever spends under the intent the user bought
+   * (translate-all on this chapter) and stops the moment that intent lapses.
    */
   let translateAllIntent: TranslateAllIntent | undefined;
 
@@ -699,12 +885,21 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
     const idx = indexOf(rec.candidate);
     if (idx < 0) return;
     rec.confirmedVisible = true; // §8: this page is now a reading anchor
-    // Re-plan at tier 0 with the new anchor: sends the candidate itself if the
-    // immediate within-window pass didn't, upgrades it if it did, and prefetches
-    // into this anchor's forward range. Then slide: re-observe suppressed
-    // candidates now inside [idx, idx + prefetchAhead].
-    onTierChange(rec.candidate, 0);
-    slideWindow(idx);
+    if (autoEnqueue) {
+      // Auto sites: re-plan at tier 0 with the new anchor — send the candidate if the
+      // immediate within-window pass didn't, upgrade it if it did, and prefetch into
+      // this anchor's forward range; then slide the suppressed-candidate window into
+      // [idx, idx + prefetchAhead]. Phase 9.8 §1 gates this off for a non-auto site
+      // (which must never visibility-plan) — there the confirm exists ONLY to advance
+      // the staged translate-all horizon, which the pump below does.
+      onTierChange(rec.candidate, 0);
+      slideWindow(idx);
+    }
+    // Phase 9.8 §1: the confirmed anchor just advanced — refill/sweep the staged
+    // translate-all window from it. A no-op unless a translate-all is armed, so it
+    // runs for both modes (it is the ONLY confirmed-anchor progress a non-auto site
+    // gets).
+    pumpTranslateAllWindow();
   };
 
   /** Schedule (at most one) pending confirmation for a tracked element. */
@@ -738,6 +933,40 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
   };
 
   /**
+   * Phase 9.8 §1: revoke the armed translate-all intent. On a NON-auto site, also
+   * detach the visible observers + pending confirms the arm attached (hygiene — the
+   * confirmed flags may remain set but are inert while unarmed on a non-auto site,
+   * which never visibility-plans). Auto sites keep their always-on observers. WHY not
+   * routed through here from `stop()`: teardown does its own full disconnect +
+   * per-record `cancelConfirm`, so it just nulls the intent directly.
+   */
+  const disarmTranslateAll = (): void => {
+    translateAllIntent = undefined;
+    if (autoEnqueue) return;
+    for (const rec of tracked.values()) {
+      cancelConfirm(rec);
+      safe(() => visibleObserver.unobserve(rec.candidate.el));
+    }
+  };
+
+  /**
+   * Phase 9.9 §2: on the FIRST tolerated href drift for the armed intent, emit one
+   * `log.debug` — the reader rewrote the page-number segment while scrolling and
+   * {@link sameChapterHref} accepted it (same chapter, different URL string). Guarded
+   * by a boolean on the intent so per-scroll drift can't spam the console. // WHY log
+   * at all: the exact-href scope bug hid for three phases because nothing logged the
+   * intent's lifecycle; the next live pass must show drift-tolerated vs. disarmed from
+   * the console alone. The armed href is NOT re-anchored to the drifted value (see
+   * {@link sameChapterHref}) — a slow multi-step mutation must not walk the scope.
+   */
+  const noteHrefDrift = (currentHref: string): void => {
+    const intent = translateAllIntent;
+    if (!intent || intent.driftLogged || intent.href === currentHref) return;
+    intent.driftLogged = true;
+    log.debug(`translate-all href drift tolerated: ${intent.href} -> ${currentHref}`);
+  };
+
+  /**
    * §8: a new anchor at `anchor` opened its forward window
    * `[anchor, anchor + prefetchAhead]` — re-observe every SUPPRESSED candidate now
    * inside it so it re-plans (the existing transition-only-IO workaround:
@@ -764,7 +993,10 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
     if (idx < 0) return;
     // Already inside the anchored window → plan (and possibly send) immediately;
     // the budget already covers it, so no confirmation latency (§8 WHY above).
-    if (anchoredWindowAllows(confirmedFlags(), idx, prefetchAhead)) {
+    // Phase 9.8 §1: gated on `autoEnqueue` — on a non-auto site the visible observer
+    // is attached ONLY to advance the translate-all horizon, so its tier-0 events
+    // must schedule a confirmation but NEVER visibility-plan/send.
+    if (autoEnqueue && anchoredWindowAllows(confirmedFlags(), idx, prefetchAhead)) {
       onTierChange(rec.candidate, 0);
     }
     // §8: EVERY unconfirmed tier-0 can become an anchor (forward OR backward), so
@@ -976,8 +1208,9 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
    * Phase 9.6 §2: if the translate-all intent is armed for the CURRENT page,
    * auto-send this freshly-registered candidate at {@link TRANSLATE_ALL_PRIORITY}
    * (a recycled `<img>`'s new candidate re-sends → coalesces/cache-hits; a late
-   * lazy-loaded page finally sends). Lazily disarms the intent on an href mismatch
-   * (an SPA chapter change). Returns whether a send was fired.
+   * lazy-loaded page finally sends). Lazily disarms the intent on a CHAPTER change
+   * (Phase 9.9 §1 {@link sameChapterHref} — the reader's numeric page-segment drift
+   * is tolerated, a real chapter change disarms). Returns whether a send was fired.
    *
    * The `!translateAllIntent` fast-path means the common (unarmed) case never even
    * reads `getHref()`, so a location-less runtime is untouched unless intent is armed.
@@ -986,14 +1219,134 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
    */
   const maybeAutoSendForIntent = (candidate: Candidate): boolean => {
     if (!translateAllIntent) return false;
-    const action = classifyRegisterIntent(translateAllIntent, getHref(), paused);
+    const index = indexOf(candidate);
+    const currentHref = getHref();
+    // Phase 9.8 §1: derive the live horizon and only auto-send a registration at or
+    // below it. A beyond-horizon registration stays armed and DEFERRED — the pump
+    // dispatches it once a confirmed anchor advances the horizon over it (matching
+    // the staged initial wave, so a late lazy-loaded tail page can't jump the queue).
+    const limit = Math.max(0, maxConfirmedIndex(confirmedFlags())) + TRANSLATE_ALL_BATCH;
+    const action = classifyRegisterIntent(translateAllIntent, currentHref, paused, {
+      index,
+      limit,
+    });
     if (action === "disarm") {
-      translateAllIntent = undefined; // SPA navigated off the clicked chapter
+      // §2: log the chapter change before disarming (a REAL chapter/site change, not
+      // tolerated page drift) so the next live pass is attributable from the console.
+      log.debug(
+        `translate-all disarm: chapter changed ${translateAllIntent.href} -> ${currentHref}`,
+      );
+      disarmTranslateAll(); // SPA navigated off the clicked chapter
       return false;
     }
-    if (action !== "send") return false;
+    // §2: same chapter — record the first tolerated page-segment drift (once per intent).
+    noteHrefDrift(currentHref);
+    if (action !== "send") {
+      // §4: a beyond-horizon registration was deferred, not dropped — log it so the
+      // next live pass is attributable from the console (the 9.8 evidence was empty).
+      if (translateAllIntent && index > limit) {
+        log.debug(
+          `translate-all defer: index=${index} horizon=${limit} total=${order.length}`,
+        );
+      }
+      return false;
+    }
     void sendTranslate(candidate, TRANSLATE_ALL_PRIORITY, translateAllIntent.budgetMs);
     return true;
+  };
+
+  /**
+   * Phase 9.8 §1: the lowest registered candidate whose element currently intersects
+   * the viewport, or `0` when none does / every rect read throws. WHY seed the
+   * initial wave with this: a mid-chapter translate-all on a non-auto site has NO
+   * confirmed anchors yet, so without a seed the initial window would ignore where
+   * the user actually is and dispatch from the top of the chapter. Fail-soft to `0`
+   * (rule 5) — the chapter top is the cheap, safe default; every `getBoundingClientRect`
+   * is wrapped (a detached element must never throw out of the arm path).
+   */
+  const computeSeedIndex = (): number => {
+    let vp: { w: number; h: number };
+    try {
+      vp = getViewport();
+    } catch {
+      return 0; // no viewport reading → safe default
+    }
+    for (let i = 0; i < order.length; i++) {
+      try {
+        const r = order[i]!.el.getBoundingClientRect();
+        if (r.bottom > 0 && r.top < vp.h && r.right > 0 && r.left < vp.w) return i;
+      } catch {
+        // detached/broken element — skip it, keep scanning
+      }
+    }
+    return 0;
+  };
+
+  /**
+   * Phase 9.8 §1: on a NON-auto site, attach the VISIBLE observer to every registered
+   * candidate when a translate-all arms, so tier-0 transitions can fire confirmations
+   * that advance the staged dispatch horizon as the user scrolls (the near observer
+   * stays auto-only — it can't anchor). No-op on an auto site, which already observes
+   * everything. Detached again on disarm ({@link disarmTranslateAll}).
+   */
+  const attachTranslateAllObservers = (): void => {
+    if (autoEnqueue) return;
+    for (const c of order) safe(() => visibleObserver.observe(c.el));
+  };
+
+  /**
+   * Phase 9.8 §1: the refill pump AND the reset-send sweeper. When a translate-all
+   * intent is armed for the CURRENT CHAPTER (a cheap {@link sameChapterHref} compare,
+   * Phase 9.9 §1; a real chapter change disarms — the reader's numeric page-segment
+   * drift while scrolling does NOT, or the staged window would freeze at the initial
+   * wave) and the queue is not paused, dispatch every planned index
+   * ({@link planTranslateAllWindow}) at
+   * {@link TRANSLATE_ALL_PRIORITY} with the arm-time budget. WHY it doubles as a
+   * sweeper: a `sendTranslate` timeout/abort resets `requested = false` in place, and
+   * on a non-auto site NOTHING re-sends such a candidate today (no observers dispatch,
+   * the element isn't recycled); because the planner always includes every
+   * not-yet-requested index at/behind the horizon, each future confirm re-plans it —
+   * closing the empty-HAR blank-page class structurally.
+   *
+   * @param seedIndex an extra anchor floor for the initial wave (the viewport seed);
+   *   omit (`-1`) for refill pumps, which anchor on the confirmed frontier alone.
+   */
+  const pumpTranslateAllWindow = (seedIndex = -1): void => {
+    if (!translateAllIntent) return;
+    // Phase 9.9 §1: chapter-scoped guard — a long-strip reader rewrites the page-number
+    // path segment as the user scrolls, and the pre-9.9 exact-href compare disarmed the
+    // staged window on the FIRST such rewrite (only the initial wave ever dispatched).
+    const currentHref = getHref();
+    if (!sameChapterHref(translateAllIntent.href, currentHref)) {
+      log.debug(
+        `translate-all disarm: chapter changed ${translateAllIntent.href} -> ${currentHref}`,
+      );
+      disarmTranslateAll(); // SPA navigated off the clicked chapter
+      return;
+    }
+    noteHrefDrift(currentHref); // §2: log the first tolerated drift once per intent
+    if (paused) return; // a paused queue never dispatches (belt-and-braces vs §2 disarm)
+    const confirmed = confirmedFlags();
+    const anchor = Math.max(seedIndex, maxConfirmedIndex(confirmed));
+    const horizon = Math.max(0, anchor) + TRANSLATE_ALL_BATCH;
+    const requested = order.map((c) => tracked.get(c.el)?.requested === true);
+    const plan = planTranslateAllWindow({
+      count: order.length,
+      anchor,
+      batch: TRANSLATE_ALL_BATCH,
+      requested,
+    });
+    if (plan.length === 0) return;
+    // §4: one line per wave — the 9.8 evidence was an EMPTY HAR, so the next report
+    // must be attributable from the console alone.
+    log.debug(
+      `translate-all wave: n=${plan.length} range=${plan[0]}..${plan[plan.length - 1]} horizon=${horizon} total=${order.length}`,
+    );
+    const budget = translateAllIntent.budgetMs;
+    for (const i of plan) {
+      const c = order[i];
+      if (c) void sendTranslate(c, TRANSLATE_ALL_PRIORITY, budget);
+    }
   };
 
   // --- Phase 7.6 cache-only hydrate -----------------------------------------
@@ -1120,6 +1473,12 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
       if (autoEnqueue) {
         safe(() => visibleObserver.observe(candidate.el));
         safe(() => nearObserver.observe(candidate.el));
+      } else if (translateAllIntent) {
+        // Phase 9.8 §1: a translate-all is armed on this non-auto site — observe the
+        // fresh element on the VISIBLE observer so its tier-0 confirmation can advance
+        // the staged horizon (a recycled/late element must be able to anchor too). The
+        // near observer stays auto-only; disarm detaches this again.
+        safe(() => visibleObserver.observe(candidate.el));
       }
       // §2: translate-all persistence. A recycled `<img>` (or a late lazy-loaded
       // page) registers as a fresh candidate after the burst already ran and would
@@ -1153,21 +1512,35 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
       // Paused (item 4): translate-all is a no-op both ways — the popup disables
       // the button anyway, and a dry-run count of 0 keeps the confirm flow honest.
       if (paused) return 0;
-      // WHY filter on `requested` and not in-flight state: sendTranslate flips
-      // `requested` synchronously before its first await, so double-clicking
-      // "translate all" (or clicking during a visibility burst) can't double-send.
+      // Phase 9.8 §1: the return value stays the TOTAL pending count (what this click
+      // buys overall), NOT the initial staged wave — the popup's "Translate N pages?"
+      // confirm and the dry-run/real-run symmetry both mean "the whole chapter". WHY
+      // filter on `requested`: sendTranslate flips it synchronously before its first
+      // await, so double-clicking (or clicking during a visibility burst) can't
+      // double-count/double-send.
       const pending = order.filter((c) => !tracked.get(c.el)?.requested);
       if (!dryRun) {
-        // §3: a large translate-all legitimately sits behind a long queue, so give
-        // each send a backlog-scaled timeout instead of the flat 120 s (which a
-        // 200-page chapter blows, churning resets). Visibility sends keep 120 s.
-        const budget = requestAllTimeoutMs(pending.length, concurrency, requestTimeoutMs);
-        // Phase 9.6 §2: arm the persistent intent for THIS page so a candidate
-        // REGISTERED LATER — a recycled element's fresh candidate (the MangaDex
-        // element-churn hole) or a late lazy-loaded page — auto-sends at the same
-        // priority + budget instead of staying blank. A dry-run never arms it.
+        // Phase 9.8 §1: the per-send timeout must cover the worst backlog a staged
+        // wave can sit behind — a flat 2×batch (implementer's call, pinned in a test,
+        // flagged in PROGRESS). Staging keeps the real backlog near this, unlike the
+        // old whole-chapter `pending.length` budget which scaled with a 200-page tail.
+        const budget = requestAllTimeoutMs(
+          2 * TRANSLATE_ALL_BATCH,
+          concurrency,
+          requestTimeoutMs,
+        );
+        // Phase 9.6 §2 / 9.8 §1: arm the persistent, page-scoped intent so the pump
+        // (refill + sweeper), later registrations, and confirm-driven refills all
+        // dispatch against a live horizon. A dry-run never arms it.
         translateAllIntent = { href: getHref(), budgetMs: budget };
-        for (const c of pending) void sendTranslate(c, TRANSLATE_ALL_PRIORITY, budget);
+        // §1: on a non-auto site, attach the visible observer so confirmed-anchor
+        // progress (and thus the sliding horizon) works there at all (no-op on auto).
+        attachTranslateAllObservers();
+        // §1: the initial wave — seed the anchor with the user's viewport position so
+        // a mid-chapter click dispatches around where they actually are, not the top.
+        // A chapter with `pending.length <= TRANSLATE_ALL_BATCH` dispatches every page
+        // here (byte-identical to the old fire-everything), keeping e2e A/B intact.
+        pumpTranslateAllWindow(computeSeedIndex());
       }
       return pending.length;
     },
@@ -1222,10 +1595,11 @@ export function createViewportQueue(opts: ViewportQueueOptions): ViewportQueue {
       if (next === paused) return 0;
       paused = next;
       if (next) {
-        // §2: pausing revokes the translate-all intent — the user chose to stop
-        // spending, so a later-registered candidate must NOT auto-send. Resume does
-        // not re-arm it; the user re-clicks Translate all to buy the rest.
-        translateAllIntent = undefined;
+        // §2 / 9.8 §1: pausing revokes the translate-all intent (and, on a non-auto
+        // site, detaches the visible observers + pending confirms the arm attached) —
+        // the user chose to stop spending, so a later-registered candidate must NOT
+        // auto-send. Resume does not re-arm it; the user re-clicks Translate all.
+        disarmTranslateAll();
         // Collect every tracked job's live requestId and cancel the queued ones in
         // ONE message; already-STARTED calls finish + render (background skips
         // them). An id present here but not yet started is aborted; its
